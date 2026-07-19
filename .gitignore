@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+devctl.app/
+*.corrupt-*
+.DS_Store
