@@ -1,3 +1,14 @@
+> Ratified plan snapshot (2026-07-18), kept as the design rationale record. The
+> living documents are CLAUDE.md (map + invariants) and docs/cli-contract.md
+> (the JSON surface). Known deviations from this plan, chosen during the build:
+> push subscriptions were replaced by incremental polling everywhere (CLI
+> --follow and the app; restart-safe, no reconnect machinery), logs.follow /
+> status.subscribe never shipped as wire methods, and the crash verb landed as
+> forensics inside `status` plus `devctl why` rather than `devctl crash`. The
+> `register --write` back-to-file option and the automatic CLAUDE.md stanza
+> offer did not ship (backlogged); resource locks (`devctl lock`) shipped
+> beyond the plan.
+
 # devctl: macOS menu bar command center for dev servers
 
 ## Context
@@ -154,16 +165,3 @@ Project hygiene at bootstrap: CLAUDE.md (symlinked AGENTS.md) with codebase map 
 - launchd smoke script (manual): install/kickstart/bootout, upgrade-in-place, shutdown intent honored by auto-bootstrap.
 - UI: `make app`, launch, drive against the live daemon, click-to-open verified, screenshot review of dropdown + dashboard (design judged by render, not tests).
 - Hook end-to-end: `devctl hook install` in a test project, fresh session + forced compaction, confirm injected context; confirm silence in an untrusted project and with the daemon stopped.
-
-## Knowledge capture (queue with kb submit during implementation)
-
-- launchd kills same-process-group remnants on job death but not own-session children; orphan mechanics + `KeepAlive={SuccessfulExit:false}` semantics.
-- Spool-fd output capture pattern: children survive supervisor restarts without SIGPIPE; pipes are the trap.
-- Overwriting a running signed Mach-O → kernel SIGKILL; stage-and-rename.
-- launchd job soft maxfiles 256; setrlimit at startup.
-- swift-subprocess 0.5 createSession/teardown API shape, pre-1.0 status.
-- NWListener unix-socket NECP log noise cosmetic (DTS-confirmed); sandboxed apps cannot reach outside-container unix sockets.
-- SwiftUI Settings scene broken from MenuBarExtra on Tahoe; plain Window + openWindow.
-- No-Xcode .app recipe: swift build + bundle layout + LSUIElement + ad-hoc codesign.
-- `*.localhost` resolution: browsers loopback it themselves; system resolver/CLI tools do not reliably; probe 127.0.0.1 + Host header.
-- Claude Code SessionStart `compact` matcher + `hookSpecificOutput.additionalContext`; statusline stdin schema.

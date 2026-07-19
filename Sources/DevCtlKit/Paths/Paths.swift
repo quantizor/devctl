@@ -44,8 +44,16 @@ public struct DevCtlPaths: Sendable {
             .appending(path: server)
     }
 
-    public func spoolFile(project: String, server: String) -> URL {
-        serverLogDir(project: project, server: server).appending(path: "spool.log")
+    public var eventsFile: URL { dataDir.appending(path: "events.log") }
+
+    /** Raw child-output spools, one per stream so out/err tagging survives; the
+        child holds these fds, so they outlive the daemon. */
+    public func spoolErrFile(project: String, server: String) -> URL {
+        serverLogDir(project: project, server: server).appending(path: "err.spool")
+    }
+
+    public func spoolOutFile(project: String, server: String) -> URL {
+        serverLogDir(project: project, server: server).appending(path: "out.spool")
     }
 
     public func structuredLogFile(project: String, server: String) -> URL {

@@ -12,7 +12,10 @@ struct DevCtl: AsyncParsableCommand {
         abstract: "Command center for local dev servers.",
         version: DevCtlVersion.version,
         subcommands: [
-            Register.self, Start.self, Status.self, Stop.self, Unregister.self, DaemonCommand.self,
+            ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
+            HookCommand.self, Logs.self, Mark.self, Open.self, Register.self, Start.self,
+            Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self, Unregister.self, Up.self,
+            Wait.self, Why.self, DaemonCommand.self,
         ]
     )
 }
@@ -21,6 +24,9 @@ struct GlobalOptions: ParsableArguments {
     @Flag(help: "Emit machine-readable JSON (schemas: docs/cli-contract.md).")
     var json = false
 
+    @Flag(help: "Never auto-install or auto-start the daemon on connection failure.")
+    var noBootstrap = false
+
     @Option(help: "Project root; defaults to the nearest devservers.json ancestor, then git root, then cwd.")
     var project: String?
 
@@ -28,8 +34,11 @@ struct GlobalOptions: ParsableArguments {
         canonicalized so worktrees/symlinks cannot mint duplicate identities. */
     func resolvedProject() -> String {
         if let project { return canonicalProjectPath(project) }
+        return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
+    }
+
+    static func resolveProject(from cwd: String) -> String {
         let fm = FileManager.default
-        let cwd = fm.currentDirectoryPath
         var probe = URL(fileURLWithPath: cwd)
         while true {
             if fm.fileExists(atPath: probe.appending(path: "devservers.json").path) {
@@ -89,22 +98,56 @@ enum CLIRunner {
             Foundation.exit(4)
         case .usage:
             Foundation.exit(2)
-        case .configInvalid, .internalError, .notTrusted, .portHeld, .spawnFailed:
+        case .configInvalid, .internalError, .notTrusted, .portHeld, .resourceLocked, .spawnFailed:
             Foundation.exit(1)
         }
     }
 
     static func run<R: Codable & Sendable>(
         json: Bool,
+        bootstrap: Bool = true,
         _ body: (DaemonClient) async throws -> R
     ) async -> R {
         do {
             return try await body(client())
+        } catch let error as WireError where error.code == .daemonUnreachable && bootstrap {
+            if await attemptBootstrap() {
+                do {
+                    return try await body(client())
+                } catch let retryError as WireError {
+                    fail(retryError, json: json)
+                } catch {
+                    fail(WireError(code: .internalError, message: String(describing: error)), json: json)
+                }
+            }
+            if FileManager.default.fileExists(atPath: DevCtlPaths().stoppedIntentFile.path) {
+                fail(
+                    WireError(
+                        code: .daemonUnreachable,
+                        hint: "run: devctl daemon start",
+                        message: "devctld was deliberately stopped"),
+                    json: json)
+            }
+            fail(error, json: json)
         } catch let error as WireError {
             fail(error, json: json)
         } catch {
             fail(WireError(code: .internalError, message: String(describing: error)), json: json)
         }
+    }
+
+    /** Auto-bootstrap: only against the default socket (never a test override),
+        never past a deliberate-stop marker, install-if-missing when the devctld
+        binary ships alongside this CLI. */
+    static func attemptBootstrap() async -> Bool {
+        guard ProcessInfo.processInfo.environment["DEVCTL_SOCKET"] == nil else { return false }
+        let paths = DevCtlPaths()
+        guard !FileManager.default.fileExists(atPath: paths.stoppedIntentFile.path) else { return false }
+        if FileManager.default.fileExists(atPath: LaunchdAdmin.plistURL.path) {
+            return (try? await LaunchdAdmin.start(paths: paths)) != nil
+        }
+        guard let binary = LaunchdAdmin.bundledDaemonBinary() else { return false }
+        return (try? await LaunchdAdmin.install(daemonBinary: binary, paths: paths)) != nil
     }
 
     static func describe(_ status: ServerStatus) -> String {
@@ -120,6 +163,71 @@ enum CLIRunner {
         }
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
+    }
+}
+
+struct Ensure: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Idempotently start a server: healthy is a no-op, otherwise start and wait for health.")
+
+    @OptionGroup var global: GlobalOptions
+
+    @Argument(help: "Server name.")
+    var name: String
+
+    @Option(help: "Seconds to wait for health before giving up.")
+    var timeout: Double = 60
+
+    func run() async throws {
+        let params = EnsureParams(name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.serverEnsure, params: params, expecting: EnsureResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            var text = CLIRunner.describe(r.server)
+            if let reason = r.reason { text = "ensure fell short (\(reason.rawValue))\n" + text }
+            return text
+        }
+        if result.reason != nil {
+            Foundation.exit(1)
+        }
+    }
+}
+
+struct Wait: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Block until a server is healthy (or stopped); fails fast on crash.")
+
+    @Flag(help: "Wait for the server to be healthy (the default).")
+    var healthy = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Argument(help: "Server name.")
+    var name: String
+
+    @Flag(help: "Wait for the server to be fully stopped instead.")
+    var stopped = false
+
+    @Option(help: "Seconds to wait before giving up.")
+    var timeout: Double = 60
+
+    func run() async throws {
+        let condition: WaitCondition = stopped ? .stopped : .healthy
+        let params = WaitParams(
+            condition: condition, name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.serverWait, params: params, expecting: EnsureResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            if let reason = r.reason {
+                return "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(r.server)
+            }
+            return CLIRunner.describe(r.server)
+        }
+        if result.reason != nil {
+            Foundation.exit(1)
+        }
     }
 }
 
@@ -153,7 +261,7 @@ struct Register: AsyncParsableCommand {
         }
         let spec = ServerSpec(command: cmd, cwd: cwd, name: name, port: port)
         let params = RegisterParams(project: global.resolvedProject(), spec: spec)
-        let result = await CLIRunner.run(json: global.json) { client in
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverRegister, params: params, expecting: ServerResult.self)
         }
         CLIRunner.emit(result, json: global.json) { "registered \(CLIRunner.describe($0.server))" }
@@ -170,7 +278,7 @@ struct Start: AsyncParsableCommand {
 
     func run() async throws {
         let params = ServerTargetParams(name: name, project: global.resolvedProject())
-        let result = await CLIRunner.run(json: global.json) { client in
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStart, params: params, expecting: ServerResult.self)
         }
         if result.server.phase == .failed {
@@ -195,7 +303,7 @@ struct Status: AsyncParsableCommand {
 
     func run() async throws {
         let params = ProjectParams(name: name, project: global.resolvedProject())
-        let result = await CLIRunner.run(json: global.json) { client in
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
         if let name, result.servers.isEmpty {
@@ -225,7 +333,7 @@ struct Stop: AsyncParsableCommand {
 
     func run() async throws {
         let params = ServerTargetParams(name: name, project: global.resolvedProject())
-        let result = await CLIRunner.run(json: global.json) { client in
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStop, params: params, expecting: ServerResult.self)
         }
         CLIRunner.emit(result, json: global.json) { CLIRunner.describe($0.server) }
@@ -242,10 +350,653 @@ struct Unregister: AsyncParsableCommand {
 
     func run() async throws {
         let params = ServerTargetParams(name: name, project: global.resolvedProject())
-        _ = await CLIRunner.run(json: global.json) { client in
+        _ = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverUnregister, params: params, expecting: WireEmpty.self)
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in "unregistered \(name)" }
+    }
+}
+
+struct Logs: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Query a server's structured logs (out/err/sys/mark streams).")
+
+    @Flag(help: "Keep polling for new lines (Ctrl-C to stop).")
+    var follow = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Regex filter (Swift Regex dialect) applied to line text.")
+    var grep: String?
+
+    @Argument(help: "Server name.")
+    var name: String
+
+    @Option(help: "Only lines at or after this time: 5m/2h style or ISO-8601.")
+    var since: String?
+
+    @Option(help: "Only lines after the mark with this id (from devctl mark).")
+    var sinceMark: String?
+
+    @Option(help: "Filter to one stream: out, err, sys, or mark.")
+    var stream: [String] = []
+
+    @Option(help: "Only the last N lines.")
+    var tail: Int?
+
+    func run() async throws {
+        var sinceDate: Date?
+        if let since {
+            sinceDate = Self.parseSince(since)
+            if sinceDate == nil {
+                CLIRunner.fail(
+                    WireError(code: .usage, message: "--since takes 5m/2h/1d style or ISO-8601, got '\(since)'"),
+                    json: global.json)
+            }
+        }
+        let streams: [LogStream]? = stream.isEmpty ? nil : stream.compactMap { LogStream(rawValue: $0) }
+        if let streams, streams.count != stream.count {
+            CLIRunner.fail(
+                WireError(code: .usage, message: "--stream takes out, err, sys, or mark"), json: global.json)
+        }
+        var params = LogsQueryParams(
+            grep: grep, name: name, project: global.resolvedProject(), since: sinceDate,
+            sinceMark: sinceMark, streams: streams, tail: follow ? (tail ?? 50) : tail)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
+        }
+        emit(result.lines)
+        guard follow else { return }
+        /** Follow = incremental polling since the last seen line: restart-safe
+            and no push machinery. Duplicate timestamps are deduped by count. */
+        var lastAt = result.lines.last?.at
+        var seenAtLast = result.lines.filter { $0.at == lastAt }.count
+        params.sinceMark = nil
+        params.tail = nil
+        while true {
+            try await Task.sleep(for: .milliseconds(300))
+            params.since = lastAt
+            let more = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+                try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
+            }
+            var fresh = more.lines
+            if let lastAt {
+                var skip = seenAtLast
+                fresh = fresh.drop { record in
+                    if record.at == lastAt, skip > 0 {
+                        skip -= 1
+                        return true
+                    }
+                    return false
+                }.filter { $0.at >= lastAt }
+            }
+            if !fresh.isEmpty {
+                emit(fresh)
+                lastAt = fresh.last?.at
+                seenAtLast = more.lines.filter { $0.at == lastAt }.count
+            }
+        }
+    }
+
+    private func emit(_ lines: [LogRecord]) {
+        if global.json {
+            for line in lines {
+                if let data = try? JSONCoding.encoder().encode(line) {
+                    print(String(decoding: data, as: UTF8.self))
+                }
+            }
+        } else {
+            for line in lines {
+                print("\(JSONCoding.formatISO8601(line.at)) [\(line.stream.rawValue)] \(line.text)")
+            }
+        }
+    }
+
+    /** 5m / 2h / 1d / 30s relative forms, else ISO-8601. */
+    static func parseSince(_ text: String) -> Date? {
+        if let match = text.wholeMatch(of: /(\d+)([smhd])/) {
+            let value = Double(match.1) ?? 0
+            let unit: Double =
+                switch match.2 {
+                case "s": 1
+                case "m": 60
+                case "h": 3600
+                default: 86400
+                }
+            return Date().addingTimeInterval(-value * unit)
+        }
+        return JSONCoding.parseISO8601(text)
+    }
+}
+
+struct Mark: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Drop a correlation marker into a server's log stream.")
+
+    @Flag(help: "Mark every server in the project.")
+    var all = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Requester label recorded with the mark (defaults to the client pid).")
+    var label: String?
+
+    /** With --all the only argument is the text; otherwise name then text. */
+    @Argument(help: "Server name (omitted with --all), then marker text.")
+    var words: [String]
+
+    func run() async throws {
+        var name: String?
+        var text: String
+        if all {
+            guard !words.isEmpty else {
+                CLIRunner.fail(WireError(code: .usage, message: "mark --all needs marker text"), json: global.json)
+            }
+            text = words.joined(separator: " ")
+        } else {
+            guard words.count >= 2 else {
+                CLIRunner.fail(
+                    WireError(code: .usage, message: "usage: devctl mark <name> <text> (or --all <text>)"),
+                    json: global.json)
+            }
+            name = words[0]
+            text = words.dropFirst().joined(separator: " ")
+        }
+        let params = MarkParams(
+            all: all ? true : nil,
+            label: label ?? "pid-\(getpid())",
+            name: name,
+            project: global.resolvedProject(),
+            text: text)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.logsMark, params: params, expecting: MarkResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            r.marks.map { "marked \($0.server): \($0.id) at \(JSONCoding.formatISO8601($0.at))" }
+                .joined(separator: "\n")
+        }
+    }
+}
+
+struct Events: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "The unified event feed: starts, stops, crashes, health changes, marks.")
+
+    @Flag(help: "Events for every project, not just the current one.")
+    var all = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Only events at or after this time: 5m/2h style or ISO-8601.")
+    var since: String?
+
+    @Option(help: "Only events after the mark with this id.")
+    var sinceMark: String?
+
+    @Option(help: "Only the last N events.")
+    var tail: Int?
+
+    func run() async throws {
+        var sinceDate: Date?
+        if let since {
+            sinceDate = Logs.parseSince(since)
+            if sinceDate == nil {
+                CLIRunner.fail(
+                    WireError(code: .usage, message: "--since takes 5m/2h/1d style or ISO-8601, got '\(since)'"),
+                    json: global.json)
+            }
+        }
+        let params = EventsQueryParams(
+            project: all ? nil : global.resolvedProject(),
+            since: sinceDate,
+            sinceMark: sinceMark,
+            tail: tail)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.eventsQuery, params: params, expecting: EventsQueryResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            if r.events.isEmpty { return "no events" }
+            return r.events.map { event in
+                var text = "\(JSONCoding.formatISO8601(event.at)) \(event.server): \(event.kind.rawValue)"
+                if let detail = event.detail { text += " (\(detail))" }
+                return text
+            }.joined(separator: "\n")
+        }
+    }
+}
+
+struct Why: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Diagnose a server: root cause across its dependency chain.")
+
+    @OptionGroup var global: GlobalOptions
+
+    @Argument(help: "Server name.")
+    var name: String
+
+    func run() async throws {
+        let params = ServerTargetParams(name: name, project: global.resolvedProject())
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.serverWhy, params: params, expecting: WhyResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            var sections: [String] = []
+            if let root = r.rootCause {
+                sections.append("root cause: \(root)")
+            }
+            for finding in r.findings {
+                var block = "\(finding.server) [\(finding.phase.rawValue)]: \(finding.summary)"
+                for line in finding.evidence {
+                    block += "\n    \(line)"
+                }
+                sections.append(block)
+            }
+            return sections.joined(separator: "\n")
+        }
+    }
+}
+
+struct Context: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Fenced plain-text server context for any agent harness. Silent when there is nothing to say.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        if let text = await AgentContext.render(project: global.resolvedProject()) {
+            print(text)
+        }
+    }
+}
+
+struct HookCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "hook",
+        abstract: "Agent-harness session hooks.",
+        subcommands: [HookInstall.self, HookClaudeSessionStart.self]
+    )
+}
+
+struct HookInstall: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install",
+        abstract: "Wire the session-start context hook into an agent harness (idempotent).")
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")).")
+    var harness: String = "claude"
+
+    @Flag(help: "Also print the statusline wiring suggestion.")
+    var statusline = false
+
+    func run() async throws {
+        guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", ")) (adding one: CONTRIBUTING.md)",
+                    message: "unknown harness '\(harness)'"),
+                json: global.json)
+        }
+        let devctlPath = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath().path
+        do {
+            let summary = try adapter.install(devctlPath: devctlPath)
+            var output = summary
+            if statusline {
+                output += "\n\nStatusline: pipe your statusline script through `devctl statusline` to append server presence, e.g.\n  devctl statusline <<< \"$STDIN_JSON\"  ->  web:3000 ok · api crashed"
+            }
+            CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
+        } catch {
+            CLIRunner.fail(
+                WireError(code: .internalError, message: "hook install failed: \(error)"),
+                json: global.json)
+        }
+    }
+}
+
+/** Invoked by Claude Code's SessionStart hook. Reads the hook's stdin JSON for
+    the session cwd, emits hookSpecificOutput.additionalContext, and always exits
+    0 quickly: a session start must never stall or fail on devctl's account. */
+struct HookClaudeSessionStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "claude-session-start", shouldDisplay: false)
+
+    func run() async throws {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        var cwd = FileManager.default.currentDirectoryPath
+        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any],
+            let hookCwd = payload["cwd"] as? String {
+            cwd = hookCwd
+        }
+        /** Project resolution without --project: reuse the CLI's walk from the
+            hook cwd by chdir-ing there first. */
+        FileManager.default.changeCurrentDirectoryPath(cwd)
+        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let text = await AgentContext.render(project: project) else { return }
+        let output: [String: Any] = [
+            "hookSpecificOutput": [
+                "additionalContext": text,
+                "hookEventName": "SessionStart",
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: output) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+}
+
+/** Statusline helper: reads the harness's statusline stdin JSON, prints one
+    compact presence line for the cwd's project (empty when nothing to show). */
+struct Statusline: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Compact server presence for a statusline; reads harness stdin JSON.")
+
+    func run() async throws {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        var cwd = FileManager.default.currentDirectoryPath
+        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
+            if let workspace = payload["workspace"] as? [String: Any],
+                let dir = workspace["current_dir"] as? String {
+                cwd = dir
+            } else if let dir = payload["cwd"] as? String {
+                cwd = dir
+            }
+        }
+        let project = GlobalOptions.resolveProject(from: cwd)
+        let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+        guard
+            let list = try? await client.request(
+                .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self),
+            !list.servers.isEmpty
+        else { return }
+        let parts = list.servers.map { server in
+            let port = (server.observedPort ?? server.declaredPort).map { ":\($0)" } ?? ""
+            let state =
+                switch server.phase {
+                case .running: "ok"
+                default: server.phase.rawValue
+                }
+            return "\(server.server)\(port) \(state)"
+        }
+        print(parts.joined(separator: " · "))
+    }
+}
+
+struct Up: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Start the whole project in dependency order, waiting per waitFor.")
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Comma-separated server names (their dependencies come along).")
+    var only: String?
+
+    @Option(help: "Per-server seconds to wait for health.")
+    var timeout: Double = 60
+
+    func run() async throws {
+        let params = GroupParams(
+            only: only.map { $0.split(separator: ",").map(String.init) },
+            project: global.resolvedProject(),
+            timeoutSeconds: timeout)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.groupUp, params: params, expecting: GroupResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            r.results.map { entry in
+                entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
+                    ?? CLIRunner.describe(entry.server)
+            }.joined(separator: "\n")
+        }
+        if result.results.contains(where: { $0.reason != nil }) {
+            Foundation.exit(1)
+        }
+    }
+}
+
+struct Down: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Stop the whole project in reverse dependency order.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let params = GroupParams(project: global.resolvedProject())
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.groupDown, params: params, expecting: GroupResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            r.results.isEmpty
+                ? "nothing to stop"
+                : r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")
+        }
+    }
+}
+
+struct Trust: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Approve this project's devservers.json so the session hook advertises it.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let params = ProjectOnlyParams(project: global.resolvedProject())
+        _ = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.projectTrust, params: params, expecting: WireEmpty.self)
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "project trusted" }
+    }
+}
+
+struct Open: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Open a server's URL (or one of a multi-headed server's named heads).")
+
+    /** Positional order is load-bearing: the server name comes first, then the
+        optional head, so declaration order deliberately breaks the alphabet. */
+    @Argument(help: "Server name.")
+    var name: String
+
+    @Argument(help: "Head name for multi-headed servers (see devctl status --json).")
+    var head: String?
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let params = ProjectParams(name: name, project: global.resolvedProject())
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
+        }
+        guard let server = result.servers.first else {
+            CLIRunner.fail(
+                WireError(
+                    code: .notFound, hint: "run: devctl status --json",
+                    message: "no server named '\(name)' is registered for this project"),
+                json: global.json)
+        }
+        var target = server.url
+        if let head {
+            guard let headURL = server.heads?[head] else {
+                let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
+                CLIRunner.fail(
+                    WireError(
+                        code: .notFound,
+                        hint: known.isEmpty ? "this server declares no heads" : "known heads: \(known)",
+                        message: "no head named '\(head)' on \(name)"),
+                    json: global.json)
+            }
+            target = headURL
+        }
+        guard let url = target else {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "add a port, url, or heads to \(name) in devservers.json",
+                    message: "\(name) has no URL (no port declared and no url configured)"),
+                json: global.json)
+        }
+        LaunchdAdmin.shell("/usr/bin/open", [url])
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "opened \(url)" }
+    }
+}
+
+struct ConfigCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "config",
+        abstract: "Project configuration helpers.",
+        subcommands: [ConfigCheck.self]
+    )
+}
+
+struct ConfigCheck: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "check", abstract: "Validate devservers.json with the daemon's own validator.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let params = ProjectOnlyParams(project: global.resolvedProject())
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.projectCheck, params: params, expecting: CheckResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            var lines: [String] = []
+            if let host = r.host { lines.append("host: \(host)") }
+            if !r.servers.isEmpty { lines.append("servers: \(r.servers.joined(separator: ", "))") }
+            lines.append(contentsOf: r.errors.map { "error: \($0)" })
+            lines.append(contentsOf: r.warnings.map { "warning: \($0)" })
+            if r.errors.isEmpty && r.warnings.isEmpty { lines.append("config ok") }
+            return lines.joined(separator: "\n")
+        }
+        if !result.errors.isEmpty {
+            Foundation.exit(1)
+        }
+    }
+}
+
+struct Doctor: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Health report: daemon, launchd, PATH staleness, signatures, stale registrations.")
+
+    @Flag(help: "Prune registry entries whose project directories no longer exist.")
+    var fix = false
+
+    @OptionGroup var global: GlobalOptions
+
+    struct Finding: Codable {
+        var detail: String
+        var kind: String
+        var severity: String
+    }
+
+    func run() async throws {
+        var findings: [Finding] = []
+        let client = CLIRunner.client()
+        let info = try? await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+        if let info {
+            findings.append(
+                Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: "daemon", severity: "ok"))
+            let livePath = LaunchdAdmin.capturedPath()
+            if let daemonPath = info.searchPath, daemonPath != livePath {
+                findings.append(
+                    Finding(
+                        detail: "daemon PATH differs from the current login shell (captured at install; run: devctl daemon install)",
+                        kind: "path-staleness", severity: "warning"))
+            }
+        } else {
+            findings.append(
+                Finding(detail: "daemon not responding (run: devctl daemon status)", kind: "daemon", severity: "error"))
+        }
+        findings.append(
+            Finding(detail: LaunchdAdmin.launchdState(), kind: "launchd", severity: "info"))
+        if let all = try? await client.request(
+            .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
+            var signatureHolders: [String: String] = [:]
+            var staleProjects: Set<String> = []
+            for server in all.servers {
+                if !FileManager.default.fileExists(atPath: server.project) {
+                    staleProjects.insert(server.project)
+                    continue
+                }
+                if let port = server.declaredPort {
+                    let host = server.url.flatMap { URL(string: $0)?.host } ?? "localhost"
+                    let signature = "\(host):\(port)"
+                    let holder = "\(server.server) (\(server.project))"
+                    if let existing = signatureHolders[signature] {
+                        findings.append(
+                            Finding(
+                                detail: "signature \(signature) claimed by both \(existing) and \(holder)",
+                                kind: "signature-conflict", severity: "warning"))
+                    } else {
+                        signatureHolders[signature] = holder
+                        findings.append(
+                            Finding(
+                                detail: "\(signature) -> \(holder) [\(server.phase.rawValue)]",
+                                kind: "signature", severity: "info"))
+                    }
+                    if server.phase == .stopped || server.phase == .crashed,
+                        PortGuardProbe.isListening(port: port) {
+                        findings.append(
+                            Finding(
+                                detail: "port \(port) has an unmanaged listener while \(server.server) is down",
+                                kind: "port-squatter", severity: "warning"))
+                    }
+                }
+            }
+            for project in staleProjects.sorted() {
+                if fix {
+                    let names = all.servers.filter { $0.project == project }.map(\.server)
+                    for name in names {
+                        _ = try? await client.request(
+                            .serverUnregister,
+                            params: ServerTargetParams(name: name, project: project),
+                            expecting: WireEmpty.self)
+                    }
+                    findings.append(
+                        Finding(detail: "pruned \(project) (\(names.count) servers)", kind: "stale-project", severity: "fixed"))
+                } else {
+                    findings.append(
+                        Finding(
+                            detail: "\(project) no longer exists on disk (devctl doctor --fix prunes it)",
+                            kind: "stale-project", severity: "warning"))
+                }
+            }
+        }
+        if global.json {
+            struct Report: Codable {
+                var findings: [Finding]
+            }
+            CLIRunner.emit(Report(findings: findings), json: true) { _ in "" }
+        } else {
+            for finding in findings {
+                print("[\(finding.severity)] \(finding.kind): \(finding.detail)")
+            }
+        }
+        if findings.contains(where: { $0.severity == "error" }) {
+            Foundation.exit(1)
+        }
+    }
+}
+
+/** TCP listen probe for doctor, duplicated minimally from the daemon's health
+    prober (the CLI cannot import DevCtlDaemonCore, which links swift-subprocess). */
+enum PortGuardProbe {
+    static func isListening(port: Int) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
     }
 }
 
@@ -253,8 +1004,135 @@ struct DaemonCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "daemon",
         abstract: "Daemon management.",
-        subcommands: [DaemonInfoCommand.self]
+        subcommands: [
+            DaemonInfoCommand.self, DaemonInstall.self, DaemonRestart.self, DaemonStart.self,
+            DaemonStatusCommand.self, DaemonStop.self, DaemonUninstall.self,
+        ]
     )
+}
+
+struct DaemonInstall: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install", abstract: "Install (or upgrade) the launchd agent and start the daemon.")
+
+    @Option(help: "Path to the devctld binary; defaults to the one alongside this devctl.")
+    var devctld: String?
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let binary = devctld.map { URL(fileURLWithPath: $0) } ?? LaunchdAdmin.bundledDaemonBinary()
+        guard let binary else {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "run: devctl daemon install --devctld /path/to/devctld",
+                    message: "cannot find a devctld binary next to devctl"),
+                json: global.json)
+        }
+        do {
+            try await LaunchdAdmin.install(daemonBinary: binary, paths: DevCtlPaths())
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in
+            "devctld installed and running (\(LaunchdAdmin.label))"
+        }
+    }
+}
+
+struct DaemonUninstall: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "uninstall", abstract: "Stop the daemon and remove the launchd agent.")
+
+    @OptionGroup var global: GlobalOptions
+
+    @Flag(help: "Also delete all devctl data and logs.")
+    var purge = false
+
+    func run() async throws {
+        await LaunchdAdmin.uninstall(paths: DevCtlPaths(), purge: purge)
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in
+            purge ? "devctld uninstalled; data and logs removed" : "devctld uninstalled"
+        }
+    }
+}
+
+struct DaemonStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "start", abstract: "Start a stopped daemon (clears the deliberate-stop marker).")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        do {
+            try await LaunchdAdmin.start(paths: DevCtlPaths())
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "devctld running" }
+    }
+}
+
+struct DaemonStop: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "stop", abstract: "Drain all servers and stop the daemon until asked to start.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let client = CLIRunner.client()
+        _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in
+            "devctld stopping (servers drained; devctl daemon start to bring it back)"
+        }
+    }
+}
+
+struct DaemonRestart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "restart",
+        abstract: "Drain, relaunch the daemon, and re-ensure the servers that were running.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let bounced: [(project: String, name: String)]
+        do {
+            bounced = try await LaunchdAdmin.restart(paths: DevCtlPaths())
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in
+            bounced.isEmpty
+                ? "devctld restarted (no servers were running)"
+                : "devctld restarted; re-ensured \(bounced.map(\.name).joined(separator: ", "))"
+        }
+    }
+}
+
+struct DaemonStatusCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "status", abstract: "launchd state plus live daemon identity.")
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let launchdLine = LaunchdAdmin.launchdState()
+        let client = CLIRunner.client()
+        let info = try? await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+        if global.json {
+            struct StatusPayload: Codable {
+                var daemon: DaemonInfo?
+                var launchd: String
+            }
+            CLIRunner.emit(StatusPayload(daemon: info, launchd: launchdLine), json: true) { _ in "" }
+        } else if let info {
+            print("launchd: \(launchdLine)\ndaemon: v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)")
+        } else {
+            print("launchd: \(launchdLine)\ndaemon: not responding")
+        }
+    }
 }
 
 struct DaemonInfoCommand: AsyncParsableCommand {
@@ -264,11 +1142,235 @@ struct DaemonInfoCommand: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
-        let result = await CLIRunner.run(json: global.json) { client in
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
         }
         CLIRunner.emit(result, json: global.json) { info in
             "devctld v\(info.daemonVersion) (proto \(info.proto)) pid \(info.pid)\nsocket \(info.socketPath)\ndata \(info.dataDir)\nlogs \(info.logsDir)"
         }
+    }
+}
+
+/** Branch switching with the project's own lifecycle playbook: stop the
+    servers, move the checkout, run the configured commands (install, seed,
+    codegen), bring everything back healthy. The tree must be clean: devctl
+    never stashes or discards work. */
+struct Switch: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Switch the project to a branch, run its lifecycle commands, and bring servers back up.")
+
+    @Argument(help: "Branch name (created from the matching remote branch when needed).")
+    var branch: String
+
+    @OptionGroup var global: GlobalOptions
+
+    @Flag(help: "Skip the git fetch before switching.")
+    var noFetch = false
+
+    @Option(help: "Per-server seconds to wait for health when coming back up.")
+    var timeout: Double = 120
+
+    func run() async throws {
+        let project = global.resolvedProject()
+        let dirty = Self.git(["status", "--porcelain"], in: project)
+        guard dirty.status == 0 else {
+            CLIRunner.fail(
+                WireError(code: .internalError, message: "git status failed: \(dirty.output)"),
+                json: global.json)
+        }
+        guard dirty.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "commit your work first (devctl never stashes or discards changes)",
+                    message: "the working tree has uncommitted changes"),
+                json: global.json)
+        }
+        if !noFetch {
+            print("fetching…")
+            _ = Self.git(["fetch", "origin", "--prune"], in: project)
+        }
+        print("stopping servers…")
+        _ = try? await CLIRunner.client().request(
+            .groupDown, params: GroupParams(project: project), expecting: GroupResult.self)
+        var switched = Self.git(["switch", branch], in: project)
+        if switched.status != 0 {
+            /** A remote-only branch needs a tracking checkout. */
+            switched = Self.git(["switch", "--track", "origin/\(branch)"], in: project)
+        }
+        guard switched.status == 0 else {
+            CLIRunner.fail(
+                WireError(
+                    code: .internalError,
+                    hint: "run: git -C \(project) switch \(branch)",
+                    message: "git switch failed: \(switched.output.trimmingCharacters(in: .whitespacesAndNewlines))"),
+                json: global.json)
+        }
+        print("on \(branch)")
+        let playbook = (try? ProjectConfigLoader.load(project: project))
+            .flatMap { _ in try? JSONCoding.decoder().decode(
+                ProjectFileConfig.self,
+                from: Data(contentsOf: ProjectConfigLoader.configURL(project: project))) }?
+            .lifecycle?["switch"] ?? []
+        for argv in playbook {
+            guard let executable = argv.first else { continue }
+            print("lifecycle: \(argv.joined(separator: " "))")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = argv
+            process.currentDirectoryURL = URL(fileURLWithPath: project)
+            do {
+                try process.run()
+            } catch {
+                CLIRunner.fail(
+                    WireError(
+                        code: .spawnFailed,
+                        message: "cannot run lifecycle command '\(executable)': \(error)"),
+                    json: global.json)
+            }
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                CLIRunner.fail(
+                    WireError(
+                        code: .internalError,
+                        hint: "fix the failure, then: devctl up",
+                        message: "lifecycle command failed (\(process.terminationStatus)): \(argv.joined(separator: " "))"),
+                    json: global.json)
+            }
+        }
+        print("bringing servers up…")
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(
+                .groupUp,
+                params: GroupParams(project: project, timeoutSeconds: timeout),
+                expecting: GroupResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            r.results.isEmpty
+                ? "switched to \(branch) (no servers registered)"
+                : r.results.map { entry in
+                    entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
+                        ?? CLIRunner.describe(entry.server)
+                }.joined(separator: "\n")
+        }
+        if result.results.contains(where: { $0.reason != nil }) {
+            Foundation.exit(1)
+        }
+    }
+
+    static func git(_ arguments: [String], in project: String) -> (status: Int32, output: String) {
+        LaunchdAdmin.shell("/usr/bin/git", ["-C", project] + arguments)
+    }
+}
+
+/** Runs a command while holding a named resource exclusively: managed servers
+    declaring the resource in their `locks` are stopped first and re-ensured
+    after, and their starts are refused for the duration, so a test harness's
+    private server never contends with the managed one over shared mutable
+    state (a local database, a fixture tree). */
+struct Lock: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Run a command holding a project resource; conflicting servers pause and return.")
+
+    @OptionGroup var global: GlobalOptions
+
+    /** Positional order is load-bearing: the resource comes first, everything
+        after -- is the command, so declaration order deliberately breaks the
+        alphabet. */
+    @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
+    var resource: String
+
+    @Argument(parsing: .captureForPassthrough, help: "Command to run while holding the resource.")
+    var command: [String]
+
+    @Option(help: "Seconds to wait for the resource if another holder has it.")
+    var acquireTimeout: Double = 300
+
+    @Option(help: "Per-server seconds to wait for health when servers return.")
+    var timeout: Double = 120
+
+    func run() async throws {
+        guard !command.isEmpty else {
+            CLIRunner.fail(
+                WireError(code: .usage, message: "usage: devctl lock <resource> -- <command…>"),
+                json: global.json)
+        }
+        let project = global.resolvedProject()
+        let holderPid = Int(getpid())
+        let client = CLIRunner.client()
+        /** Which managed holders are up now decides what comes back after. */
+        let statuses = (try? await client.request(
+            .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self))?
+            .servers ?? []
+        let merged = statuses.filter { status in
+            status.phase == .running || status.phase == .starting || status.phase == .unhealthy
+        }
+        var toRestore: [String] = []
+        /** Acquire with patience: another harness may hold it. */
+        let deadline = Date().addingTimeInterval(acquireTimeout)
+        var acquired = false
+        var lastError: WireError?
+        while Date() < deadline {
+            do {
+                _ = try await client.request(
+                    .lockAcquire,
+                    params: LockParams(holderPid: holderPid, project: project, resource: resource),
+                    expecting: WireEmpty.self)
+                acquired = true
+                break
+            } catch let error as WireError where error.code == .resourceLocked {
+                lastError = error
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+        guard acquired else {
+            CLIRunner.fail(
+                lastError ?? WireError(code: .resourceLocked, message: "could not acquire '\(resource)'"),
+                json: global.json)
+        }
+        /** Stop the managed holders of this resource (recorded for the return
+            trip). The daemon knows which specs declare it via config; the CLI
+            asks per-server status and stops the ones whose spec declares the
+            resource: simplest source is the config itself. */
+        if let view = try? ProjectConfigLoader.load(project: project) {
+            for spec in view.specs where (spec.locks ?? []).contains(resource) {
+                let wasActive = merged.contains { $0.server == spec.name }
+                if wasActive {
+                    toRestore.append(spec.name)
+                    _ = try? await client.request(
+                        .serverStop,
+                        params: ServerTargetParams(name: spec.name, project: project),
+                        expecting: ServerResult.self)
+                    print("paused \(spec.name) (holds \(resource))")
+                }
+            }
+        }
+        /** Run the guarded command with inherited stdio. */
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = command
+        process.currentDirectoryURL = URL(fileURLWithPath: project)
+        var commandStatus: Int32 = 1
+        do {
+            try process.run()
+            process.waitUntilExit()
+            commandStatus = process.terminationStatus
+        } catch {
+            FileHandle.standardError.write(Data("devctl lock: cannot run command: \(error)\n".utf8))
+        }
+        /** Release, then bring the paused servers back even if the command
+            failed: the checkpointed world returns either way. */
+        _ = try? await client.request(
+            .lockRelease,
+            params: LockParams(holderPid: holderPid, project: project, resource: resource),
+            expecting: WireEmpty.self)
+        for name in toRestore {
+            print("resuming \(name)…")
+            _ = try? await client.request(
+                .serverEnsure,
+                params: EnsureParams(name: name, project: project, timeoutSeconds: timeout),
+                expecting: EnsureResult.self)
+        }
+        Foundation.exit(commandStatus)
     }
 }

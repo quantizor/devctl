@@ -61,6 +61,31 @@ public enum WaitTarget: String, Codable, Sendable {
     case started
 }
 
+/** What `devctl wait` blocks on. */
+public enum WaitCondition: String, Codable, Sendable {
+    case healthy
+    case stopped
+}
+
+/** Why an ensure/wait returned without reaching its target. Absent = reached. */
+public enum EnsureReason: String, Codable, Sendable {
+    case crashed
+    case failed
+    case stopped
+    case timeout
+}
+
+/** Result of ensure/wait: the status plus the reason it fell short, if it did. */
+public struct EnsureResult: Codable, Equatable, Sendable {
+    public var reason: EnsureReason?
+    public var server: ServerStatus
+
+    public init(reason: EnsureReason? = nil, server: ServerStatus) {
+        self.reason = reason
+        self.server = server
+    }
+}
+
 /** A server declaration: the unit of devservers.json and ad-hoc registration. */
 public struct ServerSpec: Codable, Equatable, Sendable {
     public var command: [String]
@@ -68,7 +93,18 @@ public struct ServerSpec: Codable, Equatable, Sendable {
     public var cwd: String?
     public var dependsOn: [String]?
     public var env: [String: String]?
+    /** Named entry points for a multi-headed server (a host-routing proxy
+        serving several surfaces on one port): display name -> URL. */
+    public var heads: [String: String]?
     public var healthcheck: HealthCheckSpec?
+    /** Absolute path to an icon image (resolved from the config's
+        project-relative path); used for Spotlight thumbnails. */
+    public var icon: String?
+    /** Named mutable resources this server holds while running (a local
+        database, a fixture directory). `devctl lock <resource> -- cmd` stops
+        holders for the command's duration, and starts are refused while a live
+        external holder owns the resource. */
+    public var locks: [String]?
     public var name: String
     public var port: Int?
     /** Runs the command through `/bin/zsh -lc` for shells that need login env (nvm/mise). */
@@ -81,7 +117,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         cwd: String? = nil,
         dependsOn: [String]? = nil,
         env: [String: String]? = nil,
+        heads: [String: String]? = nil,
         healthcheck: HealthCheckSpec? = nil,
+        icon: String? = nil,
+        locks: [String]? = nil,
         name: String,
         port: Int? = nil,
         shell: Bool? = nil,
@@ -92,7 +131,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         self.cwd = cwd
         self.dependsOn = dependsOn
         self.env = env
+        self.heads = heads
         self.healthcheck = healthcheck
+        self.icon = icon
+        self.locks = locks
         self.name = name
         self.port = port
         self.shell = shell
@@ -128,7 +170,9 @@ public struct SpawnError: Codable, Equatable, Sendable {
 /** The core status schema agents consume; documented in docs/cli-contract.md. */
 public struct ServerStatus: Codable, Equatable, Sendable {
     public var declaredPort: Int?
+    public var heads: [String: String]?
     public var healthcheck: HealthCheckType
+    public var icon: String?
     public var lastExit: LastExit?
     public var lastHealthAt: Date?
     public var logPath: String
@@ -145,7 +189,9 @@ public struct ServerStatus: Codable, Equatable, Sendable {
 
     public init(
         declaredPort: Int? = nil,
+        heads: [String: String]? = nil,
         healthcheck: HealthCheckType = .none,
+        icon: String? = nil,
         lastExit: LastExit? = nil,
         lastHealthAt: Date? = nil,
         logPath: String,
@@ -161,7 +207,9 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         url: String? = nil
     ) {
         self.declaredPort = declaredPort
+        self.heads = heads
         self.healthcheck = healthcheck
+        self.icon = icon
         self.lastExit = lastExit
         self.lastHealthAt = lastHealthAt
         self.logPath = logPath
@@ -175,6 +223,62 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.specStale = specStale
         self.uptimeSec = uptimeSec
         self.url = url
+    }
+}
+
+/** The unified event feed: lifecycle transitions, health changes, and marks as
+    one queryable stream. */
+public enum EventKind: String, Codable, Sendable {
+    case crashed
+    case failed
+    case healthy
+    case marked
+    case registered
+    case started
+    case stopped
+    case unhealthy
+    case unregistered
+}
+
+public struct EventRecord: Codable, Equatable, Sendable {
+    public var at: Date
+    public var detail: String?
+    public var kind: EventKind
+    public var project: String
+    public var server: String
+
+    public init(at: Date, detail: String? = nil, kind: EventKind, project: String, server: String) {
+        self.at = at
+        self.detail = detail
+        self.kind = kind
+        self.project = project
+        self.server = server
+    }
+}
+
+/** One step in a `devctl why` diagnosis chain. */
+public struct WhyFinding: Codable, Equatable, Sendable {
+    public var evidence: [String]
+    public var phase: ServerPhase
+    public var server: String
+    public var summary: String
+
+    public init(evidence: [String] = [], phase: ServerPhase, server: String, summary: String) {
+        self.evidence = evidence
+        self.phase = phase
+        self.server = server
+        self.summary = summary
+    }
+}
+
+public struct WhyResult: Codable, Equatable, Sendable {
+    public var findings: [WhyFinding]
+    /** The dependency-walk's best root-cause statement, when one stands out. */
+    public var rootCause: String?
+
+    public init(findings: [WhyFinding], rootCause: String? = nil) {
+        self.findings = findings
+        self.rootCause = rootCause
     }
 }
 

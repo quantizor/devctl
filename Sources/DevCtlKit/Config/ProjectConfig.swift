@@ -1,0 +1,251 @@
+import Foundation
+
+/** The committed per-project file: devservers.json at the project root. Server
+    names are the dictionary keys; `host` defaults to `<slug>.localhost` and
+    gives every server a unique browser origin (cookie/storage isolation). */
+public struct ProjectFileConfig: Codable, Equatable, Sendable {
+    public var host: String?
+    /** Project-relative path to an icon image (png/svg/anything NSImage reads);
+        servers may override with their own `icon`. Spotlight thumbnails use it. */
+    public var icon: String?
+    /** Named command playbooks (argv arrays, run sequentially from the project
+        root). `switch` runs between a branch change and the servers coming back
+        (installs, seeds, codegen); agents configure these to teach devctl the
+        project's usage patterns. */
+    public var lifecycle: [String: [[String]]]?
+    public var servers: [String: ProjectFileServer]
+    public var version: Int
+
+    public init(
+        host: String? = nil,
+        icon: String? = nil,
+        lifecycle: [String: [[String]]]? = nil,
+        servers: [String: ProjectFileServer],
+        version: Int = 1
+    ) {
+        self.host = host
+        self.icon = icon
+        self.lifecycle = lifecycle
+        self.servers = servers
+        self.version = version
+    }
+}
+
+/** A server entry as written in the file (the name lives in the key). */
+public struct ProjectFileServer: Codable, Equatable, Sendable {
+    public var command: [String]
+    public var cwd: String?
+    public var dependsOn: [String]?
+    public var env: [String: String]?
+    public var heads: [String: String]?
+    public var healthcheck: HealthCheckSpec?
+    public var host: String?
+    public var icon: String?
+    public var locks: [String]?
+    public var port: Int?
+    public var shell: Bool?
+    public var url: String?
+    public var waitFor: WaitTarget?
+
+    public init(
+        command: [String],
+        cwd: String? = nil,
+        dependsOn: [String]? = nil,
+        env: [String: String]? = nil,
+        heads: [String: String]? = nil,
+        healthcheck: HealthCheckSpec? = nil,
+        host: String? = nil,
+        icon: String? = nil,
+        locks: [String]? = nil,
+        port: Int? = nil,
+        shell: Bool? = nil,
+        url: String? = nil,
+        waitFor: WaitTarget? = nil
+    ) {
+        self.command = command
+        self.cwd = cwd
+        self.dependsOn = dependsOn
+        self.env = env
+        self.heads = heads
+        self.healthcheck = healthcheck
+        self.host = host
+        self.icon = icon
+        self.locks = locks
+        self.port = port
+        self.shell = shell
+        self.url = url
+        self.waitFor = waitFor
+    }
+}
+
+/** A validated project view: resolved specs plus the problems found. Errors
+    block use of the config; warnings ride along in check output. */
+public struct ProjectConfigView: Equatable, Sendable {
+    public var errors: [String]
+    public var host: String
+    public var specs: [ServerSpec]
+    public var warnings: [String]
+
+    public init(errors: [String] = [], host: String, specs: [ServerSpec] = [], warnings: [String] = []) {
+        self.errors = errors
+        self.host = host
+        self.specs = specs
+        self.warnings = warnings
+    }
+}
+
+public enum ProjectConfigLoader {
+    public static func configURL(project: String) -> URL {
+        URL(fileURLWithPath: project).appending(path: "devservers.json")
+    }
+
+    /** Parses and validates; a thrown error is a config-invalid the caller
+        surfaces verbatim. Warnings never block. */
+    public static func load(project: String) throws -> ProjectConfigView? {
+        let url = configURL(project: project)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let config: ProjectFileConfig
+        do {
+            config = try JSONCoding.decoder().decode(ProjectFileConfig.self, from: data)
+        } catch {
+            throw configError(from: error, at: url)
+        }
+        return validate(config: config, project: project)
+    }
+
+    public static func validate(config: ProjectFileConfig, project: String) -> ProjectConfigView {
+        let host = config.host ?? "\(defaultSlug(project: project)).localhost"
+        var view = ProjectConfigView(host: host)
+        var warnings: [String] = []
+        if config.version != 1 {
+            warnings.append("unknown config version \(config.version); this devctl understands version 1")
+        }
+        var declaredPorts: [Int: String] = [:]
+        var specs: [ServerSpec] = []
+        for (name, entry) in config.servers.sorted(by: { $0.key < $1.key }) {
+            if entry.command.isEmpty {
+                view.errors.append("server '\(name)': command is empty")
+            }
+            var iconPath: String?
+            if let relative = entry.icon ?? config.icon {
+                let absolute = (project as NSString).appendingPathComponent(relative)
+                if FileManager.default.fileExists(atPath: absolute) {
+                    iconPath = absolute
+                } else {
+                    warnings.append("server '\(name)': icon '\(relative)' not found in the project")
+                }
+            }
+            let serverHost = entry.host ?? host
+            var url = entry.url
+            if url == nil, let port = entry.port {
+                url = "http://\(serverHost):\(port)/"
+            }
+            if let port = entry.port {
+                if let holder = declaredPorts[port] {
+                    warnings.append("servers '\(holder)' and '\(name)' both declare port \(port)")
+                } else {
+                    declaredPorts[port] = name
+                }
+            }
+            for dep in entry.dependsOn ?? [] where config.servers[dep] == nil {
+                view.errors.append("server '\(name)' depends on unknown server '\(dep)'")
+            }
+            specs.append(
+                ServerSpec(
+                    command: entry.command,
+                    cwd: entry.cwd,
+                    dependsOn: entry.dependsOn,
+                    env: entry.env,
+                    heads: entry.heads,
+                    healthcheck: entry.healthcheck,
+                    icon: iconPath,
+                    locks: entry.locks,
+                    name: name,
+                    port: entry.port,
+                    shell: entry.shell,
+                    url: url,
+                    waitFor: entry.waitFor
+                ))
+        }
+        switch DependencyGraph.waves(specs: specs) {
+        case .success:
+            break
+        case .cycle(let names):
+            view.errors.append("dependency cycle: \(names.joined(separator: " -> "))")
+        }
+        view.specs = specs
+        view.warnings = warnings
+        return view
+    }
+
+    public static func defaultSlug(project: String) -> String {
+        (project as NSString).lastPathComponent
+            .lowercased()
+            .replacing(/[^a-z0-9-]+/) { _ in "-" }
+    }
+
+    /** Decode failures become a message a non-engineer can act on: the file,
+        the failing key path, and what was expected. */
+    public static func configError(from error: any Error, at url: URL) -> WireError {
+        var detail = String(describing: error)
+        if let decoding = error as? DecodingError {
+            switch decoding {
+            case .keyNotFound(let key, let context):
+                let path = (context.codingPath.map(\.stringValue) + [key.stringValue])
+                    .joined(separator: ".")
+                detail = "missing key \(path)"
+            case .typeMismatch(_, let context), .valueNotFound(_, let context), .dataCorrupted(let context):
+                let path = context.codingPath.map(\.stringValue).joined(separator: ".")
+                detail = path.isEmpty ? context.debugDescription : "\(context.debugDescription) at \(path)"
+            @unknown default:
+                break
+            }
+        }
+        return WireError(
+            code: .configInvalid,
+            hint: "run: devctl config check",
+            message: "cannot parse \(url.path): \(detail)")
+    }
+}
+
+/** Dependency ordering for group operations: Kahn's algorithm producing waves of
+    servers whose dependencies are all satisfied by earlier waves. */
+public enum DependencyGraph {
+    public enum WaveResult: Equatable, Sendable {
+        case cycle([String])
+        case success([[String]])
+    }
+
+    public static func waves(specs: [ServerSpec]) -> WaveResult {
+        let names = Set(specs.map(\.name))
+        var dependents: [String: [String]] = [:]
+        var inDegree: [String: Int] = [:]
+        for spec in specs {
+            let deps = (spec.dependsOn ?? []).filter(names.contains)
+            inDegree[spec.name] = deps.count
+            for dep in deps {
+                dependents[dep, default: []].append(spec.name)
+            }
+        }
+        var waves: [[String]] = []
+        var settled = 0
+        var frontier = inDegree.filter { $0.value == 0 }.keys.sorted()
+        while !frontier.isEmpty {
+            waves.append(frontier)
+            settled += frontier.count
+            var next: Set<String> = []
+            for name in frontier {
+                for dependent in dependents[name] ?? [] {
+                    inDegree[dependent]! -= 1
+                    if inDegree[dependent] == 0 { next.insert(dependent) }
+                }
+            }
+            frontier = next.sorted()
+        }
+        if settled < specs.count {
+            let stuck = inDegree.filter { $0.value > 0 }.keys.sorted()
+            return .cycle(stuck)
+        }
+        return .success(waves)
+    }
+}

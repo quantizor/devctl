@@ -30,10 +30,11 @@ private func makeEnv() throws -> TestEnv {
             launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
             registry: registry, spec: spec)
         let started = await supervisor.start()
-        #expect(started.phase == .running)
+        /** start() settles at spawn; health promotion to `running` follows. */
+        #expect(started.phase == .starting)
         #expect(started.pid != nil)
         try await Task.sleep(for: .milliseconds(300))
-        let spool = paths.spoolFile(project: env.projectPath, server: "web")
+        let spool = paths.structuredLogFile(project: env.projectPath, server: "web")
         let contents = try String(contentsOf: spool, encoding: .utf8)
         #expect(contents.contains("started"))
         let stopped = await supervisor.stop(graceSeconds: 2)

@@ -15,15 +15,16 @@ public enum ProcessOutcome: Sendable {
     POSIX_SPAWN_SETSID + kqueue EVFILT_PROC; the protocol is shaped so that swap
     stays invisible to callers. */
 public protocol ProcessLauncher: Sendable {
-    /** Spawns `argv` in a fresh session with stdout+stderr duped onto `spoolFD`.
-        Reports the pid via `onSpawn` as soon as it exists, then returns only when
-        the process has terminated. The spool fd is the child's; the caller keeps
-        ownership of its own copy. */
+    /** Spawns `argv` in a fresh session with stdout and stderr duped onto their
+        spool fds (separate files keep the stream tags honest). Reports the pid
+        via `onSpawn` as soon as it exists, then returns only when the process
+        has terminated. The fds are the child's; the caller keeps its copies. */
     func run(
         argv: [String],
         cwd: String?,
         environment: [String: String],
-        spoolFD: Int32,
+        stdoutFD: Int32,
+        stderrFD: Int32,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome
 }
@@ -35,7 +36,8 @@ public struct SubprocessLauncher: ProcessLauncher {
         argv: [String],
         cwd: String?,
         environment: [String: String],
-        spoolFD: Int32,
+        stdoutFD: Int32,
+        stderrFD: Int32,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
         guard let first = argv.first, !first.isEmpty else {
@@ -48,7 +50,8 @@ public struct SubprocessLauncher: ProcessLauncher {
         /** New session ⇒ new process group whose pgid == child pid, which is what
             group-directed SIGTERM/SIGKILL teardown relies on. */
         options.createSession = true
-        let fd = FileDescriptor(rawValue: spoolFD)
+        let outFD = FileDescriptor(rawValue: stdoutFD)
+        let errFD = FileDescriptor(rawValue: stderrFD)
         do {
             let result = try await Subprocess.run(
                 executable,
@@ -57,8 +60,8 @@ public struct SubprocessLauncher: ProcessLauncher {
                 workingDirectory: cwd.map { FilePath($0) },
                 platformOptions: options,
                 input: .none,
-                output: .fileDescriptor(fd, closeAfterSpawningProcess: false),
-                error: .fileDescriptor(fd, closeAfterSpawningProcess: false)
+                output: .fileDescriptor(outFD, closeAfterSpawningProcess: false),
+                error: .fileDescriptor(errFD, closeAfterSpawningProcess: false)
             ) { execution in
                 await onSpawn(execution.processIdentifier.value)
             }

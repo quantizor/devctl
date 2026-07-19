@@ -66,6 +66,10 @@ public actor Registry {
         self.state = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile) ?? StateFile()
     }
 
+    public func allProjects() -> [String] {
+        registry.projects.keys.sorted()
+    }
+
     public func project(_ path: String) -> RegisteredProject? {
         registry.projects[path]
     }
@@ -83,6 +87,17 @@ public actor Registry {
 
     public func specs(project: String) -> [ServerSpec] {
         (registry.projects[project]?.servers ?? [:]).values.sorted { $0.name < $1.name }
+    }
+
+    public func isTrusted(project: String) -> Bool {
+        registry.projects[project]?.trusted ?? false
+    }
+
+    public func setTrusted(project: String) throws {
+        var entry = registry.projects[project] ?? RegisteredProject()
+        entry.trusted = true
+        registry.projects[project] = entry
+        try persistRegistry()
     }
 
     public func unregister(project: String, name: String) throws {
