@@ -50,6 +50,7 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
+          build-mode: manual
           languages: swift
 
       - name: Build for CodeQL
