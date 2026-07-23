@@ -10,6 +10,9 @@ Agents forget their dev servers. After a context compaction they spawn duplicate
 
 ## Quick start
 
+(Your agent can do all of this for you, just point them at the repo.)
+
+
 ```sh
 make install          # binaries to ~/.local/bin, app to /Applications, daemon installed
 cd your-project
@@ -19,7 +22,7 @@ devctl why web        # root cause when something breaks
 devctl hook install   # Claude Code sessions rediscover servers automatically
 ```
 
-Or commit a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. The full CLI contract lives in `docs/cli-contract.md`.
+Or commit a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. The full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).
 
 ## The parts
 
