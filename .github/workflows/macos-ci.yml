@@ -11,17 +11,12 @@ permissions:
 jobs:
   tests:
     name: Tests
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3'
 
       - name: Show Swift version
         run: swift --version
@@ -31,7 +26,7 @@ jobs:
 
   codeql:
     name: Static analysis
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     permissions:
       actions: read
@@ -41,11 +36,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3'
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
