@@ -19,6 +19,21 @@ private func makeEnv() throws -> TestEnv {
         projectPath: project.path)
 }
 
+private func decodeResult<Result: Codable & Sendable>(_ data: Data, as type: Result.Type) throws -> Result {
+    try JSONCoding.decoder().decode(WireResponse<Result>.self, from: data).result.unwrap()
+}
+
+private extension Optional {
+    func unwrap() throws -> Wrapped {
+        guard let self else { throw TestError.missingValue }
+        return self
+    }
+}
+
+private enum TestError: Error {
+    case missingValue
+}
+
 @Suite struct SupervisorTests {
     @Test func startCapturesOutputAndStopKillsGroup() async throws {
         let env = try makeEnv()
@@ -150,5 +165,56 @@ private func makeEnv() throws -> TestEnv {
         try await registry.register(project: "/p", spec: ServerSpec(command: ["echo"], name: "web"))
         try await registry.unregister(project: "/p", name: "web")
         #expect(await registry.project("/p") == nil)
+    }
+}
+
+@Suite(.serialized) struct StartupRecoveryTests {
+    @Test func recoverAtStartupRestartsWithRegisteredPortAndEnv() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let project = env.projectPath
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "echo restored:$DEVCTL_RECOVERY_ENV; sleep 30"],
+            env: ["DEVCTL_RECOVERY_ENV": "seeded"],
+            healthcheck: HealthCheckSpec(type: .none),
+            name: "web",
+            port: 43123)
+        let id = serverID(project: project, name: spec.name)
+        try await registry.register(project: project, spec: spec)
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.resumeOnBoot = true
+        }
+
+        let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let statusFrame = try NDJSON.encodeLine(
+            WireRequest(
+                id: "status",
+                method: WireMethod.serverStatus.rawValue,
+                params: ProjectParams(name: "web", project: project)))
+        let status = try decodeResult(await router.handle(line: statusFrame), as: ServerListResult.self)
+        let server = try #require(status.servers.first)
+        #expect(server.declaredPort == 43123)
+        #expect(server.pid != nil)
+
+        #expect(!server.logPath.isEmpty)
+        let logPath = server.logPath
+        var logContents = ""
+        for _ in 0..<50 where !logContents.contains("restored:seeded") {
+            try await Task.sleep(for: .milliseconds(100))
+            logContents = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        }
+        #expect(logContents.contains("restored:seeded"))
+
+        let stopFrame = try NDJSON.encodeLine(
+            WireRequest(
+                id: "stop",
+                method: WireMethod.serverStop.rawValue,
+                params: ServerTargetParams(name: "web", project: project)))
+        let stopped = try decodeResult(await router.handle(line: stopFrame), as: ServerResult.self)
+        #expect(stopped.server.phase == .stopped)
     }
 }
