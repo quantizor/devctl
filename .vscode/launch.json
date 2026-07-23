@@ -1,0 +1,76 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Debug devctl",
+            "program": "${workspaceFolder:devctl}/.build/debug/devctl",
+            "preLaunchTask": "swift: Build Debug devctl"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Release devctl",
+            "program": "${workspaceFolder:devctl}/.build/release/devctl",
+            "preLaunchTask": "swift: Build Release devctl"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Debug devctld",
+            "program": "${workspaceFolder:devctl}/.build/debug/devctld",
+            "preLaunchTask": "swift: Build Debug devctld"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Release devctld",
+            "program": "${workspaceFolder:devctl}/.build/release/devctld",
+            "preLaunchTask": "swift: Build Release devctld"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Debug DevCtlApp",
+            "program": "${workspaceFolder:devctl}/.build/debug/DevCtlApp",
+            "preLaunchTask": "swift: Build Debug DevCtlApp"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Release DevCtlApp",
+            "program": "${workspaceFolder:devctl}/.build/release/DevCtlApp",
+            "preLaunchTask": "swift: Build Release DevCtlApp"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Debug fixture-server",
+            "program": "${workspaceFolder:devctl}/.build/debug/fixture-server",
+            "preLaunchTask": "swift: Build Debug fixture-server"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:devctl}",
+            "name": "Release fixture-server",
+            "program": "${workspaceFolder:devctl}/.build/release/fixture-server",
+            "preLaunchTask": "swift: Build Release fixture-server"
+        }
+    ]
+}

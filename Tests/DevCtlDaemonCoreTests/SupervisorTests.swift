@@ -59,6 +59,41 @@ private func makeEnv() throws -> TestEnv {
         #expect(status.pid == nil)
     }
 
+    @Test func deliberateStopRetiresBootIntent() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        /** Start records the intent to come back after a reboot. */
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+        _ = await supervisor.stop(graceSeconds: 2, deliberate: true)
+        /** A deliberate stop retires it: the user asked for down. */
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
+    }
+
+    @Test func drainStopPreservesBootIntent() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        _ = await supervisor.stop(graceSeconds: 2, deliberate: false)
+        /** A launchd drain keeps the intent so the next boot restores the server,
+            while the drained phase reads stopped. */
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.resumeOnBoot == true)
+    }
+
     @Test func crashRecordsExitForensics() async throws {
         let env = try makeEnv()
         let paths = env.paths

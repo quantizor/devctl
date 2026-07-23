@@ -178,4 +178,27 @@ private func pollPhase(
         close(sock)
         #expect(!NetworkHealthProber.tcpConnects(port: port, timeoutMs: 200))
     }
+
+    @Test func tcpProbeAgainstIPv6OnlyListener() throws {
+        /** Vite 5+ binds `::1` only; the probe must still see it as up. */
+        let sock = socket(AF_INET6, SOCK_STREAM, 0)
+        defer { close(sock) }
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = 0
+        addr.sin6_addr = in6addr_loopback
+        _ = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        listen(sock, 4)
+        var bound = sockaddr_in6()
+        var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        _ = withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &len) }
+        }
+        let port = Int(UInt16(bigEndian: bound.sin6_port))
+        #expect(NetworkHealthProber.tcpConnects(port: port, timeoutMs: 500))
+    }
 }

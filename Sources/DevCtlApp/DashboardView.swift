@@ -62,43 +62,78 @@ struct ServerDetail: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                TallyDot(phase: server.phase)
-                Text(server.server).font(.headline)
-                if let url = server.url {
-                    Button {
-                        if let parsed = URL(string: url) {
-                            NSWorkspace.shared.open(parsed)
-                        }
-                    } label: {
-                        Label(url, systemImage: "safari")
-                            .labelStyle(.titleAndIcon)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .center, spacing: 10) {
+                    TallyDot(phase: server.phase)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(server.server).font(.headline)
+                        Text(statusLine)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
-                            .truncationMode(.middle)
                     }
-                    .buttonStyle(.link)
-                    .frame(maxWidth: 280, alignment: .leading)
-                }
-                if let heads = server.heads, !heads.isEmpty {
-                    Menu("heads") {
-                        ForEach(heads.sorted(by: { $0.key < $1.key }), id: \.key) { name, url in
-                            Button("\(name) · \(url)") {
-                                if let parsed = URL(string: url) {
-                                    NSWorkspace.shared.open(parsed)
-                                }
-                            }
+                    Spacer(minLength: 8)
+                    ServerLifecycleControls(
+                        model: model, reserveSlot: false, server: server, size: 16)
+                    if server.url != nil {
+                        Button {
+                            openURL(server.url)
+                        } label: {
+                            Image(systemName: "safari")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 16, height: 16)
                         }
+                        .buttonStyle(.borderless)
+                        .help(server.url ?? "Open URL")
+                        .accessibilityLabel(Text("Open URL"))
+                        Button {
+                            if let url = server.url {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(url, forType: .string)
+                            }
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 16, height: 16)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy URL")
+                        .accessibilityLabel(Text("Copy URL"))
                     }
-                    .frame(maxWidth: 90)
+                    if let heads = server.heads, !heads.isEmpty {
+                        Menu {
+                            ForEach(heads.sorted(by: { $0.key < $1.key }), id: \.key) { name, url in
+                                Button("\(name) · \(url)") { openURL(url) }
+                            }
+                        } label: {
+                            Image(systemName: "rectangle.stack")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 16, height: 16)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .frame(width: 22)
+                        .help("Open head")
+                    }
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: server.logPath)])
+                    } label: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(width: 16, height: 16)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Reveal log file")
+                    .accessibilityLabel(Text("Reveal log file"))
+                    Picker("", selection: $tab) {
+                        ForEach(Tab.allCases, id: \.self) { Text($0.rawValue) }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 240)
                 }
-                Spacer()
-                Picker("", selection: $tab) {
-                    ForEach(Tab.allCases, id: \.self) { Text($0.rawValue) }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 260)
             }
-            .padding(10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             Divider()
             switch tab {
             case .config:
@@ -109,6 +144,39 @@ struct ServerDetail: View {
                 TimelinePane(project: server.project)
             }
         }
+    }
+
+    private var statusLine: String {
+        var parts: [String] = [server.phase.rawValue]
+        if let pid = server.pid {
+            parts.append("pid \(pid)")
+        }
+        if let port = server.observedPort ?? server.declaredPort {
+            parts.append("port \(port)")
+        }
+        if let uptime = server.uptimeSec, server.phase == .running || server.phase == .unhealthy {
+            parts.append(Self.formatUptime(uptime))
+        }
+        if server.specStale == true {
+            parts.append("spec stale")
+        }
+        if let err = server.spawnError {
+            parts.append(err.message)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func openURL(_ string: String?) {
+        guard let string, let parsed = URL(string: string) else { return }
+        NSWorkspace.shared.open(parsed)
+    }
+
+    private static func formatUptime(_ seconds: Int) -> String {
+        if seconds < 60 { return "\(seconds)s up" }
+        if seconds < 3600 { return "\(seconds / 60)m up" }
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        return minutes == 0 ? "\(hours)h up" : "\(hours)h \(minutes)m up"
     }
 }
 
@@ -331,7 +399,8 @@ struct LaneView: View {
 }
 
 /** devservers.json editor with optimistic concurrency: the daemon validates and
-    rejects when the file changed under the editor. */
+    rejects when the file changed under the editor. Syntax color is applied live
+    by JSONSyntaxEditor (AppKit NSTextView); no third-party highlighter. */
 struct ConfigEditor: View {
     let project: String
 
@@ -342,10 +411,9 @@ struct ConfigEditor: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TextEditor(text: $content)
-                .font(.system(size: 12, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .padding(6)
+            JSONSyntaxEditor(text: $content)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 6)
             Divider()
             HStack {
                 if let feedback {

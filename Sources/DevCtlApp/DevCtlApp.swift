@@ -4,6 +4,167 @@ import DevCtlKit
 import ServiceManagement
 import SwiftUI
 
+/** One selectable row in the popover's keyboard model. A server row or one of
+    its heads; `actions` are the Left/Right targets in display order. */
+struct KeyNavRow: Identifiable {
+    enum Kind {
+        case head(project: String, server: String, head: String)
+        case server(project: String, server: String)
+    }
+    enum Action: String {
+        case open
+        case pin
+        case restart
+        case start
+        case stop
+    }
+    let kind: Kind
+    let actions: [Action]
+
+    var id: String {
+        switch kind {
+        case .head(let project, let server, let head): "\(project)::\(server)::\(head)"
+        case .server(let project, let server): "\(project)::\(server)"
+        }
+    }
+}
+
+/** Arrow-key navigation for the popover. The `.window` MenuBarExtra does not
+    give SwiftUI buttons arrow-key focus, so a local key monitor owns Up/Down
+    (row), Left/Right (action within a row), Return (activate), and Escape
+    (clear). The highlighted cell is published; rows render it as a soft ring.
+    Installed only while the popover is open so it never eats keys elsewhere. */
+@Observable
+final class KeyNavModel {
+    var selection: (rowID: KeyNavRow.ID, action: KeyNavRow.Action)?
+
+    /** The live model, injected by MenuContent so controls resolve against the
+        same daemon connection the rows render from. */
+    var daemon: DaemonModel?
+
+    private var monitor: Any?
+    private var projects: [DaemonModel.ProjectGroup] = []
+    private var rows: [KeyNavRow] = []
+
+    /** Whether `rowID`'s `action` is the highlighted cell, for row rendering. */
+    func isHighlighted(_ rowID: KeyNavRow.ID, _ action: KeyNavRow.Action) -> Bool {
+        selection?.rowID == rowID && selection?.action == action
+    }
+
+    /** Rebuild the flat row list from the currently visible (filtered) tree. */
+    func sync(projects: [DaemonModel.ProjectGroup]) {
+        self.projects = projects
+        var next: [KeyNavRow] = []
+        for project in projects {
+            for server in project.servers {
+                var actions: [KeyNavRow.Action] = [.open]
+                switch server.phase {
+                case .running, .unhealthy, .starting:
+                    actions += [.restart, .stop]
+                case .stopped, .crashed, .failed, .stopping:
+                    actions += [.start]
+                }
+                next.append(KeyNavRow(kind: .server(project: project.path, server: server.server), actions: actions))
+                if let heads = server.heads {
+                    for name in heads.keys.sorted() {
+                        next.append(KeyNavRow(
+                            kind: .head(project: project.path, server: server.server, head: name),
+                            actions: [.open, .pin]))
+                    }
+                }
+            }
+        }
+        rows = next
+        /** Drop a selection that scrolled out of existence (phase flip changed
+            a row's action set, or the filter hid it). */
+        if let sel = selection, !rows.contains(where: { $0.id == sel.rowID && $0.actions.contains(sel.action) }) {
+            selection = nil
+        }
+    }
+
+    func installIfNeeded() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.handle(event) else { return event }
+            return nil
+        }
+    }
+
+    func tearDown() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        selection = nil
+    }
+
+    /** Returns true when the key was consumed. */
+    private func handle(_ event: NSEvent) -> Bool {
+        guard !rows.isEmpty else { return false }
+        switch event.keyCode {
+        case 125: move(1); return true   // down
+        case 126: move(-1); return true  // up
+        case 123: stepAction(-1); return true // left
+        case 124: stepAction(1); return true  // right
+        case 36, 76: activate(); return true  // return / keypad enter
+        case 53: selection = nil; return false // escape: pass through to close
+        default: return false
+        }
+    }
+
+    private func move(_ delta: Int) {
+        guard let sel = selection, let index = rows.firstIndex(where: { $0.id == sel.rowID }) else {
+            select(row: delta > 0 ? rows.first : rows.last)
+            return
+        }
+        select(row: rows[(index + delta + rows.count) % rows.count], preferring: sel.action)
+    }
+
+    private func stepAction(_ delta: Int) {
+        guard let sel = selection, let row = rows.first(where: { $0.id == sel.rowID }),
+            let index = row.actions.firstIndex(of: sel.action)
+        else { return }
+        selection = (row.id, row.actions[(index + delta + row.actions.count) % row.actions.count])
+    }
+
+    private func select(row: KeyNavRow?, preferring action: KeyNavRow.Action? = nil) {
+        guard let row else { selection = nil; return }
+        let chosen = action.flatMap { row.actions.contains($0) ? $0 : nil } ?? row.actions.first ?? .open
+        selection = (row.id, chosen)
+    }
+
+    private func server(_ project: String, _ name: String) -> ServerStatus? {
+        projects.first { $0.path == project }?.servers.first { $0.server == name }
+    }
+
+    /** Run the highlighted action against the live model so a stale row never
+        fires a control on a server that vanished. */
+    private func activate() {
+        guard let sel = selection, let row = rows.first(where: { $0.id == sel.rowID }) else { return }
+        switch row.kind {
+        case .server(let project, let name):
+            guard let server = server(project, name) else { return }
+            switch sel.action {
+            case .open:
+                ProjectAccessLog.shared.record(projectPath: project)
+                if let url = server.url.flatMap(URL.init(string:)) { NSWorkspace.shared.open(url) }
+            case .start: daemon?.startServer(server)
+            case .stop: daemon?.stopServer(server)
+            case .restart: daemon?.restartServer(server)
+            case .pin: break
+            }
+        case .head(let project, let name, let head):
+            guard let server = server(project, name), let url = server.heads?[head] else { return }
+            switch sel.action {
+            case .open:
+                ProjectAccessLog.shared.record(projectPath: project)
+                if let parsed = URL(string: url) { NSWorkspace.shared.open(parsed) }
+            case .pin:
+                HeadPins.shared.toggle(project: project, server: name, head: head)
+            default: break
+            }
+        }
+    }
+}
+
 /** Handles Spotlight item activation: a background (LSUIElement) app receives
     it through the app delegate, not a scene view, since the popover's view tree
     may not exist when Spotlight launches us. */
@@ -59,8 +220,38 @@ struct DevCtlApp: App {
 
 struct MenuContent: View {
     @State private var contentHeight: CGFloat = 0
+    @State private var filterText: String = ""
     @Environment(\.openWindow) private var openWindow
     var model: DaemonModel
+    @State private var sortOrder: ProjectSortOrder = {
+        ProjectSortOrder(rawValue: UserDefaults.standard.string(forKey: "project sort order") ?? "") ?? .alphabetical
+    }()
+    @State private var keyNav = KeyNavModel()
+
+    private var orderedProjects: [DaemonModel.ProjectGroup] {
+        model.sortedProjects(sortOrder)
+    }
+
+    private var filteredProjects: [DaemonModel.ProjectGroup] {
+        let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty { return orderedProjects }
+        return orderedProjects.compactMap { project in
+            let projectMatches = FuzzyMatcher.matches(project.name, query: query)
+            let matchingServers = project.servers.filter { server in
+                if projectMatches { return true }
+                if FuzzyMatcher.matches(server.server, query: query) { return true }
+                if FuzzyMatcher.matches(server.url ?? "", query: query) { return true }
+                if let heads = server.heads {
+                    return heads.keys.contains { FuzzyMatcher.matches($0, query: query) } ||
+                           heads.values.contains { FuzzyMatcher.matches($0, query: query) }
+                }
+                return false
+            }
+            if matchingServers.isEmpty { return nil }
+            return DaemonModel.ProjectGroup(
+                name: project.name, path: project.path, servers: matchingServers)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -77,91 +268,154 @@ struct MenuContent: View {
                 }
                 .padding(12)
             } else {
-                /** Autogrow: the popover takes exactly its content height up to
-                    the cap, then scrolls, instead of sitting tight at a fixed
-                    frame. The inner VStack's measured height drives the frame. */
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(model.projects) { project in
-                            ProjectSection(model: model, project: project)
+                let projects = filteredProjects
+                ZStack(alignment: .topLeading) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if projects.isEmpty {
+                                Text("No matching servers")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 8)
+                            } else {
+                                ForEach(projects) { project in
+                                    ProjectSection(
+                                        filterText: filterText, keyNav: keyNav, model: model, project: project)
+                                }
+                            }
+                        }
+                        /** Top pad = filter band so at rest nothing sits under it;
+                            rows still scroll beneath the floating control. */
+                        .padding(.horizontal, 12)
+                        .padding(.top, FilterBox.restClearance)
+                        .padding(.bottom, 12)
+                        .onGeometryChange(for: CGFloat.self) { proxy in
+                            proxy.size.height
+                        } action: { measured in
+                            contentHeight = measured
                         }
                     }
-                    .padding(12)
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.size.height
-                    } action: { measured in
-                        contentHeight = measured
+                    .frame(height: min(max(contentHeight, 44), 560))
+
+                    /** Top band: sort menu floats left, filter floats right. */
+                    HStack(spacing: 0) {
+                        SortOrderMenu(selection: $sortOrder)
+                            .onChange(of: sortOrder) { _, new in
+                                UserDefaults.standard.set(new.rawValue, forKey: "project sort order")
+                            }
+                        Spacer(minLength: 0)
+                        FilterBox(text: $filterText)
                     }
+                    .padding(.top, FilterBox.topInset)
+                    .padding(.leading, 8)
+                    .padding(.trailing, 8)
+                    .zIndex(1)
                 }
-                .frame(height: min(max(contentHeight, 44), 560))
             }
             Divider()
-            HStack {
-                Button("Dashboard") {
+            HStack(spacing: 0) {
+                Button {
                     openWindow(id: "dashboard")
                     NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    FooterIconLabel(systemImage: "rectangle.split.2x1", title: "Dashboard")
                 }
                 .buttonStyle(.borderless)
-                Spacer()
+                .foregroundStyle(.secondary)
+                /** Generous air between primary action and the login preference. */
                 LaunchAtLoginToggle()
-                Button("Quit") {
+                    .padding(.leading, 22)
+                Spacer(minLength: 8)
+                Button {
                     NSApp.terminate(nil)
+                } label: {
+                    FooterIconLabel(systemImage: "power", title: "Quit")
                 }
                 .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
         .frame(width: 340)
+        .onAppear {
+            keyNav.daemon = model
+            keyNav.installIfNeeded()
+            keyNav.sync(projects: filteredProjects)
+        }
+        .onDisappear { keyNav.tearDown() }
+        /** Re-sync on any tree change the nav model cares about: servers
+            appearing, the filter narrowing, or a phase flip changing a row's
+            action set (start vs restart+stop). */
+        .onChange(of: syncStamp) { _, _ in
+            keyNav.sync(projects: filteredProjects)
+        }
+    }
+
+    /** A cheap fingerprint of everything that changes the nav row set. */
+    private var syncStamp: String {
+        filteredProjects.flatMap { p in
+            p.servers.map { "\(p.path)::\($0.server)::\($0.phase.rawValue)::\($0.heads?.count ?? 0)" }
+        }.joined(separator: "|") + "?\(filterText)"
     }
 }
 
 struct ProjectSection: View {
+    let filterText: String
+    let keyNav: KeyNavModel
     var model: DaemonModel
     let project: DaemonModel.ProjectGroup
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(project.name)
-                .font(.caption)
+            FuzzyMatcher.highlightedText(project.name, query: filterText)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
             ForEach(project.servers, id: \.server) { server in
-                ServerRow(model: model, server: server)
+                ServerRow(filterText: filterText, keyNav: keyNav, model: model, server: server)
             }
         }
     }
 }
 
 struct ServerRow: View {
+    let filterText: String
+    let keyNav: KeyNavModel
     var model: DaemonModel
     let server: ServerStatus
 
+    private var rowID: String { "\(server.project)::\(server.server)" }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
+            /** One line: dot, the descriptive address, phase, lifecycle. The
+                bare server name ("dev"/"web") adds nothing the address and the
+                project header don't already say, so it's folded away. */
+            HStack(alignment: .center, spacing: 8) {
                 TallyDot(phase: server.phase)
                 /** Clicking the row opens the server's URL: the whole point of
                     the signature is a one-click browser origin. */
                 Button {
+                    ProjectAccessLog.shared.record(projectPath: server.project)
                     if let url = server.url.flatMap(URL.init(string:)) {
                         NSWorkspace.shared.open(url)
                     }
                 } label: {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(server.server)
-                            .fontWeight(.medium)
-                        Text(subtitle)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    .contentShape(Rectangle())
+                    FuzzyMatcher.highlightedText(address, query: filterText)
+                        .font(.caption2)
+                        .fontWeight(.medium)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(server.url == nil)
                 .help(server.url ?? "no URL configured")
-                Spacer()
-                controls
+                .modifier(KeyNavCell(active: keyNav.isHighlighted(rowID, .open)))
+                Text(server.phase.rawValue)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                ServerLifecycleControls(keyNav: keyNav, model: model, rowID: rowID, server: server)
             }
             /** Multi-headed servers list their surfaces as nested compact rows,
                 each a direct click-to-open; pinned heads float to the top. */
@@ -176,130 +430,245 @@ struct ServerRow: View {
                 VStack(alignment: .leading, spacing: 1) {
                     ForEach(ordered, id: \.key) { name, url in
                         HeadRow(
+                            filterText: filterText,
+                            keyNav: keyNav,
                             name: name,
+                            onOpen: {
+                                ProjectAccessLog.shared.record(projectPath: server.project)
+                            },
+                            onTogglePin: {
+                                pins.toggle(project: server.project, server: server.server, head: name)
+                            },
+                            parentURL: server.url,
                             pinned: pins.isPinned(project: server.project, server: server.server, head: name),
+                            rowID: "\(server.project)::\(server.server)::\(name)",
                             url: url
-                        ) {
-                            pins.toggle(project: server.project, server: server.server, head: name)
-                        }
+                        )
                     }
                 }
-                .padding(.leading, 16)
             }
         }
         .padding(.vertical, 2)
     }
 
-    private var subtitle: String {
+    /** The address half of the old subtitle, which is what actually identifies
+                the server once the redundant name is gone. */
+    private var address: String {
         if let url = server.url, let parsed = URL(string: url), let host = parsed.host {
             let port = parsed.port.map { ":\($0)" } ?? ""
-            return "\(host)\(port) · \(server.phase.rawValue)"
+            return "\(host)\(port)"
         }
         if let port = server.declaredPort {
-            return "port \(port) · \(server.phase.rawValue)"
+            return "port \(port)"
         }
-        return server.phase.rawValue
-    }
-
-    @ViewBuilder private var controls: some View {
-        switch server.phase {
-        case .running, .unhealthy, .starting:
-            Button {
-                model.restartServer(server)
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .help("Restart")
-            Button {
-                model.stopServer(server)
-            } label: {
-                Image(systemName: "stop.fill")
-            }
-            .buttonStyle(.borderless)
-            .help("Stop")
-        case .stopped, .crashed, .failed, .stopping:
-            Button {
-                model.startServer(server)
-            } label: {
-                Image(systemName: "play.fill")
-            }
-            .buttonStyle(.borderless)
-            .help("Start")
-            .disabled(server.phase == .stopping)
-        }
+        return server.server
     }
 }
 
-/** Collapsed presence: template rack glyph (adapts to the bar) plus colored
-    dot+count pairs baked into an NSImage, because MenuBarExtra flattens live
-    SwiftUI color to template monochrome; a rendered image keeps its color.
-    Only nonzero groups appear, so all-quiet is just the rack. */
+/** The keyboard-highlight ring: a quiet rounded outline around the selected
+    cell, matching the instrument-panel restraint (never a filled shout). */
+struct KeyNavCell: ViewModifier {
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            .background {
+                if active {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 1)
+                }
+            }
+    }
+}
+
+/** Start / stop / restart icon strip shared by the popover rows and the
+    dashboard detail header. `reserveSlot` keeps popover rows from jumping
+    when the phase swaps play for restart+stop. */
+struct ServerLifecycleControls: View {
+    var keyNav: KeyNavModel? = nil
+    var model: DaemonModel
+    /** When true, hold a blank 14pt slot so the play button lines up with stop. */
+    var reserveSlot: Bool = true
+    var rowID: String = ""
+    let server: ServerStatus
+    var size: CGFloat = 14
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch server.phase {
+            case .running, .unhealthy, .starting:
+                iconButton("arrow.clockwise", help: "Restart", action: .restart) {
+                    model.restartServer(server)
+                }
+                iconButton("stop.fill", help: "Stop", action: .stop) {
+                    model.stopServer(server)
+                }
+            case .stopped, .crashed, .failed, .stopping:
+                if reserveSlot {
+                    Color.clear.frame(width: size, height: size)
+                }
+                iconButton("play.fill", help: "Start", action: .start, disabled: server.phase == .stopping) {
+                    model.startServer(server)
+                }
+            }
+        }
+    }
+
+    private func iconButton(
+        _ systemName: String, help: String, action: KeyNavRow.Action, disabled: Bool = false,
+        onTap: @escaping () -> Void
+    ) -> some View {
+        Button(action: onTap) {
+            Image(systemName: systemName)
+                .font(.system(size: size * 0.85, weight: .semibold))
+                .frame(width: size, height: size)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .disabled(disabled)
+        .accessibilityLabel(Text(help))
+        .modifier(KeyNavCell(active: keyNav?.isHighlighted(rowID, action) ?? false))
+    }
+}
+
+/** Collapsed menu bar label: colored tally dots only (running / busy /
+    attention). One AppKit 2x bitmap with renderingMode(.original); all-quiet
+    is a single dim template dot so the status item does not vanish. */
 struct PresenceLabel: View {
     var model: DaemonModel
 
     var body: some View {
-        /** One baked image for everything: MenuBarExtra labels render only a
-            single image, so the rack and the colored dots share one
-            ImageRenderer pass (appearanceTick re-bakes on theme change). */
-        let _ = model.appearanceTick
-        if let label = PresenceDots.image(
-            attention: model.attentionCount,
-            busy: model.busyCount,
-            running: model.runningCount) {
-            Image(nsImage: label)
-        } else {
-            Image(systemName: "server.rack")
-        }
+        /** Read counts so Observation re-renders when the poll updates them;
+            scene-level label closures alone do not track the model. */
+        let attention = model.attentionCount
+        let busy = model.busyCount
+        let running = model.runningCount
+        Image(nsImage: PresenceDots.image(
+            attention: attention, busy: busy, running: running))
+            .renderingMode(.original)
+            .accessibilityLabel(Text(accessibilitySummary(
+                attention: attention, busy: busy, running: running)))
+    }
+
+    private func accessibilitySummary(attention: Int, busy: Int, running: Int) -> String {
+        var parts = ["devctl"]
+        if running > 0 { parts.append("\(running) running") }
+        if busy > 0 { parts.append("\(busy) starting or stopping") }
+        if attention > 0 { parts.append("\(attention) need attention") }
+        if parts.count == 1 { parts.append("all quiet") }
+        return parts.joined(separator: ", ")
     }
 }
 
-/** Renders the colored dot+count pairs for the collapsed menu bar label, cached
-    by count triple so the 2s poll does not re-render an unchanged image. */
+/** Menu bar presence: colored running/busy/attention pairs only. Built as one
+    non-template 2x bitmap so the bar keeps color and a single Image. Quiet
+    state is a single tertiary-gray dot so the item stays clickable. */
 enum PresenceDots {
     private struct Key: Hashable {
         let attention: Int
         let busy: Int
-        let dark: Bool
         let running: Int
     }
 
     @MainActor private static var cache: [Key: NSImage] = [:]
 
-    @MainActor static func image(attention: Int, busy: Int, running: Int) -> NSImage? {
-        guard attention + busy + running > 0 else { return nil }
-        /** No monochrome ink in the baked image: the menu bar's tint follows the
-            wallpaper, not the system theme, so any fixed ink can vanish. The
-            mid-tone dot colors read on every bar; the adaptive rack shows only
-            in the all-quiet state (as a live template symbol, not baked). */
-        let key = Key(attention: attention, busy: busy, dark: false, running: running)
-        if let cached = cache[key] { return cached }
-        let content = HStack(spacing: 5) {
-            pair(count: running, color: Color(red: 0.28, green: 0.75, blue: 0.42))
-            pair(count: busy, color: Color(red: 0.95, green: 0.72, blue: 0.2))
-            pair(count: attention, color: Color(red: 0.92, green: 0.34, blue: 0.3))
-        }
-        let renderer = ImageRenderer(content: content)
-        renderer.scale = 2
-        guard let rendered = renderer.nsImage else { return nil }
-        /** Color must survive: never a template image. */
-        rendered.isTemplate = false
-        if cache.count > 32 { cache.removeAll() }
-        cache[key] = rendered
-        return rendered
-    }
+    /** Mid-tones that still read after the bar's slight dimming of non-template art. */
+    private static let runningColor = NSColor(calibratedRed: 0.32, green: 0.88, blue: 0.48, alpha: 1)
+    private static let busyColor = NSColor(calibratedRed: 1.0, green: 0.78, blue: 0.24, alpha: 1)
+    private static let attentionColor = NSColor(calibratedRed: 1.0, green: 0.42, blue: 0.38, alpha: 1)
+    private static let quietColor = NSColor(calibratedWhite: 0.55, alpha: 1)
 
-    @ViewBuilder private static func pair(count: Int, color: Color) -> some View {
-        if count > 0 {
-            HStack(spacing: 2.5) {
-                Circle()
-                    .fill(color)
-                    .frame(width: 6.5, height: 6.5)
-                Text("\(count)")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(color)
+    @MainActor static func image(attention: Int, busy: Int, running: Int) -> NSImage {
+        let key = Key(attention: attention, busy: busy, running: running)
+        if let cached = cache[key] { return cached }
+
+        var pairs: [(Int, NSColor)] = []
+        if running > 0 { pairs.append((running, runningColor)) }
+        if busy > 0 { pairs.append((busy, busyColor)) }
+        if attention > 0 { pairs.append((attention, attentionColor)) }
+
+        let scale: CGFloat = 2
+        let height: CGFloat = 16
+        let dot: CGFloat = 7
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        let spacing: CGFloat = 5
+        let pairGap: CGFloat = 2.5
+
+        let width: CGFloat
+        if pairs.isEmpty {
+            width = dot
+        } else {
+            var w: CGFloat = 0
+            for (index, pair) in pairs.enumerated() {
+                if index > 0 { w += spacing }
+                let textSize = NSAttributedString(
+                    string: "\(pair.0)", attributes: [.font: font]
+                ).size()
+                w += dot + pairGap + ceil(textSize.width)
+            }
+            width = w
+        }
+
+        let pixelW = max(Int(ceil(width * scale)), 1)
+        let pixelH = max(Int(ceil(height * scale)), 1)
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelW,
+            pixelsHigh: pixelH,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0)
+        else {
+            return NSImage(size: NSSize(width: width, height: height))
+        }
+        rep.size = NSSize(width: width, height: height)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        NSGraphicsContext.current?.shouldAntialias = true
+
+        if pairs.isEmpty {
+            quietColor.setFill()
+            let dy = (height - dot) / 2
+            NSBezierPath(ovalIn: NSRect(x: 0, y: dy, width: dot, height: dot)).fill()
+        } else {
+            var x: CGFloat = 0
+            for (index, pair) in pairs.enumerated() {
+                if index > 0 { x += spacing }
+                let (count, color) = pair
+                color.setFill()
+                let dy = (height - dot) / 2
+                NSBezierPath(ovalIn: NSRect(x: x, y: dy, width: dot, height: dot)).fill()
+                x += dot + pairGap
+                let text = NSAttributedString(
+                    string: "\(count)",
+                    attributes: [
+                        .font: font,
+                        .foregroundColor: color,
+                    ])
+                let textSize = text.size()
+                let ty = (height - textSize.height) / 2 - 0.5
+                text.draw(at: NSPoint(x: x, y: ty))
+                x += ceil(textSize.width)
             }
         }
+
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.addRepresentation(rep)
+        image.isTemplate = false
+        if cache.count > 32 { cache.removeAll() }
+        cache[key] = image
+        return image
     }
 }
 
@@ -335,14 +704,20 @@ final class HeadPins {
     toggle appears on hover and pinned rows keep a subtle filled pin. */
 struct HeadRow: View {
     @State private var hovering = false
+    let filterText: String
+    let keyNav: KeyNavModel
     let name: String
-    let pinned: Bool
-    let url: String
+    let onOpen: () -> Void
     let onTogglePin: () -> Void
+    let parentURL: String?
+    let pinned: Bool
+    let rowID: String
+    let url: String
 
     var body: some View {
         HStack(spacing: 0) {
             Button {
+                onOpen()
                 if let parsed = URL(string: url) {
                     NSWorkspace.shared.open(parsed)
                 }
@@ -351,30 +726,41 @@ struct HeadRow: View {
                     Image(systemName: "arrow.up.right")
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundStyle(.tertiary)
-                    Text(name)
+                    FuzzyMatcher.highlightedText(name, query: filterText)
                         .font(.caption)
-                    Text(displayHost)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    if !displayHost.isEmpty {
+                        FuzzyMatcher.highlightedText(displayHost, query: filterText)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 6)
+                .padding(.leading, 16)
+                .padding(.trailing, 6)
                 .padding(.vertical, 2)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help(url)
             .accessibilityLabel(Text("Open \(name)"))
-            if pinned || hovering {
-                Button(action: onTogglePin) {
-                    Image(systemName: pinned ? "pin.fill" : "pin")
-                        .font(.system(size: 8))
-                        .foregroundStyle(pinned ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+            .modifier(KeyNavCell(active: keyNav.isHighlighted(rowID, .open)))
+
+            HStack(spacing: 8) {
+                Color.clear.frame(width: 14, height: 14)
+                if pinned || hovering {
+                    Button(action: onTogglePin) {
+                        Image(systemName: pinned ? "pin.fill" : "pin")
+                            .font(.system(size: 9))
+                            .foregroundStyle(pinned ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+                            .frame(width: 14, height: 14)
+                    }
+                    .buttonStyle(.plain)
+                    .help(pinned ? "Unpin" : "Pin to top")
+                    .accessibilityLabel(Text(pinned ? "Unpin \(name)" : "Pin \(name) to top"))
+                    .modifier(KeyNavCell(active: keyNav.isHighlighted(rowID, .pin)))
+                } else {
+                    Color.clear.frame(width: 14, height: 14)
                 }
-                .buttonStyle(.plain)
-                .padding(.trailing, 6)
-                .help(pinned ? "Unpin" : "Pin to top")
-                .accessibilityLabel(Text(pinned ? "Unpin \(name)" : "Pin \(name) to top"))
             }
         }
         .background(
@@ -385,7 +771,16 @@ struct HeadRow: View {
 
     private var displayHost: String {
         guard let parsed = URL(string: url), let host = parsed.host else { return url }
-        return parsed.port.map { "\(host):\($0)" } ?? host
+        let headHostPort = parsed.port.map { "\(host):\($0)" } ?? host
+        let headPath = parsed.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        if let parentURL, let parentParsed = URL(string: parentURL), let parentHost = parentParsed.host {
+            let parentHostPort = parentParsed.port.map { "\(parentHost):\($0)" } ?? parentHost
+            if headHostPort == parentHostPort {
+                return headPath.isEmpty ? "" : "/\(headPath)"
+            }
+        }
+        return headPath.isEmpty ? headHostPort : "\(headHostPort)/\(headPath)"
     }
 }
 
@@ -420,13 +815,31 @@ struct TallyDot: View {
     }
 }
 
+/** Icon + title with a tight gap; Label's default titleAndIcon spacing is wide
+    for this dense footer. */
+struct FooterIconLabel: View {
+    let systemImage: String
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: systemImage)
+            Text(title)
+        }
+        .font(.caption)
+        .contentShape(Rectangle())
+    }
+}
+
 struct LaunchAtLoginToggle: View {
     @State private var enabled = SMAppService.mainApp.status == .enabled
 
     var body: some View {
-        Toggle("Login", isOn: $enabled)
+        Toggle("Start at login", isOn: $enabled)
             .toggleStyle(.checkbox)
+            .controlSize(.small)
             .font(.caption)
+            .foregroundStyle(.secondary)
             .onChange(of: enabled) { _, wanted in
                 do {
                     if wanted {
@@ -439,6 +852,138 @@ struct LaunchAtLoginToggle: View {
                 }
             }
             .help("Launch devctl.app at login")
+    }
+}
+
+/** Compact sort picker floating in the blank space left of the filter box.
+    Same continuous-corner chip language so the two controls read as one band. */
+struct SortOrderMenu: View {
+    @Binding var selection: ProjectSortOrder
+
+    var body: some View {
+        Menu {
+            ForEach(ProjectSortOrder.allCases) { order in
+                Button {
+                    selection = order
+                } label: {
+                    if order == selection {
+                        Label(order.title, systemImage: "checkmark")
+                    } else {
+                        Text(order.title)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background {
+                    let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    shape
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            shape.strokeBorder(
+                                Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
+                }
+        }
+        .buttonStyle(.plain)
+        .help("Sort projects: \(selection.title)")
+        .accessibilityLabel(Text("Sort projects"))
+    }
+}
+
+/** Slim fuzzy filter for the popover's top-right corner. Filters projects,
+    servers, urls, and heads; match marks land via FuzzyMatcher.highlightedText.
+    Continuous radius matches the MenuBarExtra panel chrome so the control
+    sits in the same curve family as the popover corner. */
+struct FilterBox: View {
+    @Binding var text: String
+
+    /** Same continuous corner language as the MenuBarExtra `.window` panel. */
+    private static let cornerRadius: CGFloat = 12
+    /** Distance from the panel top to the filter top edge. */
+    static let topInset: CGFloat = 8
+    /** Scroll content top pad: clears the filter at rest without a large gap
+        (topInset + control ≈ 8+22, plus 2pt air). */
+    static let restClearance: CGFloat = 32
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+            TextField("Filter", text: $text)
+                .textFieldStyle(.plain)
+                .font(.caption2)
+                .frame(width: 88)
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear filter")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background {
+            let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+            shape
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    shape.strokeBorder(
+                        Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
+        }
+        .accessibilityLabel(Text("Filter servers"))
+    }
+}
+
+enum FuzzyMatcher {
+    static func matches(_ text: String, query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let target = text.lowercased()
+        let pattern = trimmed.lowercased()
+        if target.contains(pattern) { return true }
+        var searchIndex = target.startIndex
+        for char in pattern {
+            guard let found = target[searchIndex...].firstIndex(of: char) else {
+                return false
+            }
+            searchIndex = target.index(after: found)
+        }
+        return true
+    }
+
+    static func highlightedText(_ text: String, query: String) -> Text {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, matches(text, query: trimmed) else { return Text(text) }
+        var attr = AttributedString(text)
+        let target = text.lowercased()
+        let pattern = trimmed.lowercased()
+        let highlightBg = Color.yellow.opacity(0.35)
+
+        if let range = target.range(of: pattern) {
+            if let attrRange = Range(range, in: attr) {
+                attr[attrRange].backgroundColor = highlightBg
+            }
+        } else {
+            var searchIndex = target.startIndex
+            for char in pattern {
+                guard let found = target[searchIndex...].firstIndex(of: char),
+                    let attrRange = Range(found...found, in: attr)
+                else { break }
+                attr[attrRange].backgroundColor = highlightBg
+                searchIndex = target.index(after: found)
+            }
+        }
+        return Text(attr)
     }
 }
 

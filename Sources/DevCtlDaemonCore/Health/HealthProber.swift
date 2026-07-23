@@ -62,8 +62,11 @@ public struct NetworkHealthProber: HealthProber {
             request.timeoutInterval = Double(timeoutMs) / 1000
             /** *.localhost hosts resolve in browsers but not reliably in the
                 system resolver; probe loopback directly and carry the Host header
-                so vhost-aware dev servers still route. */
-            if let host = parsed.host, host != "127.0.0.1", host != "localhost",
+                so vhost-aware dev servers still route. The bind stack is not
+                knowable ahead (Vite 5+ binds `::1` only), so IPv6 loopback is
+                retried when IPv4 refuses. */
+            let originalHost = parsed.host
+            if let host = originalHost, host != "127.0.0.1", host != "localhost",
                 host.hasSuffix(".localhost"), var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false) {
                 components.host = "127.0.0.1"
                 if let rewritten = components.url {
@@ -72,20 +75,32 @@ public struct NetworkHealthProber: HealthProber {
                 }
             }
             do {
-                /** A 3xx IS a healthy answer (login redirects abound in dev
-                    apps); following it would re-enter hostname resolution the
-                    loopback rewrite just avoided, so redirects never get
-                    followed. */
-                let (_, response) = try await URLSession.shared.data(
-                    for: request, delegate: RedirectStopper.shared)
-                guard let http = response as? HTTPURLResponse else { return false }
-                return (200..<400).contains(http.statusCode)
+                return try await Self.httpResponds(request)
             } catch {
-                return false
+                /** IPv4 failed; retry over IPv6 loopback carrying the same Host. */
+                guard let host = originalHost, host.hasSuffix(".localhost"),
+                    var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false)
+                else { return false }
+                components.host = "[::1]"
+                guard let rewritten = components.url else { return false }
+                var v6 = URLRequest(url: rewritten)
+                v6.timeoutInterval = request.timeoutInterval
+                v6.setValue(host, forHTTPHeaderField: "Host")
+                return (try? await Self.httpResponds(v6)) ?? false
             }
         case .tcp(let port, let timeoutMs):
             return Self.tcpConnects(port: port, timeoutMs: timeoutMs)
         }
+    }
+
+    /** A 3xx IS a healthy answer (login redirects abound in dev apps);
+        following it would re-enter hostname resolution the loopback rewrite
+        just avoided, so redirects never get followed. */
+    private static func httpResponds(_ request: URLRequest) async throws -> Bool {
+        let (_, response) = try await URLSession.shared.data(
+            for: request, delegate: RedirectStopper.shared)
+        guard let http = response as? HTTPURLResponse else { return false }
+        return (200..<400).contains(http.statusCode)
     }
 
     /** Refuses redirect-following so the probe judges the first response. */
@@ -103,20 +118,45 @@ public struct NetworkHealthProber: HealthProber {
         }
     }
 
-    /** Non-blocking connect to 127.0.0.1:port with a poll deadline. */
+    /** Non-blocking connect to a loopback port with a poll deadline. Dev
+        servers bind either stack: Vite 5+ listens on `::1` only, older
+        tooling on `127.0.0.1` only, so both loopback families are tried and
+        either answering counts as healthy. */
     static func tcpConnects(port: Int, timeoutMs: Int) -> Bool {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        tcpConnects(port: port, timeoutMs: timeoutMs, family: AF_INET)
+            || tcpConnects(port: port, timeoutMs: timeoutMs, family: AF_INET6)
+    }
+
+    private static func tcpConnects(port: Int, timeoutMs: Int, family: Int32) -> Bool {
+        let sock = socket(family, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { close(sock) }
         let flags = fcntl(sock, F_GETFL)
         _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
-        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-        let result = withUnsafePointer(to: &addr) { ptr in
+        var storage = sockaddr_storage()
+        let sockLen: socklen_t
+        if family == AF_INET6 {
+            var addr = sockaddr_in6()
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = UInt16(port).bigEndian
+            addr.sin6_addr = in6addr_loopback
+            sockLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            withUnsafeMutablePointer(to: &storage) { ptr in
+                ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee = addr }
+            }
+        } else {
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = UInt16(port).bigEndian
+            addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            sockLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            withUnsafeMutablePointer(to: &storage) { ptr in
+                ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee = addr }
+            }
+        }
+        let result = withUnsafePointer(to: &storage) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                connect(sock, sa, sockLen)
             }
         }
         if result == 0 { return true }

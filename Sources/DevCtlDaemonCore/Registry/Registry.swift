@@ -35,6 +35,12 @@ public struct PersistedServerState: Codable, Sendable {
     public var lastExit: LastExit?
     public var phase: ServerPhase
     public var pid: Int?
+    /** Intent to have this server up across a machine reboot. Set on every
+        start/ensure; cleared only by a deliberate user stop (devctl stop/down).
+        A launchd SIGTERM drain (machine shutdown) preserves it, so the next
+        boot's recoverAtStartup brings the server back. Optional so state files
+        written before this field existed keep parsing. */
+    public var resumeOnBoot: Bool?
     public var spawnError: SpawnError?
     public var startedAt: Date?
 
@@ -42,12 +48,14 @@ public struct PersistedServerState: Codable, Sendable {
         lastExit: LastExit? = nil,
         phase: ServerPhase = .stopped,
         pid: Int? = nil,
+        resumeOnBoot: Bool? = nil,
         spawnError: SpawnError? = nil,
         startedAt: Date? = nil
     ) {
         self.lastExit = lastExit
         self.phase = phase
         self.pid = pid
+        self.resumeOnBoot = resumeOnBoot
         self.spawnError = spawnError
         self.startedAt = startedAt
     }

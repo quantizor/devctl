@@ -281,28 +281,34 @@ public actor Router {
     }
 
     /** Drain-stops every supervisor in parallel: a serial drain of N servers at
-        up to 7s grace each would blow through launchd's ExitTimeOut. */
+        up to 7s grace each would blow through launchd's ExitTimeOut. The drain
+        is not a deliberate stop: resume-on-boot intent survives so the next
+        boot restores what was running. */
     public func drainAll() async {
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
-                group.addTask { _ = await supervisor.stop() }
+                group.addTask { _ = await supervisor.stop(deliberate: false) }
             }
         }
     }
 
-    /** Startup recovery: reconcile persisted state with reality. A recorded pid
-        that is gone becomes crashed(daemon-restart); a live orphan (its spool fd
-        kept it healthy while the daemon was away) is group-killed and, if it was
-        running, started fresh, since exit forensics are unknowable for
-        non-children. Never adopted silently. */
+    /** Startup recovery: reconcile persisted state with reality, then restore
+        boot intent. A recorded pid that is gone becomes crashed(daemon-restart);
+        a live orphan (its spool fd kept it healthy while the daemon was away) is
+        group-killed, since exit forensics are unknowable for non-children. Never
+        adopted silently. What comes back: any server whose start intent survives
+        (resumeOnBoot), which a machine shutdown's drain leaves set, plus the
+        classic daemon-crash case of a phase left running/starting. A deliberate
+        stop clears the flag, so only those stay down. */
     public func recoverAtStartup() async {
         for (id, persisted) in await registry.allPersistedState() {
-            guard let separator = id.range(of: "::"), persisted.pid != nil || persisted.phase == .running || persisted.phase == .starting
-            else { continue }
+            guard let separator = id.range(of: "::") else { continue }
             let project = String(id[id.startIndex..<separator.lowerBound])
             let name = String(id[separator.upperBound...])
+            let leftActive = persisted.phase == .running || persisted.phase == .starting
+            let wantsRestore = persisted.resumeOnBoot ?? false
+            guard persisted.pid != nil || leftActive || wantsRestore else { continue }
             guard let spec = await registry.spec(project: project, name: name) else { continue }
-            let wasRunning = persisted.phase == .running || persisted.phase == .starting
             if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
                 let descendants = ProcessTree.descendants(of: pid)
                 ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
@@ -313,7 +319,7 @@ public actor Router {
                 await events.post(
                     kind: .crashed, project: project, server: name,
                     detail: "daemon-restart: orphan pid \(pid) bounced")
-            } else if wasRunning {
+            } else if leftActive {
                 await events.post(
                     kind: .crashed, project: project, server: name, detail: "daemon-restart")
             }
@@ -322,7 +328,7 @@ public actor Router {
                 entry.phase = .crashed
                 entry.pid = nil
             }
-            if wasRunning {
+            if leftActive || wantsRestore {
                 let supervisor = await supervisor(project: project, spec: spec)
                 _ = await supervisor.start()
             }

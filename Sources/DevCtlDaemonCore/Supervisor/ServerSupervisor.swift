@@ -31,6 +31,9 @@ public actor ServerSupervisor {
     private var spec: ServerSpec
     private var startedAt: Date?
     private var stopRequested = false
+    /** Carries the stop()'s intent into recordOutcome: deliberate clears the
+        resume-on-boot flag, a launchd drain keeps it. */
+    private var stopWasDeliberate = true
 
     public init(
         events: EventStore? = nil,
@@ -174,8 +177,11 @@ public actor ServerSupervisor {
         then SIGKILL the same way. The session created at spawn makes pgid == pid,
         but children that setpgid/setsid themselves (Foundation Process does this
         by default) escape the group, so teardown also sweeps the descendant tree,
-        snapshotted before the first signal since orphans reparent to launchd. */
-    public func stop(graceSeconds: Double = 7) async -> ServerStatus {
+        snapshotted before the first signal since orphans reparent to launchd.
+        `deliberate` is true only for a user-invoked stop (devctl stop/down): it
+        clears the resume-on-boot intent. A launchd drain passes false so the
+        machine coming back up restores what was running. */
+    public func stop(graceSeconds: Double = 7, deliberate: Bool = true) async -> ServerStatus {
         switch phase {
         case .stopped, .crashed, .failed:
             return status()
@@ -190,6 +196,7 @@ public actor ServerSupervisor {
             return status()
         }
         stopRequested = true
+        stopWasDeliberate = deliberate
         phase = .stopping
         let snapshot = ProcessTree.descendants(of: target)
         ProcessTree.signalTree(rootPid: target, descendants: snapshot, signal: SIGTERM)
@@ -385,6 +392,7 @@ public actor ServerSupervisor {
             entry.lastExit = nil
             entry.phase = .starting
             entry.pid = Int(childPid)
+            entry.resumeOnBoot = true
             entry.spawnError = nil
             entry.startedAt = spawnedAt
         }
@@ -434,6 +442,9 @@ public actor ServerSupervisor {
         stopRequested = false
         let finalPhase = phase
         let exit = lastExit
+        /** A deliberate stop retires the boot intent; a drain (or a crash) keeps
+            whatever was recorded at start so the next boot restores it. */
+        let retireIntent = finalPhase == .stopped && stopWasDeliberate
         let cause = exit?.code.map { "code=\($0)" } ?? exit?.signal.map { "signal=\($0)" } ?? "unknown"
         await logStore.append(stream: .sys, text: "exited \(cause)")
         await events?.post(
@@ -443,6 +454,7 @@ public actor ServerSupervisor {
             entry.lastExit = exit
             entry.phase = finalPhase
             entry.pid = nil
+            if retireIntent { entry.resumeOnBoot = nil }
             entry.startedAt = nil
         }
         settleSpawnWaiters()
