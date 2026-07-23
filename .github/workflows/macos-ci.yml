@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Show Swift version
         run: swift --version
@@ -27,7 +27,7 @@ jobs:
   codeql:
     name: Static analysis
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 10
     permissions:
       actions: read
       contents: read
@@ -35,16 +35,18 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           build-mode: manual
           languages: swift
 
       - name: Build for CodeQL
-        run: make build
+        run: |
+          swift build --product devctl
+          swift build --product devctld
 
       - name: Run CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
