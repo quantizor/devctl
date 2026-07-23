@@ -37,16 +37,26 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.resolved') }}
+          path: ~/Library/Caches/org.swift.swiftpm
+
+      - name: Resolve Swift packages
+        run: swift package resolve
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           build-mode: manual
+          dependency-caching: true
           languages: swift
 
       - name: Build for CodeQL
         run: |
-          swift build --product devctl
-          swift build --product devctld
+          swift build --arch arm64 --product devctl
+          swift build --arch arm64 --product devctld
 
       - name: Run CodeQL analysis
         uses: github/codeql-action/analyze@v4
