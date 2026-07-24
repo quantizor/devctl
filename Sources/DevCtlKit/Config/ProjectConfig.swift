@@ -114,17 +114,35 @@ public enum ProjectConfigLoader {
     }
 
     public static func validate(config: ProjectFileConfig, project: String) -> ProjectConfigView {
-        let host = config.host ?? "\(defaultSlug(project: project)).localhost"
+        let recommendedHost = "\(defaultSlug(project: project)).localhost"
+        let host = config.host ?? recommendedHost
         var view = ProjectConfigView(host: host)
         var warnings: [String] = []
         if config.version != 1 {
             warnings.append("unknown config version \(config.version); this devctl understands version 1")
+        }
+        /** Bare loopback hosts collapse every project onto one browser origin, so
+            cookies/storage/service workers leak across projects. Warn (never fail):
+            an explicit bare host may be a deliberate choice for a non-browser
+            server. */
+        if let explicit = config.host, isBareLoopback(explicit) {
+            warnings.append(
+                "host '\(explicit)' is a bare loopback address; prefer '\(recommendedHost)' so each project keeps an isolated browser origin")
         }
         var declaredPorts: [Int: String] = [:]
         var specs: [ServerSpec] = []
         for (name, entry) in config.servers.sorted(by: { $0.key < $1.key }) {
             if entry.command.isEmpty {
                 view.errors.append("server '\(name)': command is empty")
+            }
+            if let explicitHost = entry.host, isBareLoopback(explicitHost) {
+                warnings.append(
+                    "server '\(name)': host '\(explicitHost)' is a bare loopback address; prefer a '\(recommendedHost)' subdomain")
+            }
+            if let explicitURL = entry.url, let urlHost = URL(string: explicitURL)?.host,
+                isBareLoopback(urlHost) {
+                warnings.append(
+                    "server '\(name)': url '\(explicitURL)' points at a bare loopback host; prefer '\(recommendedHost)'")
             }
             var iconPath: String?
             if let relative = entry.icon ?? config.icon {
@@ -176,6 +194,14 @@ public enum ProjectConfigLoader {
         view.specs = specs
         view.warnings = warnings
         return view
+    }
+
+    /** A host that resolves to loopback with no per-project subdomain, so it
+        shares one origin across every project (the isolation the `*.localhost`
+        signature exists to give). `<slug>.localhost` and `api.myproj.localhost`
+        are fine; only the bare forms trip this. */
+    static func isBareLoopback(_ host: String) -> Bool {
+        host == "localhost" || host == "127.0.0.1"
     }
 
     public static func defaultSlug(project: String) -> String {

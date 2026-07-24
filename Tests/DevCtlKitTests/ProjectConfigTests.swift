@@ -42,6 +42,40 @@ import Testing
         #expect(view.warnings.contains { $0.contains("both declare port 3000") })
     }
 
+    @Test func bareLoopbackHostsWarnButDoNotFail() {
+        let config = ProjectFileConfig(
+            host: "localhost",
+            servers: [
+                "api": ProjectFileServer(command: ["x"], host: "127.0.0.1", port: 4000),
+                "web": ProjectFileServer(command: ["x"], url: "http://localhost:3000/"),
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/Users/x/code/My Proj")
+        #expect(view.errors.isEmpty)
+        #expect(
+            view.warnings.contains {
+                $0 == "host 'localhost' is a bare loopback address; prefer 'my-proj.localhost' so each project keeps an isolated browser origin"
+            })
+        #expect(
+            view.warnings.contains {
+                $0 == "server 'api': host '127.0.0.1' is a bare loopback address; prefer a 'my-proj.localhost' subdomain"
+            })
+        #expect(
+            view.warnings.contains {
+                $0 == "server 'web': url 'http://localhost:3000/' points at a bare loopback host; prefer 'my-proj.localhost'"
+            })
+    }
+
+    @Test func subdomainLocalhostHostsDoNotWarn() {
+        let config = ProjectFileConfig(
+            host: "shop.localhost",
+            servers: [
+                "api": ProjectFileServer(command: ["x"], host: "api.shop.localhost", port: 4000),
+                "web": ProjectFileServer(command: ["x"], port: 3000),
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.warnings.allSatisfy { !$0.contains("loopback") })
+    }
+
     @Test func parseErrorIsActionable() throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "devctl-cfg-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
