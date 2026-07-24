@@ -291,6 +291,7 @@ public actor ServerSupervisor {
                 if consecutiveSuccesses >= healthyAfter {
                     everHealthy = true
                     phase = .running
+                    DevCtlLog.supervisor.info("healthy \(spec.name)@\(projectPath)")
                     scanObservedPort()
                     postHealthEvent(.healthy)
                 }
