@@ -71,6 +71,8 @@ public actor Router {
                 }
                 try await portPreCheck(target: target, supervisor: supervisor)
                 let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
+                DevCtlLog.daemon.info(
+                    "ensure \(target.name)@\(target.project) -> \(result.server.phase.rawValue)")
                 return try respond(id: head.id, result: result)
             case .serverStart:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
@@ -154,7 +156,9 @@ public actor Router {
             case .serverStop:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
                 let supervisor = try await resolvedSupervisor(request.params)
-                return try respond(id: head.id, result: ServerResult(server: await supervisor.stop()))
+                let stopped = await supervisor.stop()
+                DevCtlLog.daemon.info("stop \(request.params.name)@\(request.params.project)")
+                return try respond(id: head.id, result: ServerResult(server: stopped))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(name: request.params.name, project: request.params.project)
@@ -299,7 +303,13 @@ public actor Router {
         adopted silently. What comes back: any server whose start intent survives
         (resumeOnBoot), which a machine shutdown's drain leaves set, plus the
         classic daemon-crash case of a phase left running/starting. A deliberate
-        stop clears the flag, so only those stay down. */
+        stop clears the flag, so only those stay down.
+
+        Specs resolve through the merged view (devservers.json + ad-hoc registry),
+        the same path ensure/status use. Config-defined servers are never written
+        into registry.json, so a registry-only lookup would silently skip every
+        committed server on boot. A rename/delete with no matching spec drops the
+        orphaned state row instead of retrying forever. */
     public func recoverAtStartup() async {
         for (id, persisted) in await registry.allPersistedState() {
             guard let separator = id.range(of: "::") else { continue }
@@ -308,30 +318,81 @@ public actor Router {
             let leftActive = persisted.phase == .running || persisted.phase == .starting
             let wantsRestore = persisted.resumeOnBoot ?? false
             guard persisted.pid != nil || leftActive || wantsRestore else { continue }
-            guard let spec = await registry.spec(project: project, name: name) else { continue }
-            if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
-                let descendants = ProcessTree.descendants(of: pid)
-                ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
-                try? await Task.sleep(for: .seconds(2))
-                if kill(pid, 0) == 0 {
-                    ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGKILL)
+            switch await resolveSpecForRecover(project: project, name: name) {
+            case .missing:
+                DevCtlLog.daemon.info(
+                    "recover skip \(name)@\(project): no matching spec (renamed or removed)")
+                try? await registry.removeState(serverID: id)
+                continue
+            case .unavailable:
+                DevCtlLog.daemon.info(
+                    "recover defer \(name)@\(project): config unreadable; keeping resume intent")
+                continue
+            case .found(let spec):
+                if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
+                    let descendants = ProcessTree.descendants(of: pid)
+                    ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
+                    try? await Task.sleep(for: .seconds(2))
+                    if kill(pid, 0) == 0 {
+                        ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGKILL)
+                    }
+                    await events.post(
+                        kind: .crashed, project: project, server: name,
+                        detail: "daemon-restart: orphan pid \(pid) bounced")
+                } else if leftActive {
+                    await events.post(
+                        kind: .crashed, project: project, server: name, detail: "daemon-restart")
                 }
-                await events.post(
-                    kind: .crashed, project: project, server: name,
-                    detail: "daemon-restart: orphan pid \(pid) bounced")
-            } else if leftActive {
-                await events.post(
-                    kind: .crashed, project: project, server: name, detail: "daemon-restart")
+                try? await registry.updateState(serverID: id) { entry in
+                    entry.lastExit = entry.lastExit ?? LastExit(at: Date())
+                    entry.phase = .crashed
+                    entry.pid = nil
+                }
+                if leftActive || wantsRestore {
+                    DevCtlLog.daemon.info("recover start \(name)@\(project)")
+                    let supervisor = await supervisor(project: project, spec: spec)
+                    _ = await supervisor.start()
+                }
             }
-            try? await registry.updateState(serverID: id) { entry in
-                entry.lastExit = entry.lastExit ?? LastExit(at: Date())
-                entry.phase = .crashed
-                entry.pid = nil
+        }
+        /** Second pass: drop leftover rows for renamed/deleted servers even when
+            they carry no resume intent (e.g. a deliberate stop under the old
+            name). Only when the config is readable so a parse blip cannot wipe
+            state. */
+        for (id, _) in await registry.allPersistedState() {
+            guard let separator = id.range(of: "::") else { continue }
+            let project = String(id[id.startIndex..<separator.lowerBound])
+            let name = String(id[separator.upperBound...])
+            if case .missing = await resolveSpecForRecover(project: project, name: name) {
+                DevCtlLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
+                try? await registry.removeState(serverID: id)
             }
-            if leftActive || wantsRestore {
-                let supervisor = await supervisor(project: project, spec: spec)
-                _ = await supervisor.start()
+        }
+    }
+
+    private enum RecoverSpec {
+        case found(ServerSpec)
+        /** Config loaded cleanly and the name is absent: rename/delete. */
+        case missing
+        /** Config threw (invalid JSON, etc.): keep intent for a later boot. */
+        case unavailable
+    }
+
+    /** Prefer the merged config+registry view. Only treat a name as gone when
+        the config is readable and does not contain it (and the registry does
+        not either). A parse error must not drop resume-on-boot. */
+    private func resolveSpecForRecover(project: String, name: String) async -> RecoverSpec {
+        do {
+            let merged = try await mergedSpecs(project: project)
+            if let spec = merged.specs.first(where: { $0.name == name }) {
+                return .found(spec)
             }
+            return .missing
+        } catch {
+            if let spec = await registry.spec(project: project, name: name) {
+                return .found(spec)
+            }
+            return .unavailable
         }
     }
 
@@ -370,6 +431,8 @@ public actor Router {
             let status = await other.status()
             let active = status.phase == .running || status.phase == .starting || status.phase == .unhealthy
             if active, status.declaredPort == port || status.observedPort == port {
+                DevCtlLog.daemon.error(
+                    "port-held \(port) by \(status.server)@\(status.project) for \(target.name)")
                 throw WireError(
                     code: .portHeld,
                     hint: "run: devctl stop \(status.server) --project \(status.project)",
