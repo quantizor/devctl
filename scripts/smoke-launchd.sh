@@ -1,7 +1,8 @@
 #!/bin/zsh
 # launchd smoke: exercises the REAL LaunchAgent lifecycle on this machine.
 # install → daemon status → server ensure → restart (bounce + re-ensure) →
-# deliberate stop honored by auto-bootstrap → start → uninstall.
+# install-upgrade (bounce + re-ensure) → deliberate stop honored by
+# auto-bootstrap → start → uninstall.
 # Leaves no agent installed; uses a throwaway project + fixture-server.
 set -euo pipefail
 
@@ -46,6 +47,16 @@ PHASE="$("$DEVCTL" wait web --healthy --timeout 20 --json | /usr/bin/python3 -c 
 PID_AFTER="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
 [[ "$PID_AFTER" != "$PID_BEFORE" ]] || fail "pid unchanged across restart; bounce did not happen"
 pass "restart bounced and re-ensured (pid $PID_BEFORE -> $PID_AFTER)"
+
+# Upgrade-in-place: install again while the server is up must re-ensure it,
+# same contract as restart (this is what `make install` hits).
+PID_PRE_UPGRADE="$PID_AFTER"
+"$DEVCTL" daemon install > /dev/null || fail "daemon install upgrade"
+PHASE="$("$DEVCTL" wait web --healthy --timeout 20 --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["phase"])')"
+[[ "$PHASE" == "running" ]] || fail "server did not come back after install upgrade (phase $PHASE)"
+PID_POST_UPGRADE="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
+[[ "$PID_POST_UPGRADE" != "$PID_PRE_UPGRADE" ]] || fail "pid unchanged across install upgrade; bounce did not happen"
+pass "install upgrade bounced and re-ensured (pid $PID_PRE_UPGRADE -> $PID_POST_UPGRADE)"
 
 "$DEVCTL" daemon stop > /dev/null
 sleep 2

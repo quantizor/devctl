@@ -131,6 +131,14 @@ public actor Registry {
         try persistState()
     }
 
+    /** Drop a state row whose server no longer exists in config or the registry
+        (rename / delete). Keeps recoverAtStartup from re-visiting ghosts. */
+    public func removeState(serverID: String) throws {
+        guard state.servers[serverID] != nil else { return }
+        state.servers[serverID] = nil
+        try persistState()
+    }
+
     private func persistRegistry() throws {
         try AtomicFile.write(JSONCoding.encoder().encode(registry), to: paths.registryFile)
     }

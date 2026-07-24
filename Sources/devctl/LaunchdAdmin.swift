@@ -19,7 +19,12 @@ enum LaunchdAdmin {
         return FileManager.default.isExecutableFile(atPath: sibling.path) ? sibling : nil
     }
 
-    static func install(daemonBinary: URL, paths: DevCtlPaths) async throws {
+    /** Install (or upgrade) the LaunchAgent. Same bounce contract as restart:
+        capture what is running, drain, swap binary + bootstrap, re-ensure. The
+        daemon's recoverAtStartup is the reboot path; install cannot rely on it
+        alone because a pre-feature state.json may lack resumeOnBoot, and the
+        CLI already knows the live names from status. */
+    static func install(daemonBinary: URL, paths: DevCtlPaths) async throws -> [(project: String, name: String)] {
         let fm = FileManager.default
         try fm.createDirectory(at: paths.daemonBinaryDir, withIntermediateDirectories: true)
         let destination = paths.daemonBinaryDir.appending(path: "devctld")
@@ -32,9 +37,10 @@ enum LaunchdAdmin {
         try fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(plist.utf8).write(to: plistURL)
         try? fm.removeItem(at: paths.stoppedIntentFile)
+        let client = DaemonClient(socketPath: paths.socketPath)
+        let runningServers = await captureActiveServers(client: client)
         /** Drain through the daemon FIRST: bootout's own kill can outrun the
             SIGTERM drain and orphan server trees mid-escalation. */
-        let client = DaemonClient(socketPath: paths.socketPath)
         _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
         for _ in 0..<50 where FileManager.default.fileExists(atPath: paths.socketPath) {
             if (try? await DaemonClient(socketPath: paths.socketPath)
@@ -56,6 +62,8 @@ enum LaunchdAdmin {
                 message: "launchctl bootstrap failed (\(bootstrap.status)): \(bootstrap.output)")
         }
         try await pollHello(paths: paths)
+        await reensure(runningServers, paths: paths)
+        return runningServers
     }
 
     static func uninstall(paths: DevCtlPaths, purge: Bool) async {
@@ -88,13 +96,7 @@ enum LaunchdAdmin {
         come back" is the restart contract. */
     static func restart(paths: DevCtlPaths) async throws -> [(project: String, name: String)] {
         let client = DaemonClient(socketPath: paths.socketPath)
-        var runningServers: [(project: String, name: String)] = []
-        if let all = try? await client.request(
-            .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
-            runningServers = all.servers
-                .filter { $0.phase == .running || $0.phase == .starting || $0.phase == .unhealthy }
-                .map { (project: $0.project, name: $0.server) }
-        }
+        let runningServers = await captureActiveServers(client: client)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
         let result = shell("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
         if result.status != 0 {
@@ -104,14 +106,29 @@ enum LaunchdAdmin {
                 message: "launchctl kickstart failed (\(result.status)): \(result.output)")
         }
         try await pollHello(paths: paths)
+        await reensure(runningServers, paths: paths)
+        return runningServers
+    }
+
+    static func captureActiveServers(client: DaemonClient) async -> [(project: String, name: String)] {
+        guard let all = try? await client.request(
+            .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self)
+        else { return [] }
+        return all.servers
+            .filter { $0.phase == .running || $0.phase == .starting || $0.phase == .unhealthy }
+            .map { (project: $0.project, name: $0.server) }
+    }
+
+    static func reensure(
+        _ servers: [(project: String, name: String)], paths: DevCtlPaths
+    ) async {
         let fresh = DaemonClient(socketPath: paths.socketPath)
-        for server in runningServers {
+        for server in servers {
             _ = try? await fresh.request(
                 .serverEnsure,
                 params: EnsureParams(name: server.name, project: server.project, timeoutSeconds: 60),
                 expecting: EnsureResult.self)
         }
-        return runningServers
     }
 
     static func launchdState() -> String {
