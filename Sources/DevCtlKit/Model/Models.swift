@@ -4,7 +4,7 @@ import Foundation
 public enum DevCtlVersion {
     /** Wire protocol major version; clients abort on mismatch with `version-mismatch`. */
     public static let proto = 1
-    public static let version = "0.1.0"
+    public static let version = "1.1.0"
 }
 
 /** Lifecycle phase of a supervised server. `failed` means the spawn itself never

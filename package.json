@@ -1,0 +1,20 @@
+{
+  "name": "devctl",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Version and changelog source of truth for GitHub releases (Swift product; not published to npm).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/quantizor/devctl.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "changeset": "changeset",
+    "version": "changeset version && node scripts/sync-version.mjs",
+    "release": "changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.1"
+  }
+}

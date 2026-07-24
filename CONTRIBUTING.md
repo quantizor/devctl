@@ -2,6 +2,10 @@
 
 devctl is a personal tool first; issues and patches are welcome all the same. Read `CLAUDE.md` (or its `AGENTS.md` symlink) for the codebase map, invariants, and commands, and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass locally; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management. GitHub Actions (`.github/workflows/ci.yml`) runs `swift build` + `swift test` on `macos-26` only: no smoke, no large runners.
 
+## Releases
+
+GitHub releases are driven by [Changesets](https://github.com/changesets/changesets) (see `.changeset/README.md`). With a user-facing change, run `npm run changeset`, commit the generated file, and merge. A Version Packages PR appears on `main`; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
+
 ## Adding an agent-harness adapter
 
 The session-context payload is harness-agnostic: `devctl context` prints a fenced plain-text block describing the current project's servers, and `devctl statusline` prints a one-line presence summary from statusline stdin JSON. Wiring those into a harness is the only per-harness work.
