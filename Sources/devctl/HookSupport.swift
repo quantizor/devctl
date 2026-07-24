@@ -1,5 +1,25 @@
 import DevCtlKit
+import Darwin
 import Foundation
+
+/** Absolute path of this running `devctl` binary. Prefer over
+    CommandLine.arguments[0], which is often a bare PATH name and would resolve
+    relative to cwd (breaking `hook install` when invoked as `devctl` from a
+    project directory). */
+enum CLISelf {
+    static var path: String {
+        var size = UInt32(PATH_MAX)
+        var buf = [CChar](repeating: 0, count: Int(size))
+        if _NSGetExecutablePath(&buf, &size) != 0 {
+            buf = [CChar](repeating: 0, count: Int(size))
+            _ = _NSGetExecutablePath(&buf, &size)
+        }
+        let end = buf.firstIndex(of: 0) ?? buf.endIndex
+        let bytes = buf[..<end].map { UInt8(bitPattern: $0) }
+        let raw = String(decoding: bytes, as: UTF8.self)
+        return URL(fileURLWithPath: raw).resolvingSymlinksInPath().path
+    }
+}
 
 /** The harness-agnostic context primitive: a fenced plain-text block any agent
     harness can inject into a session. Prints nothing for unregistered or
@@ -58,7 +78,27 @@ protocol HarnessAdapter: Sendable {
     var name: String { get }
 }
 
-let harnessAdapters: [any HarnessAdapter] = [ClaudeCodeAdapter()]
+let harnessAdapters: [any HarnessAdapter] = [ClaudeCodeAdapter(), CursorAdapter()]
+
+/** Resolve the project directory a session-start hook should introspect. Cursor
+    hooks carry workspace_roots (and CURSOR_PROJECT_DIR); Claude Code carries cwd.
+    Fall back to the process cwd when the payload is empty or malformed. */
+enum HookSessionCwd {
+    static func resolve(stdin: Data) -> String {
+        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
+            if let roots = payload["workspace_roots"] as? [String], let first = roots.first,
+                !first.isEmpty
+            {
+                return first
+            }
+            if let cwd = payload["cwd"] as? String, !cwd.isEmpty { return cwd }
+        }
+        if let env = ProcessInfo.processInfo.environment["CURSOR_PROJECT_DIR"], !env.isEmpty {
+            return env
+        }
+        return FileManager.default.currentDirectoryPath
+    }
+}
 
 /** Claude Code: SessionStart hook with the compact matcher (fires right after
     compaction, exactly when agents forget), merged into user settings without
@@ -79,10 +119,15 @@ struct ClaudeCodeAdapter: HarnessAdapter {
         }
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var sessionStart = hooks["SessionStart"] as? [[String: Any]] ?? []
+        if let repaired = repairClaudeSessionStart(sessionStart: &sessionStart, command: command) {
+            hooks["SessionStart"] = sessionStart
+            settings["hooks"] = hooks
+            try writeSettings(settings)
+            return repaired
+        }
         let alreadyInstalled = sessionStart.contains { entry in
             ((entry["hooks"] as? [[String: Any]]) ?? []).contains { hook in
-                (hook["command"] as? String)?.contains("devctl hook claude-session-start") == true
-                    || (hook["command"] as? String) == command
+                (hook["command"] as? String) == command
             }
         }
         if alreadyInstalled {
@@ -94,11 +139,100 @@ struct ClaudeCodeAdapter: HarnessAdapter {
         ])
         hooks["SessionStart"] = sessionStart
         settings["hooks"] = hooks
+        try writeSettings(settings)
+        return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
+    }
+
+    private func writeSettings(_ settings: [String: Any]) throws {
         let data = try JSONSerialization.data(
             withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
         try FileManager.default.createDirectory(
             at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: settingsURL)
-        return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
+    }
+
+    /** Rewrite a prior install whose command path no longer resolves (e.g. a
+        bare `devctl` that was resolved relative to cwd at install time). */
+    private func repairClaudeSessionStart(sessionStart: inout [[String: Any]], command: String)
+        -> String?
+    {
+        var changed = false
+        for i in sessionStart.indices {
+            guard var entryHooks = sessionStart[i]["hooks"] as? [[String: Any]] else { continue }
+            for j in entryHooks.indices {
+                guard let existing = entryHooks[j]["command"] as? String,
+                    existing.contains("devctl hook claude-session-start"),
+                    existing != command
+                else { continue }
+                entryHooks[j]["command"] = command
+                changed = true
+            }
+            if changed { sessionStart[i]["hooks"] = entryHooks }
+        }
+        return changed
+            ? "Claude Code SessionStart hook path repaired in \(settingsURL.path)" : nil
+    }
+}
+
+/** Cursor: sessionStart hook merged into ~/.cursor/hooks.json without clobbering
+    existing entries. Emits {additional_context} (snake_case; Cursor's schema). */
+struct CursorAdapter: HarnessAdapter {
+    let name = "cursor"
+
+    var settingsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appending(path: ".cursor/hooks.json")
+    }
+
+    func install(devctlPath: String) throws -> String {
+        let command = "\(devctlPath) hook cursor-session-start"
+        var settings: [String: Any] = ["version": 1]
+        if let data = try? Data(contentsOf: settingsURL),
+            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            settings = parsed
+            if settings["version"] == nil { settings["version"] = 1 }
+        }
+        var hooks = settings["hooks"] as? [String: Any] ?? [:]
+        var sessionStart = hooks["sessionStart"] as? [[String: Any]] ?? []
+        if let repaired = repairCursorSessionStart(sessionStart: &sessionStart, command: command) {
+            hooks["sessionStart"] = sessionStart
+            settings["hooks"] = hooks
+            try writeSettings(settings)
+            return repaired
+        }
+        let alreadyInstalled = sessionStart.contains { entry in
+            (entry["command"] as? String) == command
+        }
+        if alreadyInstalled {
+            return "Cursor sessionStart hook already installed (\(settingsURL.path))"
+        }
+        sessionStart.append(["command": command])
+        hooks["sessionStart"] = sessionStart
+        settings["hooks"] = hooks
+        try writeSettings(settings)
+        return "Cursor sessionStart hook installed in \(settingsURL.path)"
+    }
+
+    private func writeSettings(_ settings: [String: Any]) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
+        try FileManager.default.createDirectory(
+            at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: settingsURL)
+    }
+
+    private func repairCursorSessionStart(sessionStart: inout [[String: Any]], command: String)
+        -> String?
+    {
+        var changed = false
+        for i in sessionStart.indices {
+            guard let existing = sessionStart[i]["command"] as? String,
+                existing.contains("devctl hook cursor-session-start"),
+                existing != command
+            else { continue }
+            sessionStart[i]["command"] = command
+            changed = true
+        }
+        return changed ? "Cursor sessionStart hook path repaired in \(settingsURL.path)" : nil
     }
 }

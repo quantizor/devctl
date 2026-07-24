@@ -613,7 +613,7 @@ struct HookCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hook",
         abstract: "Agent-harness session hooks.",
-        subcommands: [HookInstall.self, HookClaudeSessionStart.self]
+        subcommands: [HookInstall.self, HookClaudeSessionStart.self, HookCursorSessionStart.self]
     )
 }
 
@@ -624,7 +624,7 @@ struct HookInstall: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    @Option(help: "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")).")
+    @Option(help: "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: claude).")
     var harness: String = "claude"
 
     @Flag(help: "Also print the statusline wiring suggestion.")
@@ -639,8 +639,7 @@ struct HookInstall: AsyncParsableCommand {
                     message: "unknown harness '\(harness)'"),
                 json: global.json)
         }
-        let devctlPath = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath().path
+        let devctlPath = CLISelf.path
         do {
             let summary = try adapter.install(devctlPath: devctlPath)
             var output = summary
@@ -665,11 +664,7 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
 
     func run() async throws {
         let stdin = FileHandle.standardInput.readDataToEndOfFile()
-        var cwd = FileManager.default.currentDirectoryPath
-        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any],
-            let hookCwd = payload["cwd"] as? String {
-            cwd = hookCwd
-        }
+        let cwd = HookSessionCwd.resolve(stdin: stdin)
         /** Project resolution without --project: reuse the CLI's walk from the
             hook cwd by chdir-ing there first. */
         FileManager.default.changeCurrentDirectoryPath(cwd)
@@ -681,6 +676,25 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
                 "hookEventName": "SessionStart",
             ]
         ]
+        if let data = try? JSONSerialization.data(withJSONObject: output) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+}
+
+/** Invoked by Cursor's sessionStart hook. Emits {additional_context} (Cursor's
+    snake_case schema). Same silence / exit-0 guarantees as the Claude hook. */
+struct HookCursorSessionStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cursor-session-start", shouldDisplay: false)
+
+    func run() async throws {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let cwd = HookSessionCwd.resolve(stdin: stdin)
+        FileManager.default.changeCurrentDirectoryPath(cwd)
+        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let text = await AgentContext.render(project: project) else { return }
+        let output: [String: Any] = ["additional_context": text]
         if let data = try? JSONSerialization.data(withJSONObject: output) {
             FileHandle.standardOutput.write(data)
         }
