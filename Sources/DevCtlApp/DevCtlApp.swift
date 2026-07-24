@@ -3,6 +3,7 @@ import CoreSpotlight
 import DevCtlKit
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 /** One selectable row in the popover's keyboard model. A server row or one of
     its heads; `actions` are the Left/Right targets in display order. */
@@ -145,6 +146,7 @@ final class KeyNavModel {
             switch sel.action {
             case .open:
                 ProjectAccessLog.shared.record(projectPath: project)
+                SpotlightIndexer.noteOpened(identifier: "\(project)::\(name)")
                 if let url = server.url.flatMap(URL.init(string:)) { NSWorkspace.shared.open(url) }
             case .start: daemon?.startServer(server)
             case .stop: daemon?.stopServer(server)
@@ -156,19 +158,51 @@ final class KeyNavModel {
             switch sel.action {
             case .open:
                 ProjectAccessLog.shared.record(projectPath: project)
+                SpotlightIndexer.noteOpened(identifier: "\(project)::\(name)::\(head)")
                 if let parsed = URL(string: url) { NSWorkspace.shared.open(parsed) }
             case .pin:
+                let identifier = "\(project)::\(name)::\(head)"
+                let wasPinned = HeadPins.shared.isPinned(project: project, server: name, head: head)
                 HeadPins.shared.toggle(project: project, server: name, head: head)
+                if !wasPinned { SpotlightIndexer.noteOpened(identifier: identifier) }
             default: break
             }
         }
     }
 }
 
-/** Handles Spotlight item activation: a background (LSUIElement) app receives
-    it through the app delegate, not a scene view, since the popover's view tree
-    may not exist when Spotlight launches us. */
-final class SpotlightActivationDelegate: NSObject, NSApplicationDelegate {
+/** Handles Spotlight, `devctl://` URL opens, and notification action taps. A
+    background (LSUIElement) app receives these through the app delegate, not a
+    scene view: the popover's view tree may not exist when Launch Services or
+    Spotlight launches us. */
+final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDeepLinkDispatch.registerNotificationCategories()
+        UNUserNotificationCenter.current().delegate = self
+        /** MenuBarExtra / LSUIElement apps do not always receive
+            application(_:open:); the GetURL Apple Event is the reliable path. */
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc private func handleGetURLEvent(
+        _ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor
+    ) {
+        guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+            let url = URL(string: raw)
+        else { return }
+        AppDeepLinkDispatch.run(url)
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme?.lowercased() == "devctl" {
+            AppDeepLinkDispatch.run(url)
+        }
+    }
+
     func application(
         _ application: NSApplication,
         continue userActivity: NSUserActivity,
@@ -178,8 +212,30 @@ final class SpotlightActivationDelegate: NSObject, NSApplicationDelegate {
             let identifier = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String,
             let url = SpotlightIndexer.url(forIdentifier: identifier)
         else { return false }
+        SpotlightIndexer.noteOpened(identifier: identifier)
         NSWorkspace.shared.open(url)
         return true
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let info = response.notification.request.content.userInfo
+        let project = info[AppDeepLinkDispatch.userInfoProject] as? String
+        let server = info[AppDeepLinkDispatch.userInfoServer] as? String
+        let head = info[AppDeepLinkDispatch.userInfoHead] as? String
+        if let project, let server,
+            let link = DeepLinkNotificationAction.link(
+                actionId: response.actionIdentifier,
+                projectSlug: (project as NSString).lastPathComponent,
+                server: server,
+                head: head)
+        {
+            AppDeepLinkDispatch.run(link)
+        }
+        completionHandler()
     }
 }
 
@@ -189,7 +245,7 @@ final class SpotlightActivationDelegate: NSObject, NSApplicationDelegate {
     necessity (unix socket), LSUIElement, no Dock icon. */
 @main
 struct DevCtlApp: App {
-    @NSApplicationDelegateAdaptor(SpotlightActivationDelegate.self) private var spotlightDelegate
+    @NSApplicationDelegateAdaptor(AppActivationDelegate.self) private var appDelegate
     @State private var model = DaemonModel()
 
     /** Polling starts at launch, not first popover open: the collapsed label's
@@ -262,7 +318,7 @@ struct MenuContent: View {
             } else if model.projects.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("No servers registered")
-                    Text("devctl register --name web --cmd …")
+                    Text("devctl register --name myproj --cmd …")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
@@ -322,6 +378,8 @@ struct MenuContent: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
+                .help("Open the dashboard window")
+                .accessibilityLabel(Text("Open dashboard"))
                 /** Generous air between primary action and the login preference. */
                 LaunchAtLoginToggle()
                     .padding(.leading, 22)
@@ -333,6 +391,8 @@ struct MenuContent: View {
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
+                .help("Quit devctl")
+                .accessibilityLabel(Text("Quit devctl"))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -398,6 +458,7 @@ struct ServerRow: View {
                     the signature is a one-click browser origin. */
                 Button {
                     ProjectAccessLog.shared.record(projectPath: server.project)
+                    SpotlightIndexer.noteOpened(identifier: "\(server.project)::\(server.server)")
                     if let url = server.url.flatMap(URL.init(string:)) {
                         NSWorkspace.shared.open(url)
                     }
@@ -673,7 +734,9 @@ enum PresenceDots {
 }
 
 /** Pinned-head preference, persisted across launches (UserDefaults). Keys are
-    `project::server::head` so pins survive renames of nothing they should not. */
+    `project::server::head`. A server rename (dev → candor) orphans the old key;
+    `reconcile` remaps when the project still has exactly one server that exposes
+    that head, otherwise drops the dead pin. */
 @Observable
 final class HeadPins {
     static let shared = HeadPins()
@@ -696,6 +759,42 @@ final class HeadPins {
         } else {
             pinned.insert(key)
         }
+        persist()
+    }
+
+    /** Drop or remap pins that no longer match a live head (server renames). */
+    func reconcile(projects: [DaemonModel.ProjectGroup]) {
+        var valid: Set<String> = []
+        /** projectPath → head → [server names that expose it] */
+        var byProjectHead: [String: [String: [String]]] = [:]
+        for project in projects {
+            for server in project.servers {
+                for head in (server.heads ?? [:]).keys {
+                    let key = "\(project.path)::\(server.server)::\(head)"
+                    valid.insert(key)
+                    byProjectHead[project.path, default: [:]][head, default: []].append(server.server)
+                }
+            }
+        }
+        var next = pinned
+        for key in pinned where !valid.contains(key) {
+            next.remove(key)
+            let parts = key.split(separator: "::", maxSplits: 2, omittingEmptySubsequences: false)
+                .map(String.init)
+            guard parts.count == 3 else { continue }
+            let project = parts[0]
+            let head = parts[2]
+            let candidates = byProjectHead[project]?[head] ?? []
+            if candidates.count == 1, let server = candidates.first {
+                next.insert("\(project)::\(server)::\(head)")
+            }
+        }
+        guard next != pinned else { return }
+        pinned = next
+        persist()
+    }
+
+    private func persist() {
         UserDefaults.standard.set(pinned.sorted(), forKey: Self.defaultsKey)
     }
 }
@@ -718,6 +817,7 @@ struct HeadRow: View {
         HStack(spacing: 0) {
             Button {
                 onOpen()
+                SpotlightIndexer.noteOpened(identifier: rowID)
                 if let parsed = URL(string: url) {
                     NSWorkspace.shared.open(parsed)
                 }
@@ -748,7 +848,10 @@ struct HeadRow: View {
             HStack(spacing: 8) {
                 Color.clear.frame(width: 14, height: 14)
                 if pinned || hovering {
-                    Button(action: onTogglePin) {
+                    Button {
+                        onTogglePin()
+                        if !pinned { SpotlightIndexer.noteOpened(identifier: rowID) }
+                    } label: {
                         Image(systemName: pinned ? "pin.fill" : "pin")
                             .font(.system(size: 9))
                             .foregroundStyle(pinned ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
@@ -928,6 +1031,7 @@ struct FilterBox: View {
                 }
                 .buttonStyle(.plain)
                 .help("Clear filter")
+                .accessibilityLabel(Text("Clear filter"))
             }
         }
         .padding(.horizontal, 8)

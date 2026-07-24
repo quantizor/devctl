@@ -77,6 +77,7 @@ struct ServerDetail: View {
                         model: model, reserveSlot: false, server: server, size: 16)
                     if server.url != nil {
                         Button {
+                            SpotlightIndexer.noteOpened(identifier: "\(server.project)::\(server.server)")
                             openURL(server.url)
                         } label: {
                             Image(systemName: "safari")
@@ -103,7 +104,11 @@ struct ServerDetail: View {
                     if let heads = server.heads, !heads.isEmpty {
                         Menu {
                             ForEach(heads.sorted(by: { $0.key < $1.key }), id: \.key) { name, url in
-                                Button("\(name) · \(url)") { openURL(url) }
+                                Button("\(name) · \(url)") {
+                                    SpotlightIndexer.noteOpened(
+                                        identifier: "\(server.project)::\(server.server)::\(name)")
+                                    openURL(url)
+                                }
                             }
                         } label: {
                             Image(systemName: "rectangle.stack")
@@ -113,6 +118,7 @@ struct ServerDetail: View {
                         .menuStyle(.borderlessButton)
                         .frame(width: 22)
                         .help("Open head")
+                        .accessibilityLabel(Text("Open head"))
                     }
                     Button {
                         NSWorkspace.shared.activateFileViewerSelecting(
@@ -130,6 +136,7 @@ struct ServerDetail: View {
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 240)
+                    .accessibilityLabel(Text("Detail view"))
                 }
             }
             .padding(.horizontal, 12)
