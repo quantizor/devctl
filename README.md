@@ -6,7 +6,7 @@ A launchd-supervised daemon owns every server process. Sessions come and go, con
 
 ## Why
 
-Agents forget their dev servers. After a context compaction they spawn duplicates, tail dead logs, and fight over ports. devctl gives them one idempotent verb (`devctl ensure web`) that always lands in the same place, a session hook that re-teaches every new or compacted session what is running, and a `why` command that turns a broken server into a root-cause diagnosis.
+Agents forget their dev servers. After a context compaction they spawn duplicates, tail dead logs, and fight over ports. devctl gives them one idempotent verb (`devctl ensure myproj`) that always lands in the same place, a session hook that re-teaches every new or compacted session what is running, and a `why` command that turns a broken server into a root-cause diagnosis.
 
 ## Quick start
 
@@ -16,12 +16,14 @@ Agents forget their dev servers. After a context compaction they spawn duplicate
 ```sh
 make install          # binaries to ~/.local/bin, app to /Applications, daemon installed
 cd your-project
-devctl register --name web --cmd bun --cmd run --cmd dev --port 3000
-devctl ensure web     # idempotent: healthy is a no-op
-devctl why web        # root cause when something breaks
+devctl register --name myproj --cmd bun --cmd run --cmd dev --port 3000
+devctl ensure myproj  # idempotent: healthy is a no-op
+devctl why myproj     # root cause when something breaks
 devctl hook install --harness cursor   # Cursor Agent sessions rediscover servers automatically
 devctl hook install --harness claude   # same for Claude Code (default harness)
 ```
+
+Name each server after the project (`myproj`, not a generic `web`) so it is easy to spot in Spotlight and search, and give it a `<project>.localhost` host rather than bare `localhost`: the per-project subdomain keeps browser cookies, storage, and service workers isolated between projects.
 
 Or commit a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. The full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).
 
