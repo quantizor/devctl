@@ -4,71 +4,90 @@ import DevCtlKit
 import Foundation
 
 /** Spotlight integration: every server and every head becomes a searchable item
-    ("candor operator" from anywhere opens the surface in the browser). The
-    id -> URL map is persisted at index time so activation resolves without the
-    daemon on the hot path. Re-indexes only when the item set changes. */
+    ("candor · operator" opens the surface). Titles lead with the project/head;
+    `devctl` lives in the subtitle. Ranking above filesystem Top Hits is not
+    something Core Spotlight can force; this is best-effort discovery, not a
+    launcher. Raycast/Alfred + `devctl://` is the fast path. */
 enum SpotlightIndexer {
-    static let domain = "devctl-servers"
-    private static let urlMapKey = "spotlight urls"
+    /** nonisolated: read inside the (nonisolated) index completion callback. */
+    nonisolated static let domain = "devctl-servers"
+    /** Donated on open so Siri / Spotlight can predict the surface; the type is
+        opaque since continuation runs through CSSearchableItemActionType, not this. */
+    static let activityType = "dev.quantizor.devctl.open-surface"
+    private static let entriesKey = "spotlight entries"
     private static let signatureKey = "spotlight signature"
-    private static let statusKey = "spotlight last sync"
+    /** nonisolated: written inside the (nonisolated) index completion callback. */
+    nonisolated private static let statusKey = "spotlight last sync"
+
+    private static let baseRankingHint = 90
+    private static let pinnedRankingHint = 100
+
+    struct SpotlightEntry: Codable, Sendable {
+        let icon: String?
+        let keywords: [String]
+        let rankingHint: Int
+        let title: String
+        let url: String
+    }
+
+    private static var currentActivity: NSUserActivity?
 
     static func sync(projects: [DaemonModel.ProjectGroup]) {
-        var urlByIdentifier: [String: String] = [:]
-        var entriesToIndex: [(icon: String?, identifier: String, title: String, url: String)] = []
+        HeadPins.shared.reconcile(projects: projects)
+        let pins = HeadPins.shared
+        var entriesByIdentifier: [String: SpotlightEntry] = [:]
+        var payload: [(identifier: String, entry: SpotlightEntry)] = []
         for project in projects {
             for server in project.servers {
-                var entries: [(icon: String?, identifier: String, title: String, url: String)] = []
                 if let url = server.url {
-                    entries.append(
-                        (
-                            icon: server.icon,
-                            identifier: "\(project.path)::\(server.server)",
-                            title: "\(project.name) \(server.server)",
-                            url: url
-                        ))
+                    let identifier = "\(project.path)::\(server.server)"
+                    let entry = SpotlightEntry(
+                        icon: server.icon,
+                        keywords: SpotlightLabel.keywords(
+                            project: project.name, server: server.server, head: nil, url: url),
+                        rankingHint: baseRankingHint,
+                        title: SpotlightLabel.title(
+                            project: project.name, server: server.server, head: nil),
+                        url: url)
+                    entriesByIdentifier[identifier] = entry
+                    payload.append((identifier, entry))
                 }
                 for (head, url) in server.heads ?? [:] {
-                    entries.append(
-                        (
-                            icon: server.icon,
-                            identifier: "\(project.path)::\(server.server)::\(head)",
-                            title: "\(project.name) \(head)",
-                            url: url
-                        ))
-                }
-                for entry in entries {
-                    urlByIdentifier[entry.identifier] = entry.url
-                    entriesToIndex.append(entry)
+                    let identifier = "\(project.path)::\(server.server)::\(head)"
+                    let pinned = pins.isPinned(project: project.path, server: server.server, head: head)
+                    let entry = SpotlightEntry(
+                        icon: server.icon,
+                        keywords: SpotlightLabel.keywords(
+                            project: project.name, server: server.server, head: head, url: url),
+                        rankingHint: pinned ? pinnedRankingHint : baseRankingHint,
+                        title: SpotlightLabel.title(
+                            project: project.name, server: server.server, head: head),
+                        url: url)
+                    entriesByIdentifier[identifier] = entry
+                    payload.append((identifier, entry))
                 }
             }
         }
-        let signature = urlByIdentifier.keys.sorted().joined(separator: "|")
-            + "#" + urlByIdentifier.values.sorted().joined(separator: "|")
-            + "#" + entriesToIndex.compactMap(\.icon).sorted().joined(separator: "|")
+        let signature = "v6-cs-only|" + payload.map {
+            "\($0.identifier)#\($0.entry.title)#\($0.entry.url)#\($0.entry.icon ?? "")#\($0.entry.rankingHint)#\($0.entry.keywords.joined(separator: ","))"
+        }.sorted().joined(separator: "|")
         guard signature != UserDefaults.standard.string(forKey: signatureKey) else { return }
-        UserDefaults.standard.set(urlByIdentifier, forKey: urlMapKey)
+        if let data = try? JSONEncoder().encode(entriesByIdentifier) {
+            UserDefaults.standard.set(data, forKey: entriesKey)
+        }
         UserDefaults.standard.set(signature, forKey: signatureKey)
-        /** CSSearchableItem is not Sendable, so the items are BUILT inside the
-            callback from Sendable value tuples rather than captured across it. */
-        let payload = entriesToIndex
+        let items = payload
         CSSearchableIndex.default().deleteSearchableItems(withDomainIdentifiers: [domain]) { _ in
-            let items = payload.map { entry -> CSSearchableItem in
-                let attributes = CSSearchableItemAttributeSet(contentType: .url)
-                attributes.contentDescription = "\(entry.url) · devctl dev server"
-                attributes.keywords = ["devctl", "dev server"]
-                attributes.thumbnailData = entry.icon.flatMap(Self.thumbnailPNG)
-                attributes.title = entry.title
-                attributes.url = URL(string: entry.url)
+            let built = items.map { element -> CSSearchableItem in
                 let item = CSSearchableItem(
-                    uniqueIdentifier: entry.identifier,
+                    uniqueIdentifier: element.identifier,
                     domainIdentifier: domain,
-                    attributeSet: attributes)
+                    attributeSet: attributeSet(for: element.entry))
                 item.expirationDate = .distantFuture
                 return item
             }
-            let count = items.count
-            CSSearchableIndex.default().indexSearchableItems(items) { error in
+            let count = built.count
+            CSSearchableIndex.default().indexSearchableItems(built) { error in
                 UserDefaults.standard.set(
                     error.map { "error: \($0.localizedDescription)" }
                         ?? "ok \(count) items \(JSONCoding.formatISO8601(Date()))",
@@ -77,10 +96,59 @@ enum SpotlightIndexer {
         }
     }
 
-    /** Rasterizes a config-supplied icon (png/svg/pdf, anything NSImage reads)
-        to PNG at thumbnail size. */
-    /** nonisolated: runs inside the index callback; offscreen NSImage drawing
-        has no main-thread dependence. */
+    static func noteOpened(identifier: String) {
+        guard let entry = loadEntries()[identifier] else { return }
+        let item = CSSearchableItem(
+            uniqueIdentifier: identifier,
+            domainIdentifier: domain,
+            attributeSet: attributeSet(for: entry, lastUsed: Date()))
+        item.isUpdate = true
+        item.expirationDate = .distantFuture
+        CSSearchableIndex.default().indexSearchableItems([item]) { _ in }
+        donateActivity(identifier: identifier, entry: entry)
+    }
+
+    nonisolated private static func attributeSet(
+        for entry: SpotlightEntry, lastUsed: Date? = nil
+    ) -> CSSearchableItemAttributeSet {
+        /** `.text` surfaces on macOS; `.url` often indexes "ok" but never appears. */
+        let attributes = CSSearchableItemAttributeSet(contentType: .text)
+        attributes.displayName = entry.title
+        attributes.title = entry.title
+        attributes.contentDescription = SpotlightLabel.subtitle(url: entry.url)
+        attributes.textContent = "\(entry.title)\n\(SpotlightLabel.subtitle(url: entry.url))"
+        attributes.containerDisplayName = "devctl"
+        attributes.kind = "Dev Server"
+        attributes.keywords = entry.keywords
+        attributes.rankingHint = NSNumber(value: entry.rankingHint)
+        attributes.thumbnailData = entry.icon.flatMap(Self.thumbnailPNG)
+        attributes.url = URL(string: entry.url)
+        if let lastUsed { attributes.lastUsedDate = lastUsed }
+        return attributes
+    }
+
+    private static func donateActivity(identifier: String, entry: SpotlightEntry) {
+        let activity = NSUserActivity(activityType: activityType)
+        activity.title = entry.title
+        activity.keywords = Set(entry.keywords)
+        activity.userInfo = [CSSearchableItemActivityIdentifier: identifier]
+        activity.isEligibleForSearch = true
+        activity.persistentIdentifier = identifier
+        if let url = URL(string: entry.url) { activity.webpageURL = url }
+        let attributes = attributeSet(for: entry, lastUsed: Date())
+        attributes.relatedUniqueIdentifier = identifier
+        activity.contentAttributeSet = attributes
+        activity.becomeCurrent()
+        currentActivity = activity
+    }
+
+    private static func loadEntries() -> [String: SpotlightEntry] {
+        guard let data = UserDefaults.standard.data(forKey: entriesKey),
+            let map = try? JSONDecoder().decode([String: SpotlightEntry].self, from: data)
+        else { return [:] }
+        return map
+    }
+
     nonisolated static func thumbnailPNG(path: String) -> Data? {
         guard let image = NSImage(contentsOfFile: path) else { return nil }
         let side: CGFloat = 128
@@ -98,9 +166,7 @@ enum SpotlightIndexer {
         return bitmap.representation(using: .png, properties: [:])
     }
 
-    /** Resolves a Spotlight activation to its URL via the persisted map. */
     static func url(forIdentifier identifier: String) -> URL? {
-        let map = UserDefaults.standard.dictionary(forKey: urlMapKey) as? [String: String]
-        return map?[identifier].flatMap(URL.init(string:))
+        loadEntries()[identifier].flatMap { URL(string: $0.url) }
     }
 }
