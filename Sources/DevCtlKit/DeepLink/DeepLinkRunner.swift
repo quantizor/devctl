@@ -131,10 +131,13 @@ public struct DeepLinkRunner: Sendable {
         if let head {
             guard let headURL = server.heads?[head] else {
                 let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
+                let detail = known.isEmpty
+                    ? "this server declares no heads"
+                    : "known heads: \(known)"
                 throw WireError(
                     code: .notFound,
-                    hint: known.isEmpty ? "this server declares no heads" : "known heads: \(known)",
-                    message: "no head named '\(head)' on \(server.server)")
+                    hint: "run: devctl status \(server.server) --json",
+                    message: "no head named '\(head)' on \(server.server); \(detail)")
             }
             raw = headURL
         } else {

@@ -109,9 +109,16 @@ private actor RecordingEffects: DeepLinkEffects {
             status: ServerStatus(
                 heads: ["wren-hollow": "http://wren-hollow.localhost:3000/"],
                 logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms"))
-        await #expect(throws: WireError.self) {
-            try await runner(daemon, RecordingEffects()).run(
+        do {
+            _ = try await runner(daemon, RecordingEffects()).run(
                 DeepLink(verb: .open, projectSlug: "candor", server: "cms", head: "cold-brook"))
+            Issue.record("expected WireError")
+        } catch let error as WireError {
+            #expect(error.code == .notFound)
+            #expect(error.hint == "run: devctl status cms --json")
+            #expect(error.message.contains("known heads: wren-hollow"))
+        } catch {
+            Issue.record("unexpected error \(error)")
         }
     }
 
