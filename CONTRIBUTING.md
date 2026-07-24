@@ -1,6 +1,6 @@
 # Contributing to devctl
 
-devctl is a personal tool first; issues and patches are welcome all the same. Read `CLAUDE.md` (or its `AGENTS.md` symlink) for the codebase map, invariants, and commands, and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management.
+devctl is a personal tool first; issues and patches are welcome all the same. Read `CLAUDE.md` (or its `AGENTS.md` symlink) for the codebase map, invariants, and commands, and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass locally; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management. GitHub Actions (`.github/workflows/ci.yml`) runs `swift build` + `swift test` on `macos-26` only: no smoke, no large runners.
 
 ## Adding an agent-harness adapter
 
