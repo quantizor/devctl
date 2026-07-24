@@ -11,7 +11,7 @@ devctl is a personal tool first; issues and patches are welcome all the same. Re
 
 ## Releases
 
-GitHub releases are driven by [Changesets](https://github.com/changesets/changesets). After changesets land on `main`, a Version Packages PR appears; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
+GitHub releases are driven by [Changesets](https://github.com/changesets/changesets). After changesets land on `main`, a Version Packages PR appears; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version. The Release workflow needs the repo setting **Allow GitHub Actions to create and approve pull requests** (Actions → General → Workflow permissions), or PR creation fails with a 403 even when `pull-requests: write` is declared.
 
 ## Adding an agent-harness adapter
 
