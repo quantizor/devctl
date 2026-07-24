@@ -172,6 +172,36 @@ PHASE_AFTER="$("$DEVCTL" wait db --healthy --timeout 15 --json | /usr/bin/python
 pass "resource lock pauses holder, refuses ensure, resumes after"
 "$DEVCTL" down --json > /dev/null
 
+# Deep links: print URL + dispatch via x-url (no Launch Services).
+cd "$PROJECT"
+SLUG="$(basename "$PROJECT")"
+LINK_URL="$("$DEVCTL" link ensure web)"
+[[ "$LINK_URL" == "devctl://ensure/${SLUG}/web" ]] || fail "link ensure printed '$LINK_URL'"
+pass "link prints canonical URL ($LINK_URL)"
+"$DEVCTL" x-url "$LINK_URL" --json > /dev/null || fail "x-url ensure failed"
+"$DEVCTL" wait web --healthy --timeout 15 --json > /dev/null || fail "x-url ensure never healthy"
+pass "x-url ensure"
+"$DEVCTL" x-url "devctl://stop/${SLUG}/web" --json > /dev/null || fail "x-url stop failed"
+PHASE_STOP="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["phase"])')"
+[[ "$PHASE_STOP" == "stopped" ]] || fail "x-url stop left phase $PHASE_STOP"
+pass "x-url stop"
+"$DEVCTL" x-url "devctl://why/${SLUG}/web" --json > /dev/null || fail "x-url why failed"
+pass "x-url why"
+set +e
+BAD_OUT="$("$DEVCTL" x-url 'devctl://ensure/no-such-slug/web' --json 2>/dev/null)"
+BAD_EXIT=$?
+set -e
+[[ "$BAD_EXIT" -ne 0 ]] || fail "x-url unknown slug should fail"
+echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelope: $BAD_OUT"
+pass "x-url rejects unknown slug"
+
+# Bundle advertises the custom URL scheme.
+swift build --package-path "$ROOT" --product DevCtlApp > /dev/null
+"$ROOT/scripts/make-app-bundle.sh" - debug
+SCHEME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$ROOT/devctl.app/Contents/Info.plist")"
+[[ "$SCHEME" == "devctl" ]] || fail "assembled Info.plist scheme was '$SCHEME'"
+pass "assembled app declares CFBundleURLSchemes=devctl"
+
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
 

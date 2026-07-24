@@ -13,9 +13,9 @@ struct DevCtl: AsyncParsableCommand {
         version: DevCtlVersion.version,
         subcommands: [
             ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
-            HookCommand.self, Logs.self, Mark.self, Open.self, Register.self, Start.self,
+            HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self, Start.self,
             Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self, Unregister.self, Up.self,
-            Wait.self, Why.self, DaemonCommand.self,
+            Wait.self, Why.self, XURL.self, DaemonCommand.self,
         ]
     )
 }
@@ -316,7 +316,7 @@ struct Status: AsyncParsableCommand {
         }
         CLIRunner.emit(result, json: global.json) { list in
             if list.servers.isEmpty {
-                return "no servers registered for this project (hint: devctl register --name web --cmd …)"
+                return "no servers registered for this project (hint: devctl register --name myproj --cmd …)"
             }
             return list.servers.map(CLIRunner.describe).joined(separator: "\n")
         }
@@ -644,8 +644,18 @@ struct HookInstall: AsyncParsableCommand {
             let summary = try adapter.install(devctlPath: devctlPath)
             var output = summary
             if statusline {
-                output += "\n\nStatusline: pipe your statusline script through `devctl statusline` to append server presence, e.g.\n  devctl statusline <<< \"$STDIN_JSON\"  ->  web:3000 ok · api crashed"
+                output += "\n\nStatusline: pipe your statusline script through `devctl statusline` to append server presence, e.g.\n  devctl statusline <<< \"$STDIN_JSON\"  ->  myproj:3000 ok · api crashed"
             }
+            /** The discovery tip is printed, never appended to CLAUDE.md/AGENTS.md:
+                devctl does not edit a project's files. Server names come from the
+                nearest devservers.json (empty when there is none yet). */
+            let serverNames: [String]
+            if let view = try? ProjectConfigLoader.load(project: global.resolvedProject()) {
+                serverNames = view.specs.map(\.name)
+            } else {
+                serverNames = []
+            }
+            output += "\n\nDiscovery tip: paste this bullet into the project's CLAUDE.md/AGENTS.md so agents find devctl on their own (devctl never edits those files):\n\(DiscoveryStanza.render(serverNames: serverNames))"
             CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
         } catch {
             CLIRunner.fail(
@@ -856,6 +866,102 @@ struct Open: AsyncParsableCommand {
     }
 }
 
+/** Print a `devctl://` URL for the cwd project (Raycast snippets, docs, smoke). */
+struct Link: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Print a devctl:// URL for a verb and server in this project.")
+
+    @Argument(help: "Verb: open, ensure, stop, or why.")
+    var verb: String
+
+    @Argument(help: "Server name.")
+    var name: String
+
+    @Argument(help: "Head name (open only).")
+    var head: String?
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        guard let deepVerb = DeepLinkVerb(rawValue: verb.lowercased()) else {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "verbs: \(DeepLinkVerb.allCases.map(\.rawValue).sorted().joined(separator: ", "))",
+                    message: "unknown verb '\(verb)'"),
+                json: global.json)
+        }
+        if head != nil, deepVerb != .open {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage, message: "a head is only valid with verb open"),
+                json: global.json)
+        }
+        let project = global.resolvedProject()
+        let slug = (project as NSString).lastPathComponent
+        let link = DeepLink(verb: deepVerb, projectSlug: slug, server: name, head: head)
+        struct LinkResult: Codable {
+            var url: String
+        }
+        let url = link.urlString()
+        CLIRunner.emit(LinkResult(url: url), json: global.json) { $0.url }
+    }
+}
+
+/** Smoke/CI entry: run a `devctl://` URL through DeepLinkRunner without Launch
+    Services or the menu bar app. Hidden from `--help`. */
+struct XURL: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "x-url",
+        abstract: "Dispatch a devctl:// URL via the daemon (smoke / agents).",
+        shouldDisplay: false)
+
+    @Argument(help: "A devctl:// URL.")
+    var url: String
+
+    @OptionGroup var global: GlobalOptions
+
+    func run() async throws {
+        let link: DeepLink
+        switch DeepLink.parse(url) {
+        case .failure(let error):
+            CLIRunner.fail(error, json: global.json)
+        case .success(let parsed):
+            link = parsed
+        }
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await DeepLinkRunner(client: client, effects: CLIDeepLinkEffects()).run(link)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            var line = "\(r.verb.rawValue) \(r.projectPath)"
+            if let detail = r.detail { line += ": \(detail)" }
+            return line
+        }
+    }
+}
+
+/** CLI-side effects for x-url: open(1), pbcopy, stderr notify (no AppKit). */
+struct CLIDeepLinkEffects: DeepLinkEffects {
+    func copyToPasteboard(_ text: String) async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pbcopy")
+        let pipe = Pipe()
+        process.standardInput = pipe
+        try? process.run()
+        pipe.fileHandleForWriting.write(Data(text.utf8))
+        try? pipe.fileHandleForWriting.close()
+        process.waitUntilExit()
+    }
+
+    func notify(title: String, body: String) async {
+        FileHandle.standardError.write(Data("devctl: \(title): \(body)\n".utf8))
+    }
+
+    func openBrowser(_ url: URL) async {
+        _ = LaunchdAdmin.shell("/usr/bin/open", [url.absoluteString])
+    }
+}
+
 struct ConfigCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "config",
@@ -1044,13 +1150,16 @@ struct DaemonInstall: AsyncParsableCommand {
                     message: "cannot find a devctld binary next to devctl"),
                 json: global.json)
         }
+        let restored: [(project: String, name: String)]
         do {
-            try await LaunchdAdmin.install(daemonBinary: binary, paths: DevCtlPaths())
+            restored = try await LaunchdAdmin.install(daemonBinary: binary, paths: DevCtlPaths())
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            "devctld installed and running (\(LaunchdAdmin.label))"
+            restored.isEmpty
+                ? "devctld installed and running (\(LaunchdAdmin.label))"
+                : "devctld installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
         }
     }
 }

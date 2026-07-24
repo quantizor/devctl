@@ -267,11 +267,18 @@ final class DaemonModel {
             content.title = "\(event.server) \(event.kind.rawValue)"
             content.body = event.detail.map { "\($0) · \((event.project as NSString).lastPathComponent)" }
                 ?? (event.project as NSString).lastPathComponent
+            content.categoryIdentifier = AppDeepLinkDispatch.serverAlertCategory
+            content.userInfo = [
+                AppDeepLinkDispatch.userInfoProject: event.project,
+                AppDeepLinkDispatch.userInfoServer: event.server,
+            ]
+            content.sound = .default
             let request = UNNotificationRequest(
                 identifier: "devctl-\(event.server)-\(event.at.timeIntervalSince1970)",
                 content: content,
                 trigger: nil)
             try? await UNUserNotificationCenter.current().add(request)
+            DevCtlLog.app.info("notified \(event.kind.rawValue) \(event.server)")
         }
     }
 }
