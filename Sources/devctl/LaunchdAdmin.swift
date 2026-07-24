@@ -14,7 +14,7 @@ enum LaunchdAdmin {
 
     /** The devctld binary that ships alongside this devctl binary. */
     static func bundledDaemonBinary() -> URL? {
-        let selfPath = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        let selfPath = URL(fileURLWithPath: CLISelf.path)
         let sibling = selfPath.deletingLastPathComponent().appending(path: "devctld")
         return FileManager.default.isExecutableFile(atPath: sibling.path) ? sibling : nil
     }

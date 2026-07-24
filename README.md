@@ -19,7 +19,8 @@ cd your-project
 devctl register --name web --cmd bun --cmd run --cmd dev --port 3000
 devctl ensure web     # idempotent: healthy is a no-op
 devctl why web        # root cause when something breaks
-devctl hook install   # Claude Code sessions rediscover servers automatically
+devctl hook install --harness cursor   # Cursor Agent sessions rediscover servers automatically
+devctl hook install --harness claude   # same for Claude Code (default harness)
 ```
 
 Or commit a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. The full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).

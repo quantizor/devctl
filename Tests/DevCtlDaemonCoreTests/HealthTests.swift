@@ -71,10 +71,14 @@ private func pollPhase(
     }
 
     @Test func unhealthyAfterThresholdAndRecovery() async throws {
+        /** Pad failures past unhealthyAfter so the unhealthy phase lasts longer
+            than pollPhase's 50ms sample: a tight [true,F,F,F,true] script can
+            recover before the assertion sees .unhealthy (flake on CI). */
         let (supervisor, _, _) = try makeSupervisor(
             command: ["/bin/sh", "-c", "sleep 30"],
             healthcheck: fastTCP,
-            prober: ScriptedProber(script: ProbeScript([true, false, false, false, true])))
+            prober: ScriptedProber(
+                script: ProbeScript([true] + Array(repeating: false, count: 12) + [true])))
         _ = await supervisor.start()
         #expect(await pollPhase(supervisor, until: .running) == .running)
         #expect(await pollPhase(supervisor, until: .unhealthy) == .unhealthy)
