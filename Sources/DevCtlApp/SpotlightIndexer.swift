@@ -72,7 +72,7 @@ enum SpotlightIndexer {
             "\($0.identifier)#\($0.entry.title)#\($0.entry.url)#\($0.entry.icon ?? "")#\($0.entry.rankingHint)#\($0.entry.keywords.joined(separator: ","))"
         }.sorted().joined(separator: "|")
         guard signature != UserDefaults.standard.string(forKey: signatureKey) else { return }
-        if let data = try? JSONEncoder().encode(entriesByIdentifier) {
+        if let data = try? JSONCoding.encoder().encode(entriesByIdentifier) {
             UserDefaults.standard.set(data, forKey: entriesKey)
         }
         UserDefaults.standard.set(signature, forKey: signatureKey)
@@ -144,7 +144,7 @@ enum SpotlightIndexer {
 
     private static func loadEntries() -> [String: SpotlightEntry] {
         guard let data = UserDefaults.standard.data(forKey: entriesKey),
-            let map = try? JSONDecoder().decode([String: SpotlightEntry].self, from: data)
+            let map = try? JSONCoding.decoder().decode([String: SpotlightEntry].self, from: data)
         else { return [:] }
         return map
     }

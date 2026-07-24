@@ -15,11 +15,11 @@ if ! launchctl print "$SERVICE" >"$PRINT_FILE" 2>/dev/null; then
   echo "service $SERVICE not loaded; run: devctl daemon install" >&2
   exit 1
 fi
-rg -n '^\t(path|state|pid|spawn type|job state) =' "$PRINT_FILE" || true
+grep -nE $'^\t(path|state|pid|spawn type|job state) =' "$PRINT_FILE" || true
 
-SPAWN=$(rg 'spawn type =' "$PRINT_FILE" | head -1 || true)
+SPAWN=$(grep -E 'spawn type =' "$PRINT_FILE" | head -1 || true)
 echo "observed: ${SPAWN:-unknown}"
-echo "$SPAWN" | rg -qi 'interactive' || {
+echo "$SPAWN" | grep -qi 'interactive' || {
   echo "expected spawn type = interactive (4); ProcessType may be missing from the plist" >&2
   exit 1
 }
