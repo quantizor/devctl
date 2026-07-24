@@ -4,7 +4,7 @@ devctl is a personal tool first; issues and patches are welcome all the same. Re
 
 ## Releases
 
-GitHub releases are driven by [Changesets](https://github.com/changesets/changesets) (see `.changeset/README.md`). With a user-facing change, run `npm run changeset`, commit the generated file, and merge. A Version Packages PR appears on `main`; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
+GitHub releases are driven by [Changesets](https://github.com/changesets/changesets) (see `.changeset/README.md`). With a user-facing change, run `npm run changeset`, commit the generated file, and merge. Internal-only work (CI, agent docs, no-behavior refactors) never gets a changeset. A Version Packages PR appears on `main`; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
 
 ## Adding an agent-harness adapter
 
