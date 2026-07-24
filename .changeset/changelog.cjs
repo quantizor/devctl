@@ -1,6 +1,6 @@
 /** Wraps `@changesets/changelog-github`, omitting self-thanks for the
     maintainer login while still thanking other contributors. */
-const github = require("@changesets/changelog-github");
+const github = require("@changesets/changelog-github").default;
 
 const NO_THANKS = new Set(["quantizor"]);
 
