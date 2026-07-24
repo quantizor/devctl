@@ -2,6 +2,8 @@
 
 A macOS menu bar command center for local dev servers, built so coding agents never lose track of the servers they started.
 
+![devctl menu bar popover showing per-project servers, status dots, and pinned heads](./docs/images/menu-bar.png)
+
 A launchd-supervised daemon owns every server process. Sessions come and go, contexts compact, terminals close: the servers, their logs, and their crash forensics stay. A CLI designed for agents (stable `--json` everywhere) and a quiet menu bar app for you sit on top of the same unix socket.
 
 ## Why
