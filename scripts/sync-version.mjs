@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-/** Keep DevCtlVersion.version in lockstep with package.json after
-    `changeset version`. GitHub releases use package.json; the CLI/app
-    report the Swift constant. */
+/** Keep DevCtlVersion.version and package-lock.json root version in lockstep
+    with package.json after `changeset version`. GitHub releases use
+    package.json; the CLI/app report the Swift constant. */
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,8 +24,26 @@ if (after === before) {
     console.error("sync-version: DevCtlVersion.version declaration not found in Models.swift");
     process.exit(1);
   }
-  console.log(`sync-version: already at ${version}`);
-  process.exit(0);
+  console.log(`sync-version: Models.swift already at ${version}`);
+} else {
+  writeFileSync(swiftPath, after);
+  console.log(`sync-version: Models.swift -> ${version}`);
 }
-writeFileSync(swiftPath, after);
-console.log(`sync-version: Models.swift -> ${version}`);
+
+const lockPath = join(root, "package-lock.json");
+const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+let lockChanged = false;
+if (lock.version !== version) {
+  lock.version = version;
+  lockChanged = true;
+}
+if (lock.packages?.[""] && lock.packages[""].version !== version) {
+  lock.packages[""].version = version;
+  lockChanged = true;
+}
+if (lockChanged) {
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+  console.log(`sync-version: package-lock.json -> ${version}`);
+} else {
+  console.log(`sync-version: package-lock.json already at ${version}`);
+}
