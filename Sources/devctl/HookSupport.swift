@@ -8,16 +8,40 @@ import Foundation
     project directory). */
 enum CLISelf {
     static var path: String {
-        var size = UInt32(PATH_MAX)
-        var buf = [CChar](repeating: 0, count: Int(size))
-        if _NSGetExecutablePath(&buf, &size) != 0 {
-            buf = [CChar](repeating: 0, count: Int(size))
-            _ = _NSGetExecutablePath(&buf, &size)
+        if let raw = dyldExecutablePath() {
+            return URL(fileURLWithPath: raw).resolvingSymlinksInPath().path
         }
+        return fallbackPath()
+    }
+
+    /** Standard 2-call `_NSGetExecutablePath`: query size, then fill. */
+    private static func dyldExecutablePath() -> String? {
+        var size: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &size)
+        guard size > 1 else { return nil }
+        var buf = [CChar](repeating: 0, count: Int(size))
+        guard _NSGetExecutablePath(&buf, &size) == 0 else { return nil }
         let end = buf.firstIndex(of: 0) ?? buf.endIndex
         let bytes = buf[..<end].map { UInt8(bitPattern: $0) }
         let raw = String(decoding: bytes, as: UTF8.self)
-        return URL(fileURLWithPath: raw).resolvingSymlinksInPath().path
+        return raw.isEmpty ? nil : raw
+    }
+
+    /** Last resort when dyld refuses: absolute arg0, else first PATH hit. */
+    private static func fallbackPath() -> String {
+        let arg0 = CommandLine.arguments[0]
+        if arg0.hasPrefix("/") {
+            return URL(fileURLWithPath: arg0).resolvingSymlinksInPath().path
+        }
+        let name = URL(fileURLWithPath: arg0).lastPathComponent
+        let pathEnv = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        for dir in pathEnv.split(separator: ":") where !dir.isEmpty {
+            let candidate = URL(fileURLWithPath: String(dir)).appending(path: name)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate.resolvingSymlinksInPath().path
+            }
+        }
+        return URL(fileURLWithPath: arg0).resolvingSymlinksInPath().path
     }
 }
 
