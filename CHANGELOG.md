@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+
+
+- [#8](https://github.com/quantizor/devctl/pull/8) [`e503e93`](https://github.com/quantizor/devctl/commit/e503e937766af58499f2ff108da04142b28a8ff1) - Ship a DMG installer that places the app in Applications and registers the Login Items agent, keep resource locks across a daemon crash so paused servers resume, and rebind the helper after ad-hoc upgrades so the daemon returns in seconds instead of stalling on a codesign throttle.
+
 All notable changes to this project are documented here. Releases are tagged
 `vX.Y.Z` on GitHub (same scheme Changesets uses for this root package).
 
