@@ -17,6 +17,9 @@ pass() { echo "  ok: $1" }
 cleanup() {
   [[ -n "${DAEMON_PID:-}" ]] && kill -9 "$DAEMON_PID" 2>/dev/null || true
   [[ -n "${CHILD_PID:-}" ]] && kill -9 "-$CHILD_PID" 2>/dev/null || true
+  # Grandchildren escape the process group on purpose (that is what the teardown
+  # assertions exercise), so a group kill leaves them behind. Reap them by pid.
+  for stray in ${STRAY_PIDS:-}; do kill -9 "$stray" 2>/dev/null || true; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -116,6 +119,7 @@ sleep 1
 AFTER="$(wc -l < "$RAW_SPOOL")"
 [[ "$AFTER" -gt "$BEFORE" ]] || fail "raw spool stopped growing after daemon death"
 pass "child survived daemon kill and kept logging ($BEFORE -> $AFTER raw lines)"
+STRAY_PIDS="${STRAY_PIDS:-} $(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')"
 kill -9 "-$CHILD_PID" 2>/dev/null || true
 CHILD_PID=""
 
@@ -195,12 +199,33 @@ set -e
 echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelope: $BAD_OUT"
 pass "x-url rejects unknown slug"
 
-# Bundle advertises the custom URL scheme.
-swift build --package-path "$ROOT" --product DevCtlApp > /dev/null
+# Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
 "$ROOT/scripts/make-app-bundle.sh" - debug
 SCHEME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$ROOT/devctl.app/Contents/Info.plist")"
 [[ "$SCHEME" == "devctl" ]] || fail "assembled Info.plist scheme was '$SCHEME'"
 pass "assembled app declares CFBundleURLSchemes=devctl"
+ICON="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$ROOT/devctl.app/Contents/Info.plist")"
+[[ "$ICON" == "AppIcon" ]] || fail "assembled Info.plist CFBundleIconFile was '$ICON'"
+[[ -f "$ROOT/devctl.app/Contents/Resources/AppIcon.icns" ]] || fail "bundle missing Resources/AppIcon.icns"
+pass "assembled app ships AppIcon.icns"
+DISPLAY="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$ROOT/devctl.app/Contents/Info.plist")"
+[[ "$DISPLAY" == "quantizor/devctl" ]] || fail "assembled Info.plist CFBundleDisplayName was '$DISPLAY'"
+pass "assembled app display name is quantizor/devctl"
+ROLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleTypeRole' "$ROOT/devctl.app/Contents/Info.plist")"
+[[ "$ROLE" == "Editor" ]] || fail "assembled Info.plist CFBundleTypeRole was '$ROLE'"
+pass "assembled app URL type role is Editor"
+[[ -x "$ROOT/devctl.app/Contents/Resources/devctl" ]] || fail "bundle missing Resources/devctl"
+[[ -x "$ROOT/devctl.app/Contents/Resources/devctld" ]] || fail "bundle missing Resources/devctld"
+pass "assembled app ships CLI and daemon in Resources"
+[[ -x "$ROOT/devctl.app/Contents/Helpers/devctld" ]] || fail "bundle missing Helpers/devctld"
+AGENT_PLIST="$ROOT/devctl.app/Contents/Library/LaunchAgents/dev.quantizor.devctl.plist"
+[[ -f "$AGENT_PLIST" ]] || fail "bundle missing Library/LaunchAgents/dev.quantizor.devctl.plist"
+BUNDLE_PROG="$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$AGENT_PLIST")"
+[[ "$BUNDLE_PROG" == "Contents/Helpers/devctld" ]] || fail "BundleProgram was '$BUNDLE_PROG'"
+# launchd caps ExitTimeOut at 60 and logs a complaint above it.
+AGENT_EXIT_TIMEOUT="$(/usr/libexec/PlistBuddy -c 'Print :ExitTimeOut' "$AGENT_PLIST")"
+[[ "$AGENT_EXIT_TIMEOUT" -le 60 ]] || fail "ExitTimeOut was '$AGENT_EXIT_TIMEOUT'; launchd caps it at 60"
+pass "assembled app ships Helpers/devctld + in-bundle LaunchAgent"
 
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""

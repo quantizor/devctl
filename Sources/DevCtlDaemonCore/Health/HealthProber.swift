@@ -47,6 +47,16 @@ public protocol HealthProber: Sendable {
 }
 
 public struct NetworkHealthProber: HealthProber {
+    /** Dedicated ephemeral session so probes do not share URLSession.shared
+        caches or the default 60s resource timeout. */
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 5
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config, delegate: RedirectStopper.shared, delegateQueue: nil)
+    }()
+
     public init() {}
 
     public func probe(_ check: EffectiveHealthcheck) async -> Bool {
@@ -97,8 +107,7 @@ public struct NetworkHealthProber: HealthProber {
         following it would re-enter hostname resolution the loopback rewrite
         just avoided, so redirects never get followed. */
     private static func httpResponds(_ request: URLRequest) async throws -> Bool {
-        let (_, response) = try await URLSession.shared.data(
-            for: request, delegate: RedirectStopper.shared)
+        let (_, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { return false }
         return (200..<400).contains(http.statusCode)
     }

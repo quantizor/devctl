@@ -14,6 +14,12 @@ enum CLISelf {
         return fallbackPath()
     }
 
+    /** The devctld that shipped alongside this devctl; the preferred install
+        source because it is version-matched to this binary. */
+    static var daemonSibling: URL {
+        URL(fileURLWithPath: path).deletingLastPathComponent().appending(path: "devctld")
+    }
+
     /** Standard 2-call `_NSGetExecutablePath`: query size, then fill. */
     private static func dyldExecutablePath() -> String? {
         var size: UInt32 = 0

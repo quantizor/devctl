@@ -1,5 +1,8 @@
 #!/bin/zsh
 # launchd smoke: exercises the REAL LaunchAgent lifecycle on this machine.
+# Uses the legacy home LaunchAgent path (--legacy) so it stays deterministic
+# when /Applications/devctl.app is also present. For SMAppService, install from
+# the app / Login Items on a GUI session separately.
 # install → daemon status → server ensure → restart (bounce + re-ensure) →
 # install-upgrade (bounce + re-ensure) → deliberate stop honored by
 # auto-bootstrap → start → uninstall.
@@ -12,6 +15,7 @@ WORK="$(mktemp -d /tmp/devctl-launchd-smoke.XXXXXX)"
 PROJECT="$WORK/project"
 mkdir -p "$PROJECT"
 DEVCTL="$BIN/devctl"
+LABEL="dev.quantizor.devctl"
 
 fail() { echo "LAUNCHD-SMOKE FAIL: $1" >&2; cleanup; exit 1 }
 pass() { echo "  ok: $1" }
@@ -25,12 +29,15 @@ trap cleanup EXIT
 echo "building..."
 swift build --package-path "$ROOT" > /dev/null
 
-if [[ -f "$HOME/Library/LaunchAgents/dev.quantizor.devctl.plist" ]]; then
-  fail "a devctl LaunchAgent is already installed; refusing to clobber it"
+if [[ -f "$HOME/Library/LaunchAgents/${LABEL}.plist" ]]; then
+  fail "a legacy home LaunchAgent is already installed; refusing to clobber it"
+fi
+if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
+  fail "a ${LABEL} job is already bootstrapped; refusing to clobber it"
 fi
 
-"$DEVCTL" daemon install > /dev/null || fail "daemon install"
-pass "daemon install + hello"
+"$DEVCTL" daemon install --legacy > /dev/null || fail "daemon install --legacy"
+pass "daemon install + hello (legacy home LaunchAgent)"
 
 "$DEVCTL" daemon status | grep -q "pid" || fail "daemon status shows no pid"
 pass "daemon status"
@@ -51,7 +58,7 @@ pass "restart bounced and re-ensured (pid $PID_BEFORE -> $PID_AFTER)"
 # Upgrade-in-place: install again while the server is up must re-ensure it,
 # same contract as restart (this is what `make install` hits).
 PID_PRE_UPGRADE="$PID_AFTER"
-"$DEVCTL" daemon install > /dev/null || fail "daemon install upgrade"
+"$DEVCTL" daemon install --legacy > /dev/null || fail "daemon install upgrade"
 PHASE="$("$DEVCTL" wait web --healthy --timeout 20 --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["phase"])')"
 [[ "$PHASE" == "running" ]] || fail "server did not come back after install upgrade (phase $PHASE)"
 PID_POST_UPGRADE="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
@@ -68,20 +75,20 @@ set -e
 echo "$STATUS_OUT" | grep -q "deliberately stopped" || fail "missing deliberate-stop hint: $STATUS_OUT"
 pass "deliberate stop honored by auto-bootstrap"
 
-"$DEVCTL" daemon start > /dev/null || fail "daemon start"
+"$DEVCTL" daemon start --legacy > /dev/null || fail "daemon start"
 "$DEVCTL" daemon status | grep -q "pid" || fail "daemon not back after start"
 pass "daemon start"
 
 # Auto-bootstrap: stop via bootout (simulating a dead daemon with no intent),
 # then a plain status must resurrect it.
-launchctl bootout "gui/$(id -u)/dev.quantizor.devctl" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 sleep 1
 "$DEVCTL" status --json > /dev/null || fail "auto-bootstrap did not resurrect the daemon"
 "$DEVCTL" daemon status | grep -q "pid" || fail "daemon not resurrected"
 pass "auto-bootstrap resurrects a dead daemon"
 
 "$DEVCTL" daemon uninstall > /dev/null
-[[ ! -f "$HOME/Library/LaunchAgents/dev.quantizor.devctl.plist" ]] || fail "plist survived uninstall"
+[[ ! -f "$HOME/Library/LaunchAgents/${LABEL}.plist" ]] || fail "plist survived uninstall"
 pass "uninstall"
 
 echo "LAUNCHD-SMOKE PASS"

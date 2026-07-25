@@ -85,7 +85,22 @@ final class DaemonModel {
     /** Bumped on system theme change so the baked menu bar label re-renders. */
     var appearanceTick = 0
     var daemonReachable = false
+    /** Last failed recovery, surfaced in the popover so a dead daemon is never
+        a dead end. */
+    var daemonRecoveryError: String?
+    /** True while a bootstrap/kickstart is in flight, so the row can say so and
+        the poll does not stack attempts. */
+    var daemonRecovering = false
+    /** macOS registered the background agent but is waiting for the user to
+        switch it on. Nothing the app can retry, so the popover asks for the
+        approval instead of looping. */
+    var daemonNeedsApproval = false
+    /** `devctl daemon stop` wrote the deliberate-stop marker: the app offers
+        Start instead of resurrecting the daemon behind the user's back. */
+    var daemonStoppedOnPurpose = false
     var projects: [ProjectGroup] = []
+
+    private var lastRecoveryAttempt: Date?
 
     struct ProjectGroup: Identifiable {
         var id: String { path }
@@ -172,6 +187,18 @@ final class DaemonModel {
                 self?.appearanceTick += 1
             }
         }
+        /** Launch-time registration runs behind the same in-flight flag and
+            cooldown as recovery. Left outside them, the 2s poll sees the socket
+            still silent inside launchd's respawn throttle and fires a second
+            unregister + register on top of the first. */
+        Task { [weak self] in
+            guard let self else { return }
+            daemonRecovering = true
+            await AgentService.ensureAtLaunchIfNeeded()
+            lastRecoveryAttempt = Date()
+            daemonRecovering = false
+            await refresh()
+        }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -194,11 +221,103 @@ final class DaemonModel {
                     servers: (grouped[path] ?? []).sorted { $0.server < $1.server })
             }
             SpotlightIndexer.sync(projects: projects)
+            daemonRecoveryError = nil
+            lastRecoveryAttempt = nil
+            daemonStoppedOnPurpose = false
             await surfaceCrashNotifications(client: client)
         } catch {
             daemonReachable = false
             projects = []
+            daemonStoppedOnPurpose = LaunchdAdmin.deliberatelyStopped()
+            await recoverDaemonIfNeeded()
         }
+    }
+
+    /** Bring the daemon back on its own after a crash or a failed relaunch.
+        Skipped when the user stopped it on purpose (their intent wins) and
+        rate-limited so a permanently broken install does not spin. */
+    private func recoverDaemonIfNeeded() async {
+        let decision = DaemonRecoveryPolicy.decide(
+            reachable: daemonReachable,
+            stoppedOnPurpose: daemonStoppedOnPurpose,
+            recovering: daemonRecovering,
+            lastAttempt: lastRecoveryAttempt)
+        guard decision == .recover else { return }
+        lastRecoveryAttempt = Date()
+        daemonRecovering = true
+        let recovered = await recoverAgent()
+        daemonRecovering = false
+        if recovered {
+            daemonRecoveryError = nil
+            await refresh()
+        } else if daemonNeedsApproval {
+            daemonRecoveryError = AgentService.Failure.needsApproval.localizedDescription
+        } else {
+            daemonRecoveryError = "could not start devctld automatically"
+        }
+    }
+
+    /** Prefer SMAppService inside this app process; fall back to the legacy home
+        LaunchAgent only when this bundle cannot host an agent. Falling back while
+        approval is pending would write back the very `~/Library/LaunchAgents`
+        job the migration removed, and Login Items would name it `devctld` again. */
+    private func recoverAgent() async -> Bool {
+        if AgentService.bundleHasAgentPlist {
+            do {
+                try await AgentService.ensureRunning()
+                daemonNeedsApproval = false
+                return true
+            } catch AgentService.Failure.needsApproval {
+                daemonNeedsApproval = true
+                DevCtlLog.app.error("agent awaiting approval in Login Items")
+                return false
+            } catch {
+                DevCtlLog.app.error("SMAppService recover failed: \(error.localizedDescription)")
+                return false
+            }
+        }
+        return await LaunchdAdmin.attemptBootstrap(
+            extraDaemonCandidates: Self.bundledDaemonCandidates(), forceLegacy: true)
+    }
+
+    /** Explicit Start from the popover: clears a deliberate-stop marker, so it
+        also works when auto recovery is intentionally standing down. */
+    func startDaemon() {
+        guard !daemonRecovering else { return }
+        Task {
+            daemonRecovering = true
+            daemonRecoveryError = nil
+            do {
+                if AgentService.bundleHasAgentPlist {
+                    try await AgentService.ensureRunning()
+                } else {
+                    try await LaunchdAdmin.startOrInstall(
+                        extraDaemonCandidates: Self.bundledDaemonCandidates(),
+                        forceLegacy: true)
+                }
+                daemonNeedsApproval = false
+                daemonStoppedOnPurpose = false
+            } catch AgentService.Failure.needsApproval {
+                daemonNeedsApproval = true
+                daemonRecoveryError = AgentService.Failure.needsApproval.localizedDescription
+            } catch let error as WireError {
+                daemonRecoveryError = error.message
+            } catch {
+                daemonRecoveryError = error.localizedDescription
+            }
+            daemonRecovering = false
+            await refresh()
+        }
+    }
+
+    /** The version-matched devctld inside this app bundle's Resources, which is
+        the right install source when no LaunchAgent exists yet. */
+    private static func bundledDaemonCandidates() -> [URL] {
+        guard
+            let url = Bundle.main.url(
+                forResource: SetupPlanner.resourceDaemonName, withExtension: nil)
+        else { return [] }
+        return [url]
     }
 
     func startServer(_ server: ServerStatus) {

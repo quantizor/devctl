@@ -198,7 +198,12 @@ public actor ServerSupervisor {
         stopRequested = true
         stopWasDeliberate = deliberate
         phase = .stopping
-        let snapshot = ProcessTree.descendants(of: target)
+        let snapshotResult = ProcessTree.descendants(of: target)
+        if case .failed(let code) = snapshotResult {
+            DevCtlLog.supervisor.error(
+                "descendant sweep failed before SIGTERM (errno \(code)); group-only teardown")
+        }
+        let snapshot = snapshotResult.identities
         ProcessTree.signalTree(rootPid: target, descendants: snapshot, signal: SIGTERM)
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
         while ContinuousClock.now < deadline {
@@ -208,13 +213,21 @@ public actor ServerSupervisor {
         }
         /** Escalate: the pre-signal snapshot plus a fresh sweep (new children may
             have appeared during the grace window while the parent lived). */
-        let escalation = Set(snapshot).union(ProcessTree.descendants(of: target))
+        let fresh = ProcessTree.descendants(of: target)
+        if case .failed(let code) = fresh {
+            DevCtlLog.supervisor.error(
+                "descendant sweep failed before SIGKILL (errno \(code)); using pre-signal snapshot")
+        }
+        var byPid: [pid_t: ProcessIdentity] = [:]
+        for identity in snapshot + fresh.identities {
+            byPid[identity.pid] = identity
+        }
+        let escalation = Array(byPid.values)
         if kill(target, 0) == 0 {
-            ProcessTree.signalTree(rootPid: target, descendants: Array(escalation), signal: SIGKILL)
+            ProcessTree.signalTree(
+                rootPid: target, descendants: escalation, signal: SIGKILL, revalidate: true)
         } else {
-            for pid in escalation where kill(pid, 0) == 0 {
-                kill(pid, SIGKILL)
-            }
+            ProcessTree.escalateIndividuals(escalation)
         }
         await waitForRunTaskCompletion()
         return status()
@@ -317,7 +330,7 @@ public actor ServerSupervisor {
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
         Task { [weak self] in
-            let pids = [rootPid] + ProcessTree.descendants(of: rootPid)
+            let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = PortGuard.listeningPorts(pids: pids)
             await self?.recordObservedPort(ports: ports)
         }

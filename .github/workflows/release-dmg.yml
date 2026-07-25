@@ -1,0 +1,110 @@
+# Notarized DMG artifact for GitHub Releases.
+# Triggered when the Ubuntu Changesets job publishes a release (tag vX.Y.Z).
+# Requires repository secrets:
+#   APPLE_DEVELOPER_ID_P12_BASE64, APPLE_DEVELOPER_ID_P12_PASSWORD
+#   APPLE_SIGN_IDENTITY (e.g. "Developer ID Application: Name (TEAMID)")
+#   APPLE_API_KEY_BASE64, APPLE_API_KEY_ID, APPLE_API_ISSUER
+name: Release DMG
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.2.0); defaults to latest release tag"
+        required: false
+
+concurrency:
+  group: release-dmg-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    name: Build and notarize DMG
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            spm-release-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Import Developer ID certificate
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${P12_BASE64:-}" || -z "${P12_PASSWORD:-}" ]]; then
+            echo "Missing APPLE_DEVELOPER_ID_P12_BASE64 or APPLE_DEVELOPER_ID_P12_PASSWORD" >&2
+            exit 1
+          fi
+          # RUNNER_TEMP is job-private; mktemp only randomizes trailing Xs, so
+          # a ".XXXXXX.p12" template would be a fixed path.
+          CERT_PATH="$(mktemp "$RUNNER_TEMP/devctl-cert.XXXXXX")"
+          KEYCHAIN_PATH="$RUNNER_TEMP/devctl-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "$P12_BASE64" | base64 -D > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build signed DMG
+        env:
+          # A released image must carry the double-click instructions, so a
+          # runner that cannot drive Finder fails here instead of shipping a
+          # bare icon view.
+          DEVCTL_DMG_REQUIRE_LAYOUT: "1"
+          SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          : "${SIGN_IDENTITY:?set APPLE_SIGN_IDENTITY secret}"
+          make dmg
+
+      - name: Notarize and staple
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: scripts/notarize.sh
+
+      - name: Upload DMG to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          DMG="$(ls -t dist/devctl-*.dmg | head -1)"
+          if [[ -z "${TAG:-}" ]]; then
+            TAG="$(git describe --tags --abbrev=0)"
+          fi
+          gh release upload "$TAG" "$DMG" --clobber
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

@@ -13,6 +13,14 @@ devctl is a personal tool first; issues and patches are welcome all the same. Re
 
 GitHub releases are driven by [Changesets](https://github.com/changesets/changesets). After changesets land on `main`, a Version Packages PR appears; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
 
+A separate macOS workflow (`.github/workflows/release-dmg.yml`) builds a Developer ID-signed, notarized DMG and attaches it to that release. Required repository secrets:
+
+- `APPLE_DEVELOPER_ID_P12_BASE64` / `APPLE_DEVELOPER_ID_P12_PASSWORD`: exported Developer ID Application certificate
+- `APPLE_SIGN_IDENTITY`: exact codesign identity string (for example `Developer ID Application: Name (TEAMID)`)
+- `APPLE_API_KEY_BASE64` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`: App Store Connect API key for `notarytool`
+
+Local path: `SIGN_IDENTITY="Developer ID Application: …" make dmg` then `scripts/notarize.sh`. The first DMG for an already-published tag (for example attaching to `v1.2.0`) is uploaded only after local dogfood and maintainer sign-off.
+
 ## Adding an agent-harness adapter
 
 The session-context payload is harness-agnostic: `devctl context` prints a fenced plain-text block describing the current project's servers, and `devctl statusline` prints a one-line presence summary from statusline stdin JSON. Wiring those into a harness is the only per-harness work.

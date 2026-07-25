@@ -22,6 +22,34 @@ public enum SpotlightLabel {
         "devctl · \(url)"
     }
 
+    /** Alternate titles Spotlight can match against without stuffing keywords.
+        Host leaf and head name are the tokens people type after the project. */
+    public static func alternateNames(project: String, server: String, head: String?, url: String)
+        -> [String]
+    {
+        var names: Set<String> = [project, server]
+        if let head { names.insert(head) }
+        if let host = URL(string: url)?.host {
+            let leaf = host.split(separator: ".").first.map(String.init)
+            if let leaf, !leaf.isEmpty, leaf != "localhost" {
+                names.insert(leaf)
+            }
+        }
+        names.remove(title(project: project, server: server, head: head))
+        return names.sorted()
+    }
+
+    /** Relative importance among our own indexed items (0…100). Live and pinned
+        surfaces win within the app; this cannot outrank filesystem Top Hits. */
+    public static func rankingHint(phase: ServerPhase, pinned: Bool) -> Int {
+        if pinned { return 100 }
+        switch phase {
+        case .running, .unhealthy: return 100
+        case .starting, .stopping: return 95
+        case .crashed, .failed, .stopped: return 90
+        }
+    }
+
     /** Keyword tokens: project, server, head, distinctive host/path parts, plus
         the standing "devctl" / "dev server" anchors so a typed "devctl candor"
         still lands. */

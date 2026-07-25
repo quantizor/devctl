@@ -140,14 +140,7 @@ enum CLIRunner {
         never past a deliberate-stop marker, install-if-missing when the devctld
         binary ships alongside this CLI. */
     static func attemptBootstrap() async -> Bool {
-        guard ProcessInfo.processInfo.environment["DEVCTL_SOCKET"] == nil else { return false }
-        let paths = DevCtlPaths()
-        guard !FileManager.default.fileExists(atPath: paths.stoppedIntentFile.path) else { return false }
-        if FileManager.default.fileExists(atPath: LaunchdAdmin.plistURL.path) {
-            return (try? await LaunchdAdmin.start(paths: paths)) != nil
-        }
-        guard let binary = LaunchdAdmin.bundledDaemonBinary() else { return false }
-        return (try? await LaunchdAdmin.install(daemonBinary: binary, paths: paths)) != nil
+        await LaunchdAdmin.attemptBootstrap(extraDaemonCandidates: [CLISelf.daemonSibling])
     }
 
     static func describe(_ status: ServerStatus) -> String {
@@ -1019,10 +1012,17 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: "daemon", severity: "ok"))
             let livePath = LaunchdAdmin.capturedPath()
+            let storedPath = LaunchdAdmin.readAgentPath()
             if let daemonPath = info.searchPath, daemonPath != livePath {
                 findings.append(
                     Finding(
                         detail: "daemon PATH differs from the current login shell (captured at install; run: devctl daemon install)",
+                        kind: "path-staleness", severity: "warning"))
+            }
+            if let storedPath, storedPath != livePath {
+                findings.append(
+                    Finding(
+                        detail: "agent.path differs from the current login shell (run: devctl daemon install)",
                         kind: "path-staleness", severity: "warning"))
             }
         } else {
@@ -1138,10 +1138,17 @@ struct DaemonInstall: AsyncParsableCommand {
     @Option(help: "Path to the devctld binary; defaults to the one alongside this devctl.")
     var devctld: String?
 
+    @Flag(
+        help:
+            "Force the home LaunchAgent path even when /Applications/devctl.app is present (CLI-only / smoke)."
+    )
+    var legacy = false
+
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
-        let binary = devctld.map { URL(fileURLWithPath: $0) } ?? LaunchdAdmin.bundledDaemonBinary()
+        let binary = devctld.map { URL(fileURLWithPath: $0) }
+            ?? LaunchdAdmin.resolveDaemonBinary(extraCandidates: [CLISelf.daemonSibling])
         guard let binary else {
             CLIRunner.fail(
                 WireError(
@@ -1152,14 +1159,20 @@ struct DaemonInstall: AsyncParsableCommand {
         }
         let restored: [(project: String, name: String)]
         do {
-            restored = try await LaunchdAdmin.install(daemonBinary: binary, paths: DevCtlPaths())
+            restored = try await LaunchdAdmin.install(
+                daemonBinary: binary, paths: DevCtlPaths(), forceLegacy: legacy)
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
+        let viaApp = !legacy && LaunchdAdmin.applicationsAppPresent()
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            restored.isEmpty
-                ? "devctld installed and running (\(LaunchdAdmin.label))"
-                : "devctld installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
+            if restored.isEmpty {
+                viaApp
+                    ? "devctld ensured via \(SetupPlanner.applicationsAppPath) (Login Items)"
+                    : "devctld installed and running (\(LaunchdAdmin.label))"
+            } else {
+                "devctld installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
+            }
         }
     }
 }
@@ -1185,11 +1198,20 @@ struct DaemonStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "start", abstract: "Start a stopped daemon (clears the deliberate-stop marker).")
 
+    @Flag(
+        help:
+            "Force the home LaunchAgent path even when /Applications/devctl.app is present."
+    )
+    var legacy = false
+
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
         do {
-            try await LaunchdAdmin.start(paths: DevCtlPaths())
+            try await LaunchdAdmin.startOrInstall(
+                paths: DevCtlPaths(),
+                extraDaemonCandidates: [CLISelf.daemonSibling],
+                forceLegacy: legacy)
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
@@ -1386,11 +1408,11 @@ struct Switch: AsyncParsableCommand {
     }
 }
 
-/** Runs a command while holding a named resource exclusively: managed servers
-    declaring the resource in their `locks` are stopped first and re-ensured
-    after, and their starts are refused for the duration, so a test harness's
-    private server never contends with the managed one over shared mutable
-    state (a local database, a fixture tree). */
+/** Runs a command while holding a named resource exclusively. The daemon
+    pauses managed servers that declare the resource, refuses their starts for
+    the duration, and resumes them on release (or on recover when this process
+    dies), so a test harness's private server never contends with the managed
+    one over shared mutable state (a local database, a fixture tree). */
 struct Lock: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Run a command holding a project resource; conflicting servers pause and return.")
@@ -1421,52 +1443,32 @@ struct Lock: AsyncParsableCommand {
         let project = global.resolvedProject()
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
-        /** Which managed holders are up now decides what comes back after. */
-        let statuses = (try? await client.request(
-            .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self))?
-            .servers ?? []
-        let merged = statuses.filter { status in
-            status.phase == .running || status.phase == .starting || status.phase == .unhealthy
-        }
-        var toRestore: [String] = []
-        /** Acquire with patience: another harness may hold it. */
+        /** Acquire with patience: another harness may hold it. The daemon owns
+            pause/resume of declaring servers; this CLI just runs the command. */
         let deadline = Date().addingTimeInterval(acquireTimeout)
-        var acquired = false
+        var acquired: LockResult?
         var lastError: WireError?
         while Date() < deadline {
             do {
-                _ = try await client.request(
+                acquired = try await client.request(
                     .lockAcquire,
-                    params: LockParams(holderPid: holderPid, project: project, resource: resource),
-                    expecting: WireEmpty.self)
-                acquired = true
+                    params: LockParams(
+                        holderPid: holderPid, project: project, resource: resource,
+                        resumeTimeoutSeconds: timeout),
+                    expecting: LockResult.self)
                 break
             } catch let error as WireError where error.code == .resourceLocked {
                 lastError = error
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        guard acquired else {
+        guard let acquired else {
             CLIRunner.fail(
                 lastError ?? WireError(code: .resourceLocked, message: "could not acquire '\(resource)'"),
                 json: global.json)
         }
-        /** Stop the managed holders of this resource (recorded for the return
-            trip). The daemon knows which specs declare it via config; the CLI
-            asks per-server status and stops the ones whose spec declares the
-            resource: simplest source is the config itself. */
-        if let view = try? ProjectConfigLoader.load(project: project) {
-            for spec in view.specs where (spec.locks ?? []).contains(resource) {
-                let wasActive = merged.contains { $0.server == spec.name }
-                if wasActive {
-                    toRestore.append(spec.name)
-                    _ = try? await client.request(
-                        .serverStop,
-                        params: ServerTargetParams(name: spec.name, project: project),
-                        expecting: ServerResult.self)
-                    print("paused \(spec.name) (holds \(resource))")
-                }
-            }
+        for name in acquired.paused {
+            print("paused \(name) (holds \(resource))")
         }
         /** Run the guarded command with inherited stdio. */
         let process = Process()
@@ -1481,18 +1483,15 @@ struct Lock: AsyncParsableCommand {
         } catch {
             FileHandle.standardError.write(Data("devctl lock: cannot run command: \(error)\n".utf8))
         }
-        /** Release, then bring the paused servers back even if the command
-            failed: the checkpointed world returns either way. */
-        _ = try? await client.request(
+        /** Release resumes whoever was paused, even if the command failed. */
+        let released = (try? await client.request(
             .lockRelease,
-            params: LockParams(holderPid: holderPid, project: project, resource: resource),
-            expecting: WireEmpty.self)
-        for name in toRestore {
+            params: LockParams(
+                holderPid: holderPid, project: project, resource: resource,
+                resumeTimeoutSeconds: timeout),
+            expecting: LockResult.self)) ?? LockResult()
+        for name in released.paused {
             print("resuming \(name)…")
-            _ = try? await client.request(
-                .serverEnsure,
-                params: EnsureParams(name: name, project: project, timeoutSeconds: timeout),
-                expecting: EnsureResult.self)
         }
         Foundation.exit(commandStatus)
     }

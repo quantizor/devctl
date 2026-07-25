@@ -283,21 +283,54 @@ public struct LockParams: Codable, Equatable, Sendable {
     public var holderPid: Int
     public var project: String
     public var resource: String
+    /** Per-server health wait used when this hold ends (release or orphan
+        cleanup). Optional so older clients keep decoding. */
+    public var resumeTimeoutSeconds: Double?
 
-    public init(holderPid: Int, project: String, resource: String) {
+    public init(
+        holderPid: Int, project: String, resource: String, resumeTimeoutSeconds: Double? = nil
+    ) {
         self.holderPid = holderPid
         self.project = project
         self.resource = resource
+        self.resumeTimeoutSeconds = resumeTimeoutSeconds
     }
 }
 
+/** In-memory and on-disk lock record. `paused` is who the daemon stopped for
+    this hold so a crash mid-lock can resume them when the holder is gone. */
 public struct LockHolder: Codable, Equatable, Sendable {
+    public var paused: [String]
     public var pid: Int
+    public var resumeTimeoutSeconds: Double?
     public var since: Date
 
-    public init(pid: Int, since: Date) {
+    public init(
+        paused: [String] = [], pid: Int, resumeTimeoutSeconds: Double? = nil, since: Date
+    ) {
+        self.paused = paused
         self.pid = pid
+        self.resumeTimeoutSeconds = resumeTimeoutSeconds
         self.since = since
+    }
+}
+
+/** Result of lock.acquire / lock.release: which servers were paused or resumed. */
+public struct LockResult: Codable, Equatable, Sendable {
+    public var paused: [String]
+
+    public init(paused: [String] = []) {
+        self.paused = paused
+    }
+}
+
+/** Persisted resource locks (`locks.json`). Optional on load so a missing or
+    pre-feature file is just empty. */
+public struct LocksFile: Codable, Sendable {
+    public var locks: [String: LockHolder]
+
+    public init(locks: [String: LockHolder] = [:]) {
+        self.locks = locks
     }
 }
 

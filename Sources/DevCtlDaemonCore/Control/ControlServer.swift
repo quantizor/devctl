@@ -12,8 +12,9 @@ public actor Router {
     private var supervisors: [String: ServerSupervisor] = [:]
     /** devservers.json views cached by mtime; a save invalidates naturally. */
     private var configCache: [String: (mtime: Date, view: ProjectConfigView)] = [:]
-    /** Held resource locks keyed `project::resource`; stale holders (dead pids)
-        evaporate on access, so a crashed harness never wedges a resource. */
+    /** Held resource locks keyed `project::resource`. Persisted to locks.json so
+        a daemon crash mid-hold can still resume the paused servers when the
+        holder is gone. Stale holders (dead pids) evaporate on access. */
     private var resourceLocks: [String: LockHolder] = [:]
 
     public init(launcher: any ProcessLauncher, paths: DevCtlPaths, registry: Registry) {
@@ -21,6 +22,8 @@ public actor Router {
         self.launcher = launcher
         self.paths = paths
         self.registry = registry
+        self.resourceLocks =
+            AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:]
     }
 
     /** Decodes the typed request for `method` and returns the encoded response
@@ -49,7 +52,7 @@ public actor Router {
                     /** Deliberate shutdown stays down: the intent marker keeps
                         auto-bootstrap from resurrecting the daemon, and exit 0
                         satisfies KeepAlive={SuccessfulExit:false}. */
-                    try? Data().write(to: await self.paths.stoppedIntentFile)
+                    try? Data().write(to: self.paths.stoppedIntentFile)
                     await self.exitDaemon()
                 }
                 return frame
@@ -67,7 +70,7 @@ public actor Router {
                 let supervisor = try await resolvedSupervisor(target)
                 await recordTrustIfNeeded(project: target.project, name: target.name, fileNames: merged.fileNames)
                 if let spec = merged.specs.first(where: { $0.name == target.name }) {
-                    try lockGate(project: target.project, spec: spec)
+                    try await lockGate(project: target.project, spec: spec)
                 }
                 try await portPreCheck(target: target, supervisor: supervisor)
                 let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
@@ -81,7 +84,7 @@ public actor Router {
                 await recordTrustIfNeeded(
                     project: request.params.project, name: request.params.name, fileNames: merged.fileNames)
                 if let spec = merged.specs.first(where: { $0.name == request.params.name }) {
-                    try lockGate(project: request.params.project, spec: spec)
+                    try await lockGate(project: request.params.project, spec: spec)
                 }
                 try await portPreCheck(target: request.params, supervisor: supervisor)
                 return try respond(id: head.id, result: ServerResult(server: await supervisor.start()))
@@ -169,22 +172,12 @@ public actor Router {
                     id: head.id, result: EnsureResult(reason: reason, server: await supervisor.status()))
             case .lockAcquire:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
-                let key = "\(request.params.project)::\(request.params.resource)"
-                if let holder = liveLockHolder(key: key), holder.pid != request.params.holderPid {
-                    throw WireError(
-                        code: .resourceLocked,
-                        hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
-                        message: "resource '\(request.params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))")
-                }
-                resourceLocks[key] = LockHolder(pid: request.params.holderPid, since: Date())
-                return try respond(id: head.id, result: WireEmpty())
+                let result = try await acquireLock(request.params)
+                return try respond(id: head.id, result: result)
             case .lockRelease:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
-                let key = "\(request.params.project)::\(request.params.resource)"
-                if resourceLocks[key]?.pid == request.params.holderPid {
-                    resourceLocks[key] = nil
-                }
-                return try respond(id: head.id, result: WireEmpty())
+                let result = try await releaseLock(request.params)
+                return try respond(id: head.id, result: result)
             case .logsQuery:
                 let request = try decoder.decode(WireRequest<LogsQueryParams>.self, from: line)
                 let target = ServerTargetParams(name: request.params.name, project: request.params.project)
@@ -296,14 +289,15 @@ public actor Router {
         }
     }
 
-    /** Startup recovery: reconcile persisted state with reality, then restore
-        boot intent. A recorded pid that is gone becomes crashed(daemon-restart);
+    /** Startup recovery: reconcile persisted locks first, then restore servers
+        with boot intent. A recorded pid that is gone becomes crashed(daemon-restart);
         a live orphan (its spool fd kept it healthy while the daemon was away) is
         group-killed, since exit forensics are unknowable for non-children. Never
         adopted silently. What comes back: any server whose start intent survives
         (resumeOnBoot), which a machine shutdown's drain leaves set, plus the
         classic daemon-crash case of a phase left running/starting. A deliberate
-        stop clears the flag, so only those stay down.
+        stop clears the flag, so only those stay down. Servers still paused under
+        a live resource lock are left alone: starting them would fight the harness.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
@@ -311,6 +305,8 @@ public actor Router {
         committed server on boot. A rename/delete with no matching spec drops the
         orphaned state row instead of retrying forever. */
     public func recoverAtStartup() async {
+        await reconcileLocksAtStartup()
+        var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
             guard let separator = id.range(of: "::") else { continue }
             let project = String(id[id.startIndex..<separator.lowerBound])
@@ -318,6 +314,11 @@ public actor Router {
             let leftActive = persisted.phase == .running || persisted.phase == .starting
             let wantsRestore = persisted.resumeOnBoot ?? false
             guard persisted.pid != nil || leftActive || wantsRestore else { continue }
+            if isPausedUnderLiveLock(project: project, name: name) {
+                DevCtlLog.daemon.info(
+                    "recover skip \(name)@\(project): paused under a live resource lock")
+                continue
+            }
             switch await resolveSpecForRecover(project: project, name: name) {
             case .missing:
                 DevCtlLog.daemon.info(
@@ -330,11 +331,22 @@ public actor Router {
                 continue
             case .found(let spec):
                 if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
-                    let descendants = ProcessTree.descendants(of: pid)
+                    let sweep = ProcessTree.descendants(of: pid)
+                    if case .failed(let code) = sweep {
+                        DevCtlLog.daemon.error(
+                            "orphan bounce descendant sweep failed (errno \(code)); group-only")
+                    }
+                    let descendants = sweep.identities
                     ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
-                    try? await Task.sleep(for: .seconds(2))
+                    /** Poll instead of a fixed 2s sleep: most orphans die on
+                        SIGTERM in well under a second. */
+                    let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+                    while ContinuousClock.now < graceDeadline, kill(pid, 0) == 0 {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
                     if kill(pid, 0) == 0 {
-                        ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGKILL)
+                        ProcessTree.signalTree(
+                            rootPid: pid, descendants: descendants, signal: SIGKILL, revalidate: true)
                     }
                     await events.post(
                         kind: .crashed, project: project, server: name,
@@ -349,9 +361,21 @@ public actor Router {
                     entry.pid = nil
                 }
                 if leftActive || wantsRestore {
-                    DevCtlLog.daemon.info("recover start \(name)@\(project)")
-                    let supervisor = await supervisor(project: project, spec: spec)
-                    _ = await supervisor.start()
+                    toStart.append((project: project, spec: spec))
+                }
+            }
+        }
+        /** Start restores in parallel: a serial loop made a multi-server boot
+            look like a slow daemon even after the socket was already up. */
+        if !toStart.isEmpty {
+            await withTaskGroup(of: Void.self) { group in
+                for item in toStart {
+                    group.addTask {
+                        DevCtlLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
+                        let supervisor = await self.supervisor(
+                            project: item.project, spec: item.spec)
+                        _ = await supervisor.start()
+                    }
                 }
             }
         }
@@ -503,25 +527,149 @@ public actor Router {
         }
     }
 
-    private func liveLockHolder(key: String) -> LockHolder? {
-        guard let holder = resourceLocks[key] else { return nil }
-        guard kill(pid_t(holder.pid), 0) == 0 else {
-            resourceLocks[key] = nil
-            return nil
+    /** Acquire: refuse if another live holder owns it, pause active declarers
+        without retiring boot intent, persist the hold, return who was paused. */
+    private func acquireLock(_ params: LockParams) async throws -> LockResult {
+        let key = "\(params.project)::\(params.resource)"
+        await releaseOrphanedLock(key: key)
+        if let holder = resourceLocks[key], holder.pid != params.holderPid {
+            throw WireError(
+                code: .resourceLocked,
+                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
+                message:
+                    "resource '\(params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+            )
         }
-        return holder
+        /** Same holder re-acquiring (retry after a blip) keeps the existing pause
+            set rather than double-stopping. */
+        if let existing = resourceLocks[key], existing.pid == params.holderPid {
+            return LockResult(paused: existing.paused)
+        }
+        var paused: [String] = []
+        let merged = try? await mergedSpecs(project: params.project)
+        for spec in merged?.specs ?? [] where (spec.locks ?? []).contains(params.resource) {
+            let supervisor = await supervisor(project: params.project, spec: spec)
+            let status = await supervisor.status()
+            switch status.phase {
+            case .running, .starting, .unhealthy, .stopping:
+                /** Non-retiring stop: boot intent survives so a daemon crash
+                    mid-hold can still bring the server back if the holder is gone. */
+                _ = await supervisor.stop(deliberate: false)
+                paused.append(spec.name)
+                DevCtlLog.daemon.info(
+                    "lock \(params.resource) paused \(spec.name)@\(params.project)")
+            case .stopped, .crashed, .failed:
+                break
+            }
+        }
+        paused.sort()
+        resourceLocks[key] = LockHolder(
+            paused: paused, pid: params.holderPid,
+            resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
+        persistLocks()
+        return LockResult(paused: paused)
+    }
+
+    /** Release: only the matching holder clears the lock; then ensure everyone
+        that was paused. */
+    private func releaseLock(_ params: LockParams) async throws -> LockResult {
+        let key = "\(params.project)::\(params.resource)"
+        guard let holder = resourceLocks[key], holder.pid == params.holderPid else {
+            return LockResult(paused: [])
+        }
+        resourceLocks[key] = nil
+        persistLocks()
+        let timeout = params.resumeTimeoutSeconds ?? holder.resumeTimeoutSeconds ?? 60
+        await resumePaused(
+            names: holder.paused, project: params.project, resource: params.resource,
+            timeoutSeconds: timeout)
+        return LockResult(paused: holder.paused)
+    }
+
+    /** Drop dead holders and resume what they paused. Called from gate/acquire
+        and at startup so a crashed harness (or a dead CLI after a daemon bounce)
+        never leaves servers stopped. */
+    private func releaseOrphanedLock(key: String) async {
+        guard let holder = resourceLocks[key] else { return }
+        guard kill(pid_t(holder.pid), 0) != 0 else { return }
+        guard let separator = key.range(of: "::") else {
+            resourceLocks[key] = nil
+            persistLocks()
+            return
+        }
+        let project = String(key[key.startIndex..<separator.lowerBound])
+        let resource = String(key[separator.upperBound...])
+        DevCtlLog.daemon.info(
+            "lock \(resource) holder pid \(holder.pid) is gone; resuming \(holder.paused.joined(separator: ","))"
+        )
+        resourceLocks[key] = nil
+        persistLocks()
+        await resumePaused(
+            names: holder.paused, project: project, resource: resource,
+            timeoutSeconds: holder.resumeTimeoutSeconds ?? 60)
+    }
+
+    private func resumePaused(
+        names: [String], project: String, resource: String, timeoutSeconds: Double
+    ) async {
+        guard !project.isEmpty else { return }
+        for name in names {
+            do {
+                let merged = try await mergedSpecs(project: project)
+                guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
+                let supervisor = await supervisor(project: project, spec: spec)
+                _ = await supervisor.ensure(timeoutSeconds: timeoutSeconds)
+                DevCtlLog.daemon.info("lock \(resource) resumed \(name)@\(project)")
+            } catch {
+                DevCtlLog.daemon.error(
+                    "lock \(resource) could not resume \(name)@\(project): \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    /** At boot: dead holders resume their paused set; live holders stay loaded
+        so lockGate still refuses starts under the harness. */
+    private func reconcileLocksAtStartup() async {
+        let keys = Array(resourceLocks.keys)
+        for key in keys {
+            await releaseOrphanedLock(key: key)
+        }
+        if !resourceLocks.isEmpty {
+            DevCtlLog.daemon.info(
+                "rehydrated \(resourceLocks.count) live resource lock(s) after restart")
+        }
+    }
+
+    private func isPausedUnderLiveLock(project: String, name: String) -> Bool {
+        for (key, holder) in resourceLocks {
+            guard key.hasPrefix("\(project)::") else { continue }
+            guard kill(pid_t(holder.pid), 0) == 0 else { continue }
+            if holder.paused.contains(name) { return true }
+        }
+        return false
+    }
+
+    private func persistLocks() {
+        /** Empty file is fine: defensive load treats missing/corrupt as {}. */
+        try? AtomicFile.write(
+            JSONCoding.encoder().encode(LocksFile(locks: resourceLocks)), to: paths.locksFile)
     }
 
     /** Refuses to start a server while an external holder owns one of its
         declared resources: restarting mid-harness-run is exactly the contention
         the lock exists to prevent. */
-    private func lockGate(project: String, spec: ServerSpec) throws {
+    private func lockGate(project: String, spec: ServerSpec) async throws {
         for resource in spec.locks ?? [] {
-            if let holder = liveLockHolder(key: "\(project)::\(resource)") {
+            let key = "\(project)::\(resource)"
+            await releaseOrphanedLock(key: key)
+            if let holder = resourceLocks[key] {
                 throw WireError(
                     code: .resourceLocked,
                     hint: "the holder releases it when done; check: ps -p \(holder.pid)",
-                    message: "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))")
+                    message:
+                        "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+                )
             }
         }
     }
@@ -706,6 +854,16 @@ public final class ControlServer: Sendable {
         params.requiredLocalEndpoint = NWEndpoint.unix(path: socketPath)
         params.allowLocalEndpointReuse = true
         self.listener = try NWListener(using: params)
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .failed(let error):
+                DevCtlLog.daemon.error("control listener failed: \(String(describing: error))")
+            case .cancelled:
+                DevCtlLog.daemon.debug("control listener cancelled")
+            default:
+                break
+            }
+        }
         listener.newConnectionHandler = { [router] connection in
             Self.serve(connection: connection, router: router)
         }
@@ -716,8 +874,32 @@ public final class ControlServer: Sendable {
         listener.start(queue: DispatchQueue(label: "devctl.control"))
     }
 
+    /** A client that exits without a shutdown handshake (every one-shot `devctl`
+        invocation) surfaces as `.failed` with a peer-close errno. Those are
+        routine, so they log at debug; anything else is a real listener problem
+        and stays at error. */
+    private static func isRoutineDisconnect(_ error: NWError) -> Bool {
+        guard case .posix(let code) = error else { return false }
+        return code == .ENETDOWN || code == .ECONNRESET || code == .EPIPE || code == .ECANCELED
+    }
+
     private static func serve(connection: NWConnection, router: Router) {
         let queue = DispatchQueue(label: "devctl.connection")
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed(let error):
+                if isRoutineDisconnect(error) {
+                    DevCtlLog.daemon.debug("control connection closed by peer: \(String(describing: error))")
+                } else {
+                    DevCtlLog.daemon.error("control connection failed: \(String(describing: error))")
+                }
+                connection.cancel()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
         let hello = try? NDJSON.encodeLine(
             WireEvent(

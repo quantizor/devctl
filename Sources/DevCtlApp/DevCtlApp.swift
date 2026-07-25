@@ -208,13 +208,27 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
         continue userActivity: NSUserActivity,
         restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
     ) -> Bool {
-        guard userActivity.activityType == CSSearchableItemActionType,
+        let fromSpotlight = userActivity.activityType == CSSearchableItemActionType
+        let fromDonation = userActivity.activityType == SpotlightIndexer.activityType
+        guard fromSpotlight || fromDonation,
             let identifier = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String,
             let url = SpotlightIndexer.url(forIdentifier: identifier)
         else { return false }
         SpotlightIndexer.noteOpened(identifier: identifier)
         NSWorkspace.shared.open(url)
         return true
+    }
+
+    /** MenuBarExtra is often foreground; without willPresent the SDK drops the
+        banner entirely (UNUserNotificationCenter.h). Prefer .banner/.list over
+        the deprecated .alert. */
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
     }
 
     func userNotificationCenter(
@@ -247,6 +261,7 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
 struct DevCtlApp: App {
     @NSApplicationDelegateAdaptor(AppActivationDelegate.self) private var appDelegate
     @State private var model = DaemonModel()
+    @State private var setupSession = SetupSession()
 
     /** Polling starts at launch, not first popover open: the collapsed label's
         presence dots must be live from the first frame. */
@@ -264,6 +279,7 @@ struct DevCtlApp: App {
                 closures do not participate in Observation tracking, so counts
                 read here directly would never re-render the collapsed label. */
             PresenceLabel(model: model)
+                .background(SetupWindowOpener(session: setupSession))
         }
         .menuBarExtraStyle(.window)
 
@@ -271,6 +287,22 @@ struct DevCtlApp: App {
             DashboardView(model: model)
         }
         .defaultSize(width: 860, height: 560)
+
+        Window(setupSession.migration || setupSession.replacingApplicationsApp
+            ? "Upgrade devctl" : "Install devctl", id: "setup") {
+            SetupPanel(
+                installAppToApplications: setupSession.installAppToApplications,
+                migration: setupSession.migration,
+                offers: setupSession.offers,
+                pathWarning: setupSession.pathWarning,
+                replacingApplicationsApp: setupSession.replacingApplicationsApp
+            ) {
+                setupSession.shouldPresent = false
+                SetupWindowCloser.close()
+            }
+        }
+        .windowResizability(.contentSize)
+        .defaultSize(width: 460, height: 420)
     }
 }
 
@@ -312,8 +344,7 @@ struct MenuContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if !model.daemonReachable {
-                Label("devctld is not running", systemImage: "bolt.slash")
-                    .foregroundStyle(.secondary)
+                DaemonDownRow(model: model)
                     .padding(12)
             } else if model.projects.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
@@ -417,6 +448,59 @@ struct MenuContent: View {
         filteredProjects.flatMap { p in
             p.servers.map { "\(p.path)::\($0.server)::\($0.phase.rawValue)::\($0.heads?.count ?? 0)" }
         }.joined(separator: "|") + "?\(filterText)"
+    }
+}
+
+/** Shown when the socket does not answer. The app tries to bring the daemon
+    back on its own, so this states what is happening and still offers the
+    manual action: a deliberate `devctl daemon stop` suppresses auto recovery,
+    and a failed recovery needs somewhere to report. */
+struct DaemonDownRow: View {
+    var model: DaemonModel
+
+    private var message: String {
+        if model.daemonRecovering { return "Starting devctld…" }
+        if model.daemonNeedsApproval { return "devctl needs your approval" }
+        if model.daemonStoppedOnPurpose { return "devctld is stopped" }
+        if model.daemonRecoveryError != nil { return "devctld is not running" }
+        return "devctld is not running; restarting"
+    }
+
+    private var glyph: String {
+        if model.daemonRecovering { return "bolt" }
+        if model.daemonNeedsApproval { return "hand.raised" }
+        return "bolt.slash"
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Label(message, systemImage: glyph)
+                    .foregroundStyle(.secondary)
+                if let error = model.daemonRecoveryError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            /** Approval is the only action that can help while the switch is
+                off, so it replaces Start rather than sitting beside it. */
+            if model.daemonNeedsApproval {
+                Button("Open Login Items") {
+                    AgentService.openLoginItemsSettings()
+                }
+                .buttonStyle(.borderless)
+                .help("Turn on quantizor/devctl in System Settings")
+            } else {
+                Button("Start") {
+                    model.startDaemon()
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.daemonRecovering)
+                .help("Start devctld now")
+            }
+        }
     }
 }
 
