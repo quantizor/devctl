@@ -11,6 +11,7 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -41,3 +42,22 @@ jobs:
           createGithubReleases: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Releases created with GITHUB_TOKEN do not fire release:published on
+      # other workflows. Dispatch the DMG job explicitly (workflow_dispatch is
+      # the documented exception). Tag from the just-published package version.
+      - name: Kick DMG build
+        if: steps.changesets.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_PACKAGES: ${{ steps.changesets.outputs.publishedPackages }}
+        run: |
+          set -euo pipefail
+          VERSION="$(printf '%s' "$PUBLISHED_PACKAGES" | jq -r '.[0].version')"
+          [[ -n "$VERSION" && "$VERSION" != null ]] || {
+            echo "Kick DMG: missing publishedPackages version" >&2
+            exit 1
+          }
+          # Run the workflow definition from main; checkout inside the job
+          # still pins to the release tag via the tag input.
+          gh workflow run "Release DMG" --ref main -f "tag=v${VERSION}"

@@ -13,13 +13,13 @@ devctl is a personal tool first; issues and patches are welcome all the same. Re
 
 GitHub releases are driven by [Changesets](https://github.com/changesets/changesets). After changesets land on `main`, a Version Packages PR appears; merging it tags `vX.Y.Z` and opens the GitHub release. Nothing is published to npm: the root `package.json` is private and only tracks the product version.
 
-A separate macOS workflow (`.github/workflows/release-dmg.yml`) builds a Developer ID-signed, notarized DMG and attaches it to that release. Required repository secrets:
+A separate macOS workflow (`.github/workflows/release-dmg.yml`) builds a Developer ID-signed, notarized DMG and attaches it to that release. The Release job dispatches it after a successful publish (`workflow_dispatch`): a release created with `GITHUB_TOKEN` does not fire `release:published` on other workflows. Required repository secrets:
 
 - `APPLE_DEVELOPER_ID_P12_BASE64` / `APPLE_DEVELOPER_ID_P12_PASSWORD`: exported Developer ID Application certificate
 - `APPLE_SIGN_IDENTITY`: exact codesign identity string (for example `Developer ID Application: Name (TEAMID)`)
 - `APPLE_API_KEY_BASE64` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER`: App Store Connect API key for `notarytool`
 
-Local path: `SIGN_IDENTITY="Developer ID Application: …" make dmg` then `scripts/notarize.sh`. The first DMG for an already-published tag (for example attaching to `v1.2.0`) is uploaded only after local dogfood and maintainer sign-off.
+Local path: `SIGN_IDENTITY="Developer ID Application: …" make dmg` then `scripts/notarize.sh`, then `gh release upload vX.Y.Z dist/devctl-X.Y.Z.dmg`.
 
 ## Adding an agent-harness adapter
 

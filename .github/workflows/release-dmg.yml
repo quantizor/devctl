@@ -1,5 +1,7 @@
 # Notarized DMG artifact for GitHub Releases.
-# Triggered when the Ubuntu Changesets job publishes a release (tag vX.Y.Z).
+# Kicked by Release via workflow_dispatch after Changesets publishes a tag
+# (GITHUB_TOKEN-created releases do not fire release:published elsewhere).
+# release:published remains as a manual / PAT-backed fallback.
 # Requires repository secrets:
 #   APPLE_DEVELOPER_ID_P12_BASE64, APPLE_DEVELOPER_ID_P12_PASSWORD
 #   APPLE_SIGN_IDENTITY (e.g. "Developer ID Application: Name (TEAMID)")
