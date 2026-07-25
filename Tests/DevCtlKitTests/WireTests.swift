@@ -98,4 +98,29 @@ import Testing
         #expect(quarantined.count == 1)
         try? FileManager.default.removeItem(at: dir)
     }
+
+    /** Two writers inside one process must both succeed: a pid-only temp name
+        made them rename the same temp file out from under each other, which is
+        how the app lost agent.path when launch registration and the recovery
+        poll wrote it at the same moment. */
+    @Test func concurrentWritesToOneFileAllSucceed() async throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "devctl-test-\(UUID().uuidString)")
+        let file = dir.appending(path: "agent.path")
+        let payloads = (0..<8).map { "payload-\($0)" }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for payload in payloads {
+                group.addTask {
+                    try AtomicFile.write(Data(payload.utf8), to: file)
+                }
+            }
+            try await group.waitForAll()
+        }
+        let written = try String(decoding: Data(contentsOf: file), as: UTF8.self)
+        #expect(payloads.contains(written))
+        /** No temp files survive a clean run. */
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix(".agent.path.tmp-") }
+        #expect(leftovers.isEmpty)
+        try? FileManager.default.removeItem(at: dir)
+    }
 }

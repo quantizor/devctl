@@ -2,5 +2,6 @@ node_modules/
 .build/
 .swiftpm/
 devctl.app/
+dist/
 *.corrupt-*
 .DS_Store

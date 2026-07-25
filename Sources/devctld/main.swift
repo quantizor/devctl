@@ -63,25 +63,42 @@ guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
     exit(0)
 }
 
-/** Raise the fd ceiling: launchd jobs default to a 256 soft limit, and a dozen
-    servers plus log subscribers approaches it. */
+/** Raise the fd ceiling only when below the target: launchd jobs default to a
+    256 soft limit, and a dozen servers plus log subscribers approaches it. Never
+    lower an already-higher soft limit. */
 var limit = rlimit()
 if getrlimit(RLIMIT_NOFILE, &limit) == 0 {
-    limit.rlim_cur = min(limit.rlim_max, rlim_t(8192))
-    setrlimit(RLIMIT_NOFILE, &limit)
+    let target = min(limit.rlim_max, rlim_t(8192))
+    if limit.rlim_cur < target {
+        limit.rlim_cur = target
+        if setrlimit(RLIMIT_NOFILE, &limit) != 0 {
+            FileHandle.standardError.write(
+                Data(
+                    "devctld: setrlimit(RLIMIT_NOFILE) failed: \(String(cString: strerror(errno)))\n"
+                        .utf8))
+        }
+    }
 }
 
 /** A running daemon is proof any prior deliberate-stop intent is spent. */
 try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
 
+/** Merge the install-time login PATH before any child spawn so Homebrew tools
+    stay findable under a sealed in-bundle LaunchAgent. */
+LaunchdAdmin.applyAgentPathToProcess(paths: paths)
+
 let registry = Registry(paths: paths)
 let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
 
 /** Sleep/wake awareness: health probes pause during sleep and get a grace
-    window on wake so lid-open does not flap every server unhealthy. The IOKit
-    message constants are iokit_common_msg values from IOMessage.h, written as
-    literals inside the C callback (it cannot capture top-level lets): 0xE0000270
-    can-sleep, 0xE0000280 will-sleep, 0xE0000300 has-powered-on. */
+    window on wake so lid-open does not flap every server unhealthy. IOKit
+    message macros (`kIOMessageCanSystemSleep` et al.) do not bridge into Swift;
+    these named values match IOMessage.h (`iokit_common_msg`). */
+enum PowerMessage {
+    static let canSystemSleep: natural_t = 0xE000_0270
+    static let systemHasPoweredOn: natural_t = 0xE000_0300
+    static let systemWillSleep: natural_t = 0xE000_0280
+}
 final class PowerContext {
     var rootPort: io_connect_t = 0
 }
@@ -95,20 +112,23 @@ powerContext.rootPort = IORegisterForSystemPower(
         guard let refcon else { return }
         let context = Unmanaged<PowerContext>.fromOpaque(refcon).takeUnretainedValue()
         switch messageType {
-        case 0xE000_0270, 0xE000_0280:
-            if messageType == 0xE000_0280 {
+        case PowerMessage.canSystemSleep, PowerMessage.systemWillSleep:
+            if messageType == PowerMessage.systemWillSleep {
                 Task { await PowerState.shared.recordSleep() }
             }
             /** Sleep is never vetoed; failing to acknowledge stalls the system. */
             IOAllowPowerChange(context.rootPort, Int(bitPattern: argument))
-        case 0xE000_0300:
+        case PowerMessage.systemHasPoweredOn:
             Task { await PowerState.shared.recordWake() }
         default:
             break
         }
     },
     &powerNotifier)
-if let powerPort {
+if powerContext.rootPort == 0 {
+    FileHandle.standardError.write(
+        Data("devctld: IORegisterForSystemPower failed; sleep/wake probes are unaware\n".utf8))
+} else if let powerPort {
     IONotificationPortSetDispatchQueue(powerPort, DispatchQueue.main)
 }
 
@@ -128,12 +148,28 @@ Task {
 }
 
 /** Graceful termination: drain-stop every supervised server through the normal
-    teardown path, then exit 0 (a deliberate stop must not trigger KeepAlive). */
+    teardown path, unregister power notifications, then exit 0 (a deliberate
+    stop must not trigger KeepAlive). */
 let terminationSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 signal(SIGTERM, SIG_IGN)
 terminationSource.setEventHandler {
-    Task {
+    Task { @MainActor in
         await router.drainAll()
+        if let port = powerPort {
+            IONotificationPortSetDispatchQueue(port, nil)
+        }
+        if powerNotifier != 0 {
+            IODeregisterForSystemPower(&powerNotifier)
+            powerNotifier = 0
+        }
+        if powerContext.rootPort != 0 {
+            IOServiceClose(powerContext.rootPort)
+            powerContext.rootPort = 0
+        }
+        if let port = powerPort {
+            IONotificationPortDestroy(port)
+            powerPort = nil
+        }
         exit(0)
     }
 }

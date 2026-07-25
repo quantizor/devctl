@@ -1,0 +1,210 @@
+import DevCtlKit
+import Foundation
+import Testing
+
+@testable import DevCtlDaemonCore
+
+private struct LockEnv {
+    let paths: DevCtlPaths
+    let projectPath: String
+}
+
+private func makeLockEnv() throws -> LockEnv {
+    let base = FileManager.default.temporaryDirectory.appending(path: "devctl-lock-\(UUID().uuidString)")
+    let project = base.appending(path: "proj")
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    return LockEnv(
+        paths: DevCtlPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
+        projectPath: project.path)
+}
+
+private func writeLockDevservers(project: String) throws {
+    let body = """
+    {
+      "servers": {
+        "db": {
+          "command": ["/bin/sh", "-c", "sleep 60"],
+          "locks": ["data"]
+        }
+      },
+      "version": 1
+    }
+    """
+    try Data(body.utf8).write(
+        to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+}
+
+private func handle<P: Codable & Sendable, R: Codable & Sendable>(
+    router: Router, method: WireMethod, params: P, expecting: R.Type
+) async throws -> R {
+    let line = try NDJSON.encodeLine(
+        WireRequest(id: "t", method: method.rawValue, params: params))
+    let data = await router.handle(line: line)
+    let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
+    guard response.ok, let result = response.result else {
+        throw response.error
+            ?? WireError(code: .internalError, message: "request failed")
+    }
+    return result
+}
+
+private func startDB(router: Router, project: String) async throws {
+    _ = try await handle(
+        router: router, method: .serverStart,
+        params: ServerTargetParams(name: "db", project: project),
+        expecting: ServerResult.self)
+    /** Give spawn a beat so phase is active for pause detection. */
+    try await Task.sleep(for: .milliseconds(200))
+}
+
+private func phaseOf(router: Router, project: String, name: String) async throws -> ServerPhase {
+    let list = try await handle(
+        router: router, method: .serverStatus,
+        params: ProjectParams(project: project),
+        expecting: ServerListResult.self)
+    let server = try #require(list.servers.first { $0.server == name })
+    return server.phase
+}
+
+@Suite struct ResourceLockTests {
+    /** Acquire pauses the declaring server, refuses ensure, release brings it
+        back. Pause is non-retiring so boot intent survives the hold. */
+    @Test func acquirePausesReleaseResumesAndPreservesBootIntent() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try await startDB(router: router, project: env.projectPath)
+        let id = serverID(project: env.projectPath, name: "db")
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+
+        let acquired = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        #expect(acquired.paused == ["db"])
+        #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") == .stopped)
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+        #expect(FileManager.default.fileExists(atPath: env.paths.locksFile.path))
+
+        let ensureLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "e", method: WireMethod.serverEnsure.rawValue,
+                params: EnsureParams(name: "db", project: env.projectPath, timeoutSeconds: 2)))
+        let ensureData = await router.handle(line: ensureLine)
+        let ensureResponse = try JSONCoding.decoder().decode(
+            WireResponse<EnsureResult>.self, from: ensureData)
+        #expect(ensureResponse.ok == false)
+        #expect(ensureResponse.error?.code == .resourceLocked)
+
+        let released = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        #expect(released.paused == ["db"])
+        let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(phase == .starting || phase == .running)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
+    /** The candor failure: daemon dies mid-hold, holder is gone, recover must
+        resume the paused set from locks.json. */
+    @Test func recoverResumesWhenHolderIsDead() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .stopped
+            entry.resumeOnBoot = true
+            entry.pid = nil
+        }
+        /** A pid we know is gone: spawn and wait, then reuse the identifier. */
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try probe.run()
+        probe.waitUntilExit()
+        let deadPid = Int(probe.processIdentifier)
+        #expect(kill(pid_t(deadPid), 0) != 0)
+        let key = "\(env.projectPath)::data"
+        try AtomicFile.write(
+            JSONCoding.encoder().encode(
+                LocksFile(
+                    locks: [
+                        key: LockHolder(
+                            paused: ["db"], pid: deadPid, resumeTimeoutSeconds: 15, since: Date())
+                    ])),
+            to: env.paths.locksFile)
+
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(phase == .starting || phase == .running)
+        let locks = AtomicFile.loadDefensively(LocksFile.self, from: env.paths.locksFile)
+        #expect(locks?.locks.isEmpty == true)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
+    /** If the harness survived the daemon restart, recover must leave the
+        paused server down and keep the lock so ensure stays refused. */
+    @Test func recoverLeavesPausedWhenHolderStillAlive() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .stopped
+            entry.resumeOnBoot = true
+            entry.pid = nil
+        }
+        let livePid = Int(getpid())
+        let key = "\(env.projectPath)::data"
+        try AtomicFile.write(
+            JSONCoding.encoder().encode(
+                LocksFile(
+                    locks: [
+                        key: LockHolder(
+                            paused: ["db"], pid: livePid, resumeTimeoutSeconds: 15, since: Date())
+                    ])),
+            to: env.paths.locksFile)
+
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") == .stopped)
+
+        let ensureLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "e", method: WireMethod.serverEnsure.rawValue,
+                params: EnsureParams(name: "db", project: env.projectPath, timeoutSeconds: 2)))
+        let ensureData = await router.handle(line: ensureLine)
+        let ensureResponse = try JSONCoding.decoder().decode(
+            WireResponse<EnsureResult>.self, from: ensureData)
+        #expect(ensureResponse.error?.code == .resourceLocked)
+
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: livePid, project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(phase == .starting || phase == .running)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+}

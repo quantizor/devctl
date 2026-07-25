@@ -23,7 +23,9 @@ struct AppDeepLinkEffects: DeepLinkEffects {
     }
 
     func openBrowser(_ url: URL) async {
-        await MainActor.run { NSWorkspace.shared.open(url) }
+        /** Best effort: a browser that refuses to open is not worth failing the
+            deep link over, and the caller has no recovery for it either. */
+        await MainActor.run { _ = NSWorkspace.shared.open(url) }
     }
 }
 
@@ -35,6 +37,10 @@ enum AppDeepLinkDispatch {
     static let userInfoHead = "head"
 
     static func run(_ url: URL) {
+        if isDaemonControl(url) {
+            Task { await executeDaemonControl(url) }
+            return
+        }
         switch DeepLink.parse(url: url) {
         case .failure(let error):
             DevCtlLog.deeplink.error("reject \(error.message)")
@@ -43,6 +49,36 @@ enum AppDeepLinkDispatch {
             }
         case .success(let link):
             Task { await execute(link) }
+        }
+    }
+
+    /** `devctl://daemon/ensure` and `devctl://daemon/unregister`: CLI asks the
+        app to own SMAppService registration (correct Bundle.main). */
+    private static func isDaemonControl(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "devctl",
+            url.host?.lowercased() == "daemon"
+        else { return false }
+        let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        return action == "ensure" || action == "unregister"
+    }
+
+    private static func executeDaemonControl(_ url: URL) async {
+        let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        do {
+            switch action {
+            case "ensure":
+                try await AgentService.ensureRunning()
+                DevCtlLog.app.info("deeplink daemon/ensure ok")
+            case "unregister":
+                try await AgentService.unregister()
+                DevCtlLog.app.info("deeplink daemon/unregister ok")
+            default:
+                break
+            }
+        } catch {
+            DevCtlLog.app.error("deeplink daemon/\(action): \(error.localizedDescription)")
+            await AppDeepLinkEffects().notify(
+                title: "devctl daemon control failed", body: error.localizedDescription)
         }
     }
 

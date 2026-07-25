@@ -37,7 +37,19 @@ let package = Package(
         .executableTarget(
             name: "devctld",
             dependencies: ["DevCtlDaemonCore", "DevCtlKit"],
-            swiftSettings: strictCore
+            exclude: ["Info.plist"],
+            swiftSettings: strictCore,
+            linkerSettings: [
+                /** Embedded Info.plist for the helper Mach-O identity. Login
+                    Items naming for the app install path comes from
+                    SMAppService + the responsible app, not this section. */
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "\(Context.packageDirectory)/Sources/devctld/Info.plist",
+                ])
+            ]
         ),
         .executableTarget(
             name: "devctl",

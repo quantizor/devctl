@@ -13,7 +13,18 @@ public struct DevCtlPaths: Sendable {
 
     public var daemonBinaryDir: URL { dataDir.appending(path: "bin") }
     public var daemonLog: URL { dataDir.appending(path: "daemon.log") }
+    /** Login-shell PATH captured at install/start. The sealed in-bundle
+        LaunchAgent cannot hold a dynamic PATH; the daemon merges this file
+        into its environment at startup so children still find Homebrew tools. */
+    public var agentPathFile: URL { dataDir.appending(path: "agent.path") }
+    /** Written before replacing `/Applications/devctl.app` so the relaunched
+        copy settles BTM before re-registering the helper (ad-hoc CDHash). */
+    public var agentRebindFile: URL { dataDir.appending(path: "agent.rebind") }
     public var lockFile: URL { dataDir.appending(path: "daemon.lock") }
+    /** Held resource locks (`project::resource` → holder + paused servers).
+        Survives a daemon crash so mid-lock deaths can still resume what pause
+        stopped. */
+    public var locksFile: URL { dataDir.appending(path: "locks.json") }
     public var registryFile: URL { dataDir.appending(path: "registry.json") }
     public var stateFile: URL { dataDir.appending(path: "state.json") }
     public var stoppedIntentFile: URL { dataDir.appending(path: "stopped.intent") }
@@ -92,10 +103,15 @@ public func serverID(project: String, name: String) -> String {
     failure quarantines the file to `.corrupt-<timestamp>` and returns nil rather
     than crashing (a startup parse crash under launchd KeepAlive loops forever). */
 public enum AtomicFile {
+    /** Temp + fsync + rename. The temp name carries a per-call unique suffix, not
+        just the pid: two writers inside one process (the app registers the agent
+        at launch while its recovery poll writes the same file) would otherwise
+        share a temp path and rename it out from under each other. */
     public static func write(_ data: Data, to url: URL) throws {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let tmp = dir.appending(path: ".\(url.lastPathComponent).tmp-\(getpid())")
+        let tmp = dir.appending(
+            path: ".\(url.lastPathComponent).tmp-\(getpid())-\(UUID().uuidString)")
         try data.write(to: tmp)
         let fd = open(tmp.path, O_WRONLY)
         if fd >= 0 {

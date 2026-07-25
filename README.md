@@ -12,11 +12,12 @@ Agents forget their dev servers. After a context compaction they spawn duplicate
 
 ## Quick start
 
-(Your agent can do all of this for you, just point them at the repo.)
+Download the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Claude Code and Cursor (checked by default when needed).
 
+Or build from source (your agent can do this for you):
 
 ```sh
-make install          # binaries to ~/.local/bin, app to /Applications, daemon installed
+make install          # CLI + daemon to ~/.local/bin, app to /Applications, daemon installed
 cd your-project
 devctl register --name myproj --cmd bun --cmd run --cmd dev --port 3000
 devctl ensure myproj  # idempotent: healthy is a no-op
@@ -37,4 +38,4 @@ Or commit a `devservers.json` at the project root (multiple servers, dependencie
 
 ## Building
 
-`make build` and `make test`; `scripts/smoke.sh` is the end-to-end gate. No Xcode required, ever: the app bundle is assembled by a checked-in script. See `CLAUDE.md` for the codebase map and `CONTRIBUTING.md` for adding an agent-harness adapter.
+`make build` and `make test`; `make app` / `make dmg` assemble the menu bar app (and a double-click-to-install disk image) without Xcode. `scripts/smoke.sh` is the end-to-end gate. See `CLAUDE.md` for the codebase map and `CONTRIBUTING.md` for adding an agent-harness adapter and for release DMG signing secrets.
