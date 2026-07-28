@@ -19,6 +19,13 @@ import Testing
         #expect(LogRecord.parse("not-a-date\tout\ttext") == nil)
     }
 
+    @Test func contextLineTagsStream() {
+        let record = LogRecord(at: Date(timeIntervalSince1970: 1), stream: .err, text: "boom")
+        #expect(record.contextLine == "err: boom")
+        let out = LogRecord(at: Date(timeIntervalSince1970: 1), stream: .out, text: "listening")
+        #expect(out.contextLine == "out: listening")
+    }
+
     @Test func sanitizerStripsSpinnersAnsiAndNul() {
         #expect(LogSanitizer.sanitize("10%\r50%\r100% done") == "100% done")
         #expect(LogSanitizer.sanitize("\u{1B}[31mred\u{1B}[0m plain") == "red plain")
@@ -85,5 +92,52 @@ import Testing
         let markDate = LogQuery.markDate(current: current, markID: "m1700-1")
         #expect(markDate == Date(timeIntervalSince1970: 1_700_000_002))
         #expect(LogQuery.markDate(current: current, markID: "m-nope") == nil)
+    }
+
+    @Test func invalidGrepIsRejectedNotIgnored() throws {
+        /** An unbalanced group cannot compile; the old `try? Regex` turned it into
+            "no filter" and returned every line, which reads exactly like a query
+            that matched everything. Fail closed instead. */
+        #expect(LogQuery.grepRejection("(unbalanced") != nil)
+        #expect(LogQuery.grepRejection("error|warn") == nil)
+        let lines = [record(1, .err, "error: boom"), record(2, .out, "fine")]
+        let current = try writeFamily([lines])
+        #expect(LogQuery.run(current: current, options: LogQueryOptions(grep: "(unbalanced")).isEmpty)
+    }
+
+    @Test func summarizeCountsAndBracketsErrorStream() throws {
+        let lines = [
+            record(1, .out, "listening"),
+            record(2, .err, "error one"),
+            record(5, .err, "error two"),
+            record(9, .err, "error three"),
+        ]
+        let current = try writeFamily([lines])
+        let summary = LogQuery.summarize(current: current, streams: [.err], since: nil)
+        #expect(summary == ErrorSummary(
+            count: 3,
+            firstAt: Date(timeIntervalSince1970: 1_700_000_002),
+            lastAt: Date(timeIntervalSince1970: 1_700_000_009)))
+    }
+
+    @Test func summarizeIsNilOnEmptyWindow() throws {
+        let lines = [record(1, .out, "listening"), record(2, .out, "ready")]
+        let current = try writeFamily([lines])
+        #expect(LogQuery.summarize(current: current, streams: [.err], since: nil) == nil)
+        /** A since past every err line is also empty, not a spurious zero-count. */
+        let withErr = try writeFamily([[record(1, .err, "old error")]])
+        #expect(LogQuery.summarize(
+            current: withErr, streams: [.err], since: Date(timeIntervalSince1970: 1_700_000_100)) == nil)
+    }
+
+    @Test func summarizeAnchorsSinceAcrossRotation() throws {
+        let old = (0..<50).map { record(Double($0), .err, "old \($0)") }
+        let recent = (50..<60).map { record(Double($0), .err, "recent \($0)") }
+        let current = try writeFamily([old, recent])
+        let summary = LogQuery.summarize(
+            current: current, streams: [.err], since: Date(timeIntervalSince1970: 1_700_000_050))
+        #expect(summary?.count == 10)
+        #expect(summary?.firstAt == Date(timeIntervalSince1970: 1_700_000_050))
+        #expect(summary?.lastAt == Date(timeIntervalSince1970: 1_700_000_059))
     }
 }

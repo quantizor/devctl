@@ -41,8 +41,50 @@ public enum LogQuery {
         return files
     }
 
+    /** Why a caller-supplied grep pattern will not compile, or nil when it will.
+        Callers validate before querying: a pattern the engine cannot compile must
+        not silently degrade into "no filter", because returning every line reads
+        exactly like a query that matched everything. */
+    public static func grepRejection(_ pattern: String) -> String? {
+        do {
+            _ = try Regex(pattern)
+            return nil
+        } catch {
+            return String(describing: error)
+        }
+    }
+
+    /** Counts records on the given streams and brackets them in time, without
+        building the array. The count and the two timestamps are devctl's own
+        arithmetic over the log, safe to put in an agent's context where the lines
+        themselves must never go. `since` bounds the window to one process's run
+        (current.log is append-only across spawns), and drives the same file-skip
+        and binary search `run` uses, so it does not scan a long history. */
+    public static func summarize(current: URL, streams: Set<LogStream>, since: Date?) -> ErrorSummary? {
+        var count = 0
+        var first: Date?
+        var last: Date?
+        for record in run(current: current, options: LogQueryOptions(since: since, streams: streams)) {
+            count += 1
+            if first == nil { first = record.at }
+            last = record.at
+        }
+        guard count > 0, let first, let last else { return nil }
+        return ErrorSummary(count: count, firstAt: first, lastAt: last)
+    }
+
     public static func run(current: URL, options: LogQueryOptions) -> [LogRecord] {
-        let grep = options.grep.flatMap { try? Regex($0) }
+        /** A pattern that will not compile filters nothing out, so it would
+            answer with the whole log. Fail closed and say so instead: callers
+            screen user input with grepRejection first. */
+        var grep: Regex<AnyRegexOutput>?
+        if let pattern = options.grep {
+            guard let compiled = try? Regex(pattern) else {
+                DevCtlLog.daemon.error("log query grep pattern does not compile: \(pattern)")
+                return []
+            }
+            grep = compiled
+        }
         var records: [LogRecord] = []
         for file in familyFiles(current: current) {
             /** Whole-file skip: a file whose last line predates `since` cannot

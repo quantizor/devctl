@@ -176,6 +176,7 @@ public enum ProjectConfigLoader {
                     env: entry.env,
                     heads: entry.heads,
                     healthcheck: entry.healthcheck,
+                    host: serverHost,
                     icon: iconPath,
                     locks: entry.locks,
                     name: name,

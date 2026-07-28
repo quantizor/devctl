@@ -11,6 +11,9 @@ enum WhyEngine {
         target: String,
         statuses: [String: ServerStatus],
         specs: [String: ServerSpec],
+        /** Recent log lines for a server, already stream-tagged by
+            `LogRecord.contextLine` so evidence reads the same here and in
+            `recentLogTail`. */
         errTail: (String) -> [String]
     ) -> WhyResult {
         var findings: [WhyFinding] = []
@@ -50,11 +53,11 @@ enum WhyEngine {
                 ?? status.lastExit?.signal.map { "signal \($0)" } ?? "unknown cause"
             let when = status.lastExit.map { JSONCoding.formatISO8601($0.at) } ?? "unknown time"
             summary = "crashed (\(cause)) at \(when)"
-            evidence.append(contentsOf: errTail(status.server).map { "err: \($0)" })
+            evidence.append(contentsOf: errTail(status.server))
         case .unhealthy:
             let since = status.lastHealthAt.map { JSONCoding.formatISO8601($0) } ?? "startup"
             summary = "healthcheck failing; last healthy \(since)"
-            evidence.append(contentsOf: errTail(status.server).map { "err: \($0)" })
+            evidence.append(contentsOf: errTail(status.server))
         case .starting:
             summary = "still starting; healthcheck (\(status.healthcheck.rawValue)) has not passed yet"
         case .stopped:
@@ -64,9 +67,19 @@ enum WhyEngine {
         case .running:
             summary = "running and healthy"
         }
-        if let declared = status.declaredPort, let observed = status.observedPort, declared != observed {
+        if let effective = status.effectivePort, let observed = status.observedPort,
+            effective != observed
+        {
+            summary += "; NOTE: listening on \(observed), not the effective \(effective)"
+            evidence.append("effective port \(effective), observed \(observed)")
+        } else if let declared = status.declaredPort, let observed = status.observedPort,
+            declared != observed
+        {
             summary += "; NOTE: listening on \(observed), not the declared \(declared)"
             evidence.append("declared port \(declared), observed \(observed)")
+        }
+        if let conflict = status.portConflict {
+            evidence.append("port conflict (\(conflict.state.rawValue)): \(conflict.message)")
         }
         if status.specStale == true {
             evidence.append("config changed since this process started (restart to apply)")

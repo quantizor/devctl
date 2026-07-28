@@ -127,64 +127,17 @@ public struct NetworkHealthProber: HealthProber {
         }
     }
 
-    /** Non-blocking connect to a loopback port with a poll deadline. Dev
-        servers bind either stack: Vite 5+ listens on `::1` only, older
-        tooling on `127.0.0.1` only, so both loopback families are tried and
-        either answering counts as healthy. */
     static func tcpConnects(port: Int, timeoutMs: Int) -> Bool {
-        tcpConnects(port: port, timeoutMs: timeoutMs, family: AF_INET)
-            || tcpConnects(port: port, timeoutMs: timeoutMs, family: AF_INET6)
-    }
-
-    private static func tcpConnects(port: Int, timeoutMs: Int, family: Int32) -> Bool {
-        let sock = socket(family, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { close(sock) }
-        let flags = fcntl(sock, F_GETFL)
-        _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
-        var storage = sockaddr_storage()
-        let sockLen: socklen_t
-        if family == AF_INET6 {
-            var addr = sockaddr_in6()
-            addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_port = UInt16(port).bigEndian
-            addr.sin6_addr = in6addr_loopback
-            sockLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
-            withUnsafeMutablePointer(to: &storage) { ptr in
-                ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee = addr }
-            }
-        } else {
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = UInt16(port).bigEndian
-            addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-            sockLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            withUnsafeMutablePointer(to: &storage) { ptr in
-                ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee = addr }
-            }
-        }
-        let result = withUnsafePointer(to: &storage) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(sock, sa, sockLen)
-            }
-        }
-        if result == 0 { return true }
-        guard errno == EINPROGRESS else { return false }
-        var pollTarget = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
-        guard poll(&pollTarget, 1, Int32(timeoutMs)) == 1 else { return false }
-        var soError: Int32 = 0
-        var soLen = socklen_t(MemoryLayout<Int32>.size)
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &soLen)
-        return soError == 0
+        LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
     }
 }
 
 /** Port ownership diagnostics: best-effort lsof shell-outs. These inform errors
     and status; supervision never depends on them. */
 public enum PortGuard {
-    /** True when something accepts on 127.0.0.1:port right now. */
+    /** True when something accepts on either loopback family for that port. */
     public static func isListening(port: Int) -> Bool {
-        NetworkHealthProber.tcpConnects(port: port, timeoutMs: 300)
+        LoopbackProbe.isListening(port: port)
     }
 
     /** The pid + command listening on a port, when lsof can name it. */

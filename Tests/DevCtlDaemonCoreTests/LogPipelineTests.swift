@@ -110,9 +110,12 @@ private func tempDir() throws -> URL {
             "web": ServerSpec(command: ["w"], dependsOn: ["api"], name: "web"),
             "api": ServerSpec(command: ["a"], name: "api"),
         ]
+        /** The caller supplies already stream-tagged lines (production passes
+            LogRecord.contextLine), so the engine appends them verbatim rather
+            than owning the prefix. */
         let result = WhyEngine.diagnose(
             target: "web", statuses: statuses, specs: specs,
-            errTail: { name in name == "api" ? ["ECONNREFUSED db:5432"] : [] })
+            errTail: { name in name == "api" ? ["err: ECONNREFUSED db:5432"] : [] })
         #expect(result.rootCause?.hasPrefix("api: crashed (exit 1)") == true)
         #expect(result.findings.count == 2)
         #expect(result.findings.first?.server == "web")

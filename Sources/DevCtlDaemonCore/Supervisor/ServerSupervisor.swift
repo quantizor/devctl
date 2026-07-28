@@ -13,7 +13,16 @@ public actor ServerSupervisor {
     private let logStore: LogStore
     private var outTailer: SpoolTailer?
     private var consecutiveSuccesses = 0
+    /** Committed port before override/rebind; status.declaredPort. */
+    private var declaredPort: Int?
+    /** Error-stream tally for the current process, captured when the phase turns
+        terminal or unhealthy rather than recomputed per status call. Cleared at
+        spawn so a crash loop reports this incarnation, bracketed to the run's
+        start, and persisted so it survives a daemon restart. */
+    private var errorSummary: ErrorSummary?
     private var everHealthy = false
+    /** What this run binds after override/rebind/materialization. */
+    private var effectivePort: Int?
     private var healthTask: Task<Void, Never>?
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
@@ -22,7 +31,12 @@ public actor ServerSupervisor {
     private let paths: DevCtlPaths
     private var phase: ServerPhase = .stopped
     private var pid: pid_t?
+    private var portConflict: PortConflict?
     private let prober: any HealthProber
+    /** Captured when the phase turns terminal, not recomputed per status call:
+        the log stops growing once the process is gone, so one read at the
+        transition is both cheaper and a truer snapshot of the failure. */
+    private var recentLogTail: [String]?
     private let registry: Registry
     private var runningSpecHash: String?
     private var runTask: Task<Void, Never>?
@@ -46,14 +60,18 @@ public actor ServerSupervisor {
     ) {
         self.events = events
         self.launcher = launcher
-        self.logStore = LogStore(currentURL: paths.structuredLogFile(project: projectPath, server: spec.name))
+        /** Match Registry's normalized state keys (`/var` vs `/private/var`). */
+        let project = canonicalProjectPath(projectPath)
+        self.logStore = LogStore(currentURL: paths.structuredLogFile(project: project, server: spec.name))
         self.paths = paths
         self.prober = prober
-        self.projectPath = projectPath
+        self.projectPath = project
         self.registry = registry
         self.spec = spec
+        let id = serverID(project: project, name: spec.name)
         if let persisted = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile)?
-            .servers[serverID(project: projectPath, name: spec.name)] {
+            .servers[id] {
+            self.errorSummary = persisted.errorSummary
             self.lastExit = persisted.lastExit
             self.spawnError = persisted.spawnError
             if persisted.phase == .crashed || persisted.phase == .failed {
@@ -64,6 +82,19 @@ public actor ServerSupervisor {
 
     public func updateSpec(_ newSpec: ServerSpec) {
         spec = newSpec
+    }
+
+    /** Port metadata for status/agents. Call after materializing the spawn spec. */
+    public func setPortMeta(
+        declaredPort: Int?, effectivePort: Int?, portConflict: PortConflict? = nil
+    ) {
+        self.declaredPort = declaredPort
+        self.effectivePort = effectivePort
+        self.portConflict = portConflict
+    }
+
+    public func clearBoundPortMeta() {
+        portConflict = nil
     }
 
     /** Starts the server if not already starting/running; otherwise joins the
@@ -85,8 +116,10 @@ public actor ServerSupervisor {
         phase = .starting
         stopRequested = false
         spawnError = nil
+        errorSummary = nil
         everHealthy = false
         observedPort = nil
+        recentLogTail = nil
         consecutiveFailures = 0
         consecutiveSuccesses = 0
         runningSpecHash = Self.specHash(spec)
@@ -236,8 +269,15 @@ public actor ServerSupervisor {
     public func status() -> ServerStatus {
         let check = EffectiveHealthcheck.resolve(spec: spec)
         let terminal = phase == .crashed || phase == .failed
+        /** The tail is captured once at the transition and served from memory. A
+            server rehydrated as crashed after a daemon restart has none in memory
+            (only errorSummary is persisted), so fall back to a live read there,
+            which matches the pre-capture behavior for that narrow case. */
+        let tail = terminal ? (recentLogTail ?? spoolTail()) : nil
         return ServerStatus(
-            declaredPort: spec.port,
+            declaredPort: declaredPort ?? spec.port,
+            effectivePort: effectivePort ?? spec.port,
+            errorSummary: errorSummary,
             heads: spec.heads,
             healthcheck: check.kind,
             icon: spec.icon,
@@ -247,8 +287,9 @@ public actor ServerSupervisor {
             observedPort: observedPort,
             phase: phase,
             pid: pid.map(Int.init),
+            portConflict: portConflict,
             project: projectPath,
-            recentLogTail: terminal ? spoolTail() : nil,
+            recentLogTail: tail,
             server: spec.name,
             spawnError: spawnError,
             specStale: specStaleFlag(),
@@ -319,6 +360,10 @@ public actor ServerSupervisor {
                 `starting` until the deadline callers chose, never `unhealthy`. */
             if everHealthy, phase == .running, consecutiveFailures >= unhealthyAfter {
                 phase = .unhealthy
+                /** The process is still writing, so snapshot the err tally at the
+                    moment it degrades; a later recovery to running clears nothing,
+                    so the count reflects the most recent unhealthy episode. */
+                errorSummary = captureErrorSummary(since: startedAt)
                 postHealthEvent(.unhealthy)
             }
         }
@@ -336,12 +381,42 @@ public actor ServerSupervisor {
         }
     }
 
-    private func recordObservedPort(ports: [Int]) {
+    private func recordObservedPort(ports: [Int]) async {
         guard !ports.isEmpty else { return }
-        if let declared = spec.port, ports.contains(declared) {
-            observedPort = declared
+        let expected = effectivePort ?? spec.port
+        if let expected, ports.contains(expected) {
+            observedPort = expected
         } else {
             observedPort = ports.first
+        }
+        /** Strict bind: a managed server that listened elsewhere than effectivePort
+            (Vite silent bump) is not healthy. Fail closed with port-drift metadata. */
+        guard let expected, let observed = observedPort, observed != expected,
+            phase == .running || phase == .starting
+        else { return }
+        portConflict = PortConflict(
+            declaredPort: declaredPort ?? expected,
+            effectivePort: expected,
+            message:
+                "server listened on \(observed) instead of \(expected); add {port} to the command, set portEnv, or use --port / devctl.local.json",
+            state: .drift)
+        phase = .failed
+        spawnError = SpawnError(message: "port drift: expected \(expected), observed \(observed)")
+        errorSummary = captureErrorSummary(since: startedAt)
+        recentLogTail = spoolTail()
+        healthTask?.cancel()
+        DevCtlLog.supervisor.error(
+            "port-drift \(spec.name)@\(projectPath) expected \(expected) observed \(observed)")
+        await events?.post(
+            kind: .failed, project: projectPath, server: spec.name,
+            detail: "port drift \(expected)->\(observed)")
+        let id = serverID(project: projectPath, name: spec.name)
+        let summary = errorSummary
+        let err = spawnError
+        await registryUpdate(id: id) { entry in
+            entry.errorSummary = summary
+            entry.phase = .failed
+            entry.spawnError = err
         }
     }
 
@@ -413,6 +488,15 @@ public actor ServerSupervisor {
         settleSpawnWaiters()
     }
 
+    /** Snapshot the err-stream tally for the run that just started at
+        `windowStart`. Reads only from that point forward, so a crash loop reports
+        the current incarnation rather than the whole log history. */
+    private func captureErrorSummary(since windowStart: Date?) -> ErrorSummary? {
+        LogQuery.summarize(
+            current: paths.structuredLogFile(project: projectPath, server: spec.name),
+            streams: [.err], since: windowStart)
+    }
+
     private func recordSpawnFailure(_ error: SpawnError, id: String) async {
         spawnError = error
         phase = .failed
@@ -423,6 +507,7 @@ public actor ServerSupervisor {
         runTask = nil
         healthTask?.cancel()
         healthTask = nil
+        recentLogTail = spoolTail()
         await registryUpdate(id: id) { entry in
             entry.phase = .failed
             entry.pid = nil
@@ -445,10 +530,15 @@ public actor ServerSupervisor {
         case .signaled(let signal):
             lastExit = LastExit(at: Date(), code: nil, signal: signal)
         }
+        let windowStart = startedAt
         if let out = outTailer { await out.stop() }
         if let err = errTailer { await err.stop() }
         outTailer = nil
         errTailer = nil
+        /** After the final drain, so the lines that explain the exit are in the
+            log before the snapshots are taken. */
+        recentLogTail = spoolTail()
+        errorSummary = captureErrorSummary(since: windowStart)
         pid = nil
         startedAt = nil
         observedPort = nil
@@ -464,7 +554,9 @@ public actor ServerSupervisor {
         await events?.post(
             kind: finalPhase == .stopped ? .stopped : .crashed,
             project: projectPath, server: spec.name, detail: cause)
+        let errors = errorSummary
         await registryUpdate(id: id) { entry in
+            entry.errorSummary = errors
             entry.lastExit = exit
             entry.phase = finalPhase
             entry.pid = nil
@@ -507,7 +599,7 @@ public actor ServerSupervisor {
         let records = LogQuery.run(
             current: paths.structuredLogFile(project: projectPath, server: spec.name),
             options: LogQueryOptions(streams: [.err, .out, .sys], tail: lines))
-        return records.isEmpty ? nil : records.map { "\($0.stream.rawValue): \($0.text)" }
+        return records.isEmpty ? nil : records.map(\.contextLine)
     }
 
     private func waitForRunTaskCompletion() async {

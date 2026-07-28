@@ -116,6 +116,83 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.lastExit?.code == 3)
     }
 
+    /** Poll the supervisor until it reaches `phase` or the budget runs out. */
+    private func waitForPhase(
+        _ supervisor: ServerSupervisor, _ phase: ServerPhase, tries: Int = 50
+    ) async throws -> ServerStatus {
+        var status = await supervisor.status()
+        for _ in 0..<tries where status.phase != phase {
+            try await Task.sleep(for: .milliseconds(100))
+            status = await supervisor.status()
+        }
+        return status
+    }
+
+    @Test func crashCapturesErrorLineTally() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "echo boom >&2; echo bang >&2; exit 1"], name: "noisy")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let status = try await waitForPhase(supervisor, .crashed)
+        #expect(status.phase == .crashed)
+        /** Two stderr lines this run: devctl's own count, not the lines. */
+        #expect(status.errorSummary?.count == 2)
+        #expect(status.errorSummary.map { $0.lastAt >= $0.firstAt } == true)
+        /** And it survives into the state file for a post-restart read. */
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "noisy"))
+        #expect(persisted?.errorSummary?.count == 2)
+    }
+
+    @Test func respawnClearsThePreviousRunsTally() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        /** First run writes one stderr line and crashes; the second is quiet and
+            sleeps, so its live tally must not inherit the first run's count. */
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "echo once >&2; exit 1"], name: "cycle")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let crashed = try await waitForPhase(supervisor, .crashed)
+        #expect(crashed.errorSummary?.count == 1)
+        await supervisor.updateSpec(ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle"))
+        _ = await supervisor.start()
+        /** A fresh run starts with no tally; it fills only on the next failure. */
+        #expect(await supervisor.status().errorSummary == nil)
+        _ = await supervisor.stop(graceSeconds: 1)
+    }
+
+    @Test func errorSummaryRehydratesFromStateFile() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let id = serverID(project: env.projectPath, name: "web")
+        /** A prior daemon left a crashed row with a tally; a fresh supervisor for
+            the same server surfaces it without re-running anything. */
+        let seed = Registry(paths: paths)
+        try await seed.updateState(serverID: id) { entry in
+            entry.errorSummary = ErrorSummary(
+                count: 4,
+                firstAt: Date(timeIntervalSince1970: 1_700_000_000),
+                lastAt: Date(timeIntervalSince1970: 1_700_000_009))
+            entry.phase = .crashed
+        }
+        let registry = Registry(paths: paths)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
+        let status = await supervisor.status()
+        #expect(status.phase == .crashed)
+        #expect(status.errorSummary?.count == 4)
+    }
+
     @Test func concurrentStartsSingleFlight() async throws {
         let env = try makeEnv()
         let paths = env.paths

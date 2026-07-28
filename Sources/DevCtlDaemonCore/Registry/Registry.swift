@@ -32,6 +32,12 @@ public struct StateFile: Codable, Sendable {
 }
 
 public struct PersistedServerState: Codable, Sendable {
+    /** Sibling-rebind assignment; optional so older state files keep parsing. */
+    public var boundPort: Int?
+    /** Error-stream tally from the last run, so a daemon restart does not erase
+        the forensics an agent needs to understand why a server is down.
+        Optional so state files written before this field existed keep parsing. */
+    public var errorSummary: ErrorSummary?
     public var lastExit: LastExit?
     public var phase: ServerPhase
     public var pid: Int?
@@ -45,6 +51,8 @@ public struct PersistedServerState: Codable, Sendable {
     public var startedAt: Date?
 
     public init(
+        boundPort: Int? = nil,
+        errorSummary: ErrorSummary? = nil,
         lastExit: LastExit? = nil,
         phase: ServerPhase = .stopped,
         pid: Int? = nil,
@@ -52,6 +60,8 @@ public struct PersistedServerState: Codable, Sendable {
         spawnError: SpawnError? = nil,
         startedAt: Date? = nil
     ) {
+        self.boundPort = boundPort
+        self.errorSummary = errorSummary
         self.lastExit = lastExit
         self.phase = phase
         self.pid = pid
@@ -79,10 +89,11 @@ public actor Registry {
     }
 
     public func project(_ path: String) -> RegisteredProject? {
-        registry.projects[path]
+        registry.projects[Self.normalize(path)]
     }
 
     public func register(project: String, spec: ServerSpec) throws {
+        let project = Self.normalize(project)
         var entry = registry.projects[project] ?? RegisteredProject()
         entry.servers[spec.name] = spec
         registry.projects[project] = entry
@@ -90,18 +101,21 @@ public actor Registry {
     }
 
     public func spec(project: String, name: String) -> ServerSpec? {
-        registry.projects[project]?.servers[name]
+        registry.projects[Self.normalize(project)]?.servers[name]
     }
 
     public func specs(project: String) -> [ServerSpec] {
-        (registry.projects[project]?.servers ?? [:]).values.sorted { $0.name < $1.name }
+        (registry.projects[Self.normalize(project)]?.servers ?? [:]).values.sorted {
+            $0.name < $1.name
+        }
     }
 
     public func isTrusted(project: String) -> Bool {
-        registry.projects[project]?.trusted ?? false
+        registry.projects[Self.normalize(project)]?.trusted ?? false
     }
 
     public func setTrusted(project: String) throws {
+        let project = Self.normalize(project)
         var entry = registry.projects[project] ?? RegisteredProject()
         entry.trusted = true
         registry.projects[project] = entry
@@ -109,6 +123,7 @@ public actor Registry {
     }
 
     public func unregister(project: String, name: String) throws {
+        let project = Self.normalize(project)
         registry.projects[project]?.servers[name] = nil
         if let entry = registry.projects[project], entry.servers.isEmpty {
             registry.projects[project] = nil
@@ -117,7 +132,7 @@ public actor Registry {
     }
 
     public func persistedState(serverID: String) -> PersistedServerState? {
-        state.servers[serverID]
+        state.servers[Self.normalizeServerID(serverID)]
     }
 
     public func allPersistedState() -> [String: PersistedServerState] {
@@ -125,6 +140,7 @@ public actor Registry {
     }
 
     public func updateState(serverID: String, _ mutate: (inout PersistedServerState) -> Void) throws {
+        let serverID = Self.normalizeServerID(serverID)
         var entry = state.servers[serverID] ?? PersistedServerState()
         mutate(&entry)
         state.servers[serverID] = entry
@@ -134,9 +150,21 @@ public actor Registry {
     /** Drop a state row whose server no longer exists in config or the registry
         (rename / delete). Keeps recoverAtStartup from re-visiting ghosts. */
     public func removeState(serverID: String) throws {
+        let serverID = Self.normalizeServerID(serverID)
         guard state.servers[serverID] != nil else { return }
         state.servers[serverID] = nil
         try persistState()
+    }
+
+    private static func normalize(_ project: String) -> String {
+        canonicalProjectPath(project)
+    }
+
+    private static func normalizeServerID(_ id: String) -> String {
+        guard let separator = id.range(of: "::") else { return id }
+        let project = String(id[id.startIndex..<separator.lowerBound])
+        let name = String(id[separator.upperBound...])
+        return serverID(project: canonicalProjectPath(project), name: name)
     }
 
     private func persistRegistry() throws {

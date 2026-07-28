@@ -51,50 +51,18 @@ enum CLISelf {
     }
 }
 
-/** The harness-agnostic context primitive: a fenced plain-text block any agent
-    harness can inject into a session. Prints nothing for unregistered or
-    untrusted projects and never bootstraps the daemon (a session start must stay
-    fast and side-effect free). Raw log lines and command strings never appear
-    here: child output and committed configs are attacker-influenceable. */
-enum AgentContext {
-    static let maxLength = 2400
-
+/** Fetches the trusted project's server list over the socket and hands it to the
+    pure renderer in DevCtlKit (AgentContext.render). Kept thin and side-effect
+    free: a session start must stay fast, must never bootstrap the daemon, and
+    stays silent when the daemon is unreachable. */
+enum HookContext {
     static func render(project: String) async -> String? {
         let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
         guard
             let list = try? await client.request(
-                .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self),
-            list.trusted == true,
-            !list.servers.isEmpty
+                .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self)
         else { return nil }
-        var lines: [String] = []
-        lines.append("<devctl-servers>")
-        lines.append(
-            "This project's dev servers are managed by devctl (daemon-supervised; they and their logs survive session compaction and restarts). Prefer devctl over launching servers directly.")
-        for server in list.servers {
-            var parts = ["- \(server.server): \(server.phase.rawValue)"]
-            if let url = server.url { parts.append(url) }
-            if let heads = server.heads, !heads.isEmpty {
-                let list = heads.sorted { $0.key < $1.key }
-                    .map { "\($0.key) \($0.value)" }
-                    .joined(separator: ", ")
-                parts.append("heads: \(list)")
-            }
-            if let port = server.observedPort ?? server.declaredPort { parts.append("port \(port)") }
-            if let exit = server.lastExit, server.phase == .crashed {
-                let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
-                parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
-            }
-            parts.append("log \(server.logPath)")
-            lines.append(parts.joined(separator: " · "))
-        }
-        lines.append(
-            "Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> \"text\" · devctl events --since 10m. All support --json.")
-        lines.append(
-            "While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it.")
-        lines.append("</devctl-servers>")
-        let text = lines.joined(separator: "\n")
-        return text.count > maxLength ? String(text.prefix(maxLength)) + "\n</devctl-servers>" : text
+        return AgentContext.render(list: list)
     }
 }
 

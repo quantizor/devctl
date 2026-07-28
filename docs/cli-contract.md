@@ -6,7 +6,7 @@ The JSON surface agents depend on. Every schema here is generated from the Codab
 
 Success: the command's result object on stdout. Failure with `--json`: `{"ok": false, "error": {"code", "message", "hint"}}` on stdout; `hint` is the literal remediation command when one exists.
 
-Stable `error.code` values: `config-invalid`, `daemon-unreachable`, `not-found`, `not-trusted`, `port-held`, `spawn-failed`, `usage`, `version-mismatch`. (Grows append-only.)
+Stable `error.code` values: `config-invalid`, `daemon-unreachable`, `internal-error`, `not-found`, `not-trusted`, `port-drift`, `port-held`, `resource-locked`, `spawn-failed`, `usage`, `version-mismatch`. (Grows append-only.)
 
 Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 3 daemon unreachable · 4 named server not found. Unnamed `status` in an unconfigured project exits 0 with `{"servers": []}`.
 
@@ -14,21 +14,31 @@ Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 
 
 ```jsonc
 {
-  "declaredPort": 3000,
+  "declaredPort": 3000,          // committed / ad-hoc declaration
+  "effectivePort": 3742,         // what this run binds (override, overlay, sibling rebind, or declared)
+  "errorSummary": { "count": 3, "firstAt": "…", "lastAt": "…" },  // stderr tally for the last run; present once it turns crashed/failed/unhealthy
+  "heads": { "admin": "http://admin.myproj.localhost:3742/" },    // multi-headed server: display name → URL (follows effective host/port)
   "healthcheck": "http",        // "http" | "tcp" | "none"
   "lastExit": { "at": "…", "code": 1, "signal": null },   // crashed only
   "lastHealthAt": "…",
   "logPath": "~/Library/Logs/devctl/myproj-a1b2c3d4/web/current.log",
-  "observedPort": 3000,          // from post-healthy listen scan; may differ from declared
+  "observedPort": 3742,          // from post-healthy listen scan; must match effectivePort or the server fails with port-drift
   "phase": "running",            // stopped|starting|running|unhealthy|stopping|crashed|failed
   "pid": 4242,
+  "portConflict": {              // present when a conflict was handled or is latent / fatal
+    "declaredPort": 3000,
+    "effectivePort": 3742,
+    "holder": "web@/Users/me/code/myproj",
+    "message": "port 3000 held by sibling; rebound to 3742",
+    "state": "rebound"           // "rebound" | "held" | "drift"
+  },
   "project": "/Users/me/code/myproj",
   "recentLogTail": ["…"],       // crashed/failed only
   "server": "web",
   "spawnError": { "errno": 2, "message": "…" },            // failed only
   "specStale": false,
   "uptimeSec": 123,
-  "url": "http://myproj.localhost:3000/"
+  "url": "http://worktree-review.myproj.localhost:3742/"
 }
 ```
 
@@ -39,9 +49,12 @@ Filled in per phase as each lands; golden tests reference the examples in this f
 - `devctl status [name] --json` → `{servers: [ServerStatus]}`. Named lookup that matches nothing exits 4 (`not-found`); unnamed always exits 0.
 - `devctl register --name N --cmd word --cmd word … [--port P] [--cwd D] --json` → `{server: ServerStatus}`. `--cmd` repeats per argv word and accepts dash-prefixed values.
 - `devctl start|stop <name> --json` → `{server: ServerStatus}`. `start` returns at spawn with `phase: "starting"`; health promotion to `running` follows (use `wait`/`ensure` to block). `stop` on an already-stopped server exits 0.
-- `devctl ensure <name> [--timeout 60] --json` → `{reason?, server}`. State matrix: healthy → no-op; starting → joins the in-flight attempt (single-flight, two concurrent ensures cannot double-spawn); unhealthy → no-op reporting the phase; stopped/crashed/failed → start and block until healthy. Fails fast the moment the phase turns crashed/failed. `reason: "crashed"|"failed"|"stopped"|"timeout"`; reason present ⇒ exit 1, with `lastExit`/`spawnError`/`recentLogTail` forensics in `server`.
+- `devctl ensure <name> [--port P] [--timeout 60] --json` → `{reason?, server}`. Optional `--port` overrides the committed port for this run (flows through the same effectivePort pipeline as sibling rebind and `devctl.local.json`). State matrix: healthy → no-op; starting → joins the in-flight attempt (single-flight, two concurrent ensures cannot double-spawn); unhealthy → no-op reporting the phase; stopped/crashed/failed → start and block until healthy. Fails fast the moment the phase turns crashed/failed. `reason: "crashed"|"failed"|"stopped"|"timeout"`; reason present ⇒ exit 1, with `lastExit`/`spawnError`/`recentLogTail` forensics in `server`. Sibling port conflict auto-rebinds and still returns ok with `server.portConflict.state: "rebound"`.
+- `devctl start <name> [--port P] --json` / `devctl up [--only a,b] [--port P] [--timeout 60] --json`: same optional `--port` override as ensure (applied to each started server under `up`).
 - `devctl wait <name> [--healthy|--stopped] [--timeout 60] --json` → `{reason?, server}`. `--healthy` (default) rides through non-terminal transitions (another session's restart) and fails fast on crashed/failed/stopped; `--stopped` resolves on stopped/crashed/failed.
-- Port pre-check on `start`/`ensure`: a declared port held by a managed server elsewhere → `port-held` naming that server and project; held by an unmanaged listener → `port-held` with pid + command when lsof can name it. Runs only when the target is not already up, so a server never conflicts with its own listener.
+- Port pre-check on every start-shaped path (`start`, `ensure`, `up`, `switch`, a lock resume, boot recovery): resolves `effectivePort` first. Held by a managed sibling (same git common-dir) → auto-rebind to a free port and continue (status carries `portConflict.state: "rebound"`). Held by an unrelated managed server → `port-held` naming that server and project. Held by an unmanaged listener → `port-held` with pid + command when lsof can name it. After first-healthy, if `observedPort != effectivePort` → `port-drift` (Vite silent bump is not healthy). The managed-holder scan sees both live supervisors and holders recorded in state whose pid is still alive. The listener probe tries both loopback families. Runs only when the target is not already up. Under `up`/`switch` an unhandled held port fails the whole rollout with `port-held`.
+- `devctl.local.json` (project root, gitignored by convention): partial per-server overlay merged after committed `devservers.json` (port, command, env, url, host, heads). Never committed.
+- `errorSummary` is devctl's own count of the last run's stderr lines with the first and last timestamps, captured when a server turns crashed, failed, or unhealthy. It is arithmetic over the log, never the lines themselves, so the session-context hook can surface that errors piled up without emitting attacker-influenceable child output; the agent reads the actual lines with `devctl why`.
 - Healthchecks: explicit `healthcheck` block wins; else a declared `port` implies a TCP probe; else healthy = alive past a 2s stabilization window. `ServerStatus.healthcheck` says which (`"http"|"tcp"|"none"`) so agents know when `running` is unverified. `unhealthyAfter` applies only after first-healthy: a slow boot stays `starting`.
 - `devctl logs <name> [--follow] [--tail N] [--since 5m|ISO] [--since-mark <id>] [--grep RE] [--stream out|err|sys|mark] --json` → one `{at, stream, text}` object per line on stdout. `--grep` is the Swift Regex dialect. `--follow` polls incrementally (restart-safe). Structured lines are sanitized: ANSI/OSC escapes stripped, NULs removed, CR spinner rewrites collapsed to the final frame; timestamps are per-file monotonic.
 - `devctl mark <name> <text> [--label L] --json` (or `--all <text>`) → `{marks: [{at, id, server}]}`. The id feeds `--since-mark` on `logs` and `events`, so no clock agreement is needed. Marks flow through the same append path as process output; ordering is exact.
@@ -56,8 +69,8 @@ Filled in per phase as each lands; golden tests reference the examples in this f
 - `devctl doctor [--fix] --json` → `{findings: [{detail, kind, severity}]}`: daemon/launchd state, captured-PATH staleness, the host:port signature table with conflicts, unmanaged listeners on managed ports, and registry entries whose project path no longer exists (`--fix` prunes those).
 - `devctl switch <branch> [--no-fetch] [--timeout 120]` → clean-tree guard (refuses dirty; never stashes), fetch, group down, `git switch` (remote-tracking fallback), then the project's `lifecycle.switch` playbook (argv arrays run sequentially from the project root; failures stop with `devctl up` as the resume hint), then group up. Playbooks live in devservers.json `lifecycle` and are agent-configurable.
 - Config extras: project-level `icon` (project-relative path, per-server override) feeds Spotlight thumbnails; every server and head is indexed in Spotlight as `<project> · <head>` with subtitle `devctl · <url>` (best-effort; not a Top Hit launcher); `heads` and pins surface in the menu bar app.
-- `devctl lock <resource> -- <command…> [--acquire-timeout 300] [--timeout 120]` → runs the command holding a project resource exclusively. The daemon pauses servers that declare the resource in their `locks` (devservers.json) and re-ensures them on release (even on command failure); `ensure`/`start` of a declaring server is refused (`resource-locked`, naming the holder pid) while a live holder owns it. Locks persist across a daemon crash: a dead holder auto-releases and resumes the paused set; a still-live holder keeps them paused so the harness stays exclusive. Exit status is the command's. The mechanism for test harnesses whose private servers share mutable state (a local database) with a managed server.
+- `devctl lock <resource> [--no-pause] [--acquire-timeout 300] [--timeout 120] -- <command…>` → runs the command holding a project resource exclusively. By default the daemon pauses servers that declare the resource in their `locks` (devservers.json) and re-ensures them on release (even on command failure). `--no-pause` takes the mutex without stopping declarers (for harnesses that reuse the live server). `ensure`/`start` of a declaring server is refused (`resource-locked`, naming the holder pid) while a live holder owns it, regardless of `--no-pause`. Locks are path-scoped (`canonicalPath::resource`); they do not pause other checkouts. Locks persist across a daemon crash: a dead holder auto-releases and resumes the paused set; a still-live holder keeps them paused so the harness stays exclusive. Exit status is the command's.
+- `devctl context`: the harness-agnostic session context: a fenced `<devctl-servers>` plain-text block (server phases, effective URLs, log paths, latent/rebound port-conflict warnings, the ensure/wait/why/logs/lock cheat-sheet) for the cwd's project. Linked worktrees get a banner naming the preferred host. Silent (exit 0) when the project is unregistered or untrusted or the daemon is down; never bootstraps; never contains raw log lines or command strings.
 - `devctl daemon install|uninstall [--purge]|start|stop|restart|status`: launchd lifecycle. `stop` drains and writes a deliberate-stop marker that auto-bootstrap honors; `restart` and `install` (upgrade) both capture running servers, bounce the daemon, and re-ensure them by name ("servers bounce, then come back"). `install` also stages-and-renames the daemon binary and captures the login-shell PATH into the agent plist. Reboot recovery: the LaunchAgent runs at load; starting a server records resume-on-boot; a machine shutdown drains without clearing it; `recoverAtStartup` resolves specs through the merged config+registry view (so committed `devservers.json` servers come back, not only ad-hoc `register` entries). A deliberate `devctl stop`/`down` clears the intent. Renamed or deleted servers leave orphan state rows that recover drops.
-- `devctl context`: the harness-agnostic session context: a fenced `<devctl-servers>` plain-text block (server phases, URLs, log paths, the ensure/wait/why/logs cheat-sheet) for the cwd's project. Silent (exit 0) when the project is unregistered or untrusted or the daemon is down; never bootstraps; never contains raw log lines or command strings.
 - `devctl hook install [--harness claude|cursor] [--statusline]`: idempotently wires a session-start hook into the harness's settings (claude: SessionStart with matcher `startup|resume|clear|compact` in ~/.claude/settings.json, emitting `hookSpecificOutput.additionalContext`; cursor: sessionStart in ~/.cursor/hooks.json, emitting `{additional_context}`). After a successful install it also prints a one-bullet discovery tip for the project's CLAUDE.md/AGENTS.md (wired to the nearest devservers.json's first server when one exists); the tip is printed for a human to paste and is never auto-appended to those files. Adding a harness: CONTRIBUTING.md.
 - `devctl statusline`: reads harness statusline stdin JSON (workspace.current_dir or cwd), prints `myproj:3000 ok · api crashed` for the project, empty otherwise.

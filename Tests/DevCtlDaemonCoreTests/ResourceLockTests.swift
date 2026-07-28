@@ -135,7 +135,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         probe.waitUntilExit()
         let deadPid = Int(probe.processIdentifier)
         #expect(kill(pid_t(deadPid), 0) != 0)
-        let key = "\(env.projectPath)::data"
+        let key = "\(canonicalProjectPath(env.projectPath))::data"
         try AtomicFile.write(
             JSONCoding.encoder().encode(
                 LocksFile(
@@ -171,7 +171,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             entry.pid = nil
         }
         let livePid = Int(getpid())
-        let key = "\(env.projectPath)::data"
+        let key = "\(canonicalProjectPath(env.projectPath))::data"
         try AtomicFile.write(
             JSONCoding.encoder().encode(
                 LocksFile(
@@ -202,6 +202,32 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: LockResult.self)
         let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
         #expect(phase == .starting || phase == .running)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
+    @Test func noPauseLeavesDeclarerRunning() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try await startDB(router: router, project: env.projectPath)
+        let acquired = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(
+                holderPid: Int(getpid()), pause: false, project: env.projectPath, resource: "data"),
+            expecting: LockResult.self)
+        #expect(acquired.paused.isEmpty)
+        let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(phase == .starting || phase == .running)
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: Int(getpid()), pause: false, project: env.projectPath, resource: "data"),
+            expecting: LockResult.self)
         _ = try await handle(
             router: router, method: .serverStop,
             params: ServerTargetParams(name: "db", project: env.projectPath),

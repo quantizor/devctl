@@ -27,6 +27,13 @@ public struct LogRecord: Codable, Equatable, Sendable {
         "\(JSONCoding.formatISO8601(at))\t\(stream.rawValue)\t\(text)"
     }
 
+    /** Stream-tagged payload for a human or an agent reading a tail: the shared
+        spelling behind `devctl why` evidence and `recentLogTail`, which used to
+        prefix it two different ways. */
+    public var contextLine: String {
+        "\(stream.rawValue): \(text)"
+    }
+
     public static func parse(_ line: Substring) -> LogRecord? {
         let firstTab = line.firstIndex(of: "\t")
         guard let firstTab else { return nil }

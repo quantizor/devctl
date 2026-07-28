@@ -97,6 +97,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         serving several surfaces on one port): display name -> URL. */
     public var heads: [String: String]?
     public var healthcheck: HealthCheckSpec?
+    /** Resolved server host (committed, worktree-derived, or overlay). Kept on
+        the spec so port materialization can rebuild urls without re-reading
+        the project file. Optional so older ad-hoc registry entries keep parsing. */
+    public var host: String?
     /** Absolute path to an icon image (resolved from the config's
         project-relative path); used for Spotlight thumbnails. */
     public var icon: String?
@@ -107,6 +111,8 @@ public struct ServerSpec: Codable, Equatable, Sendable {
     public var locks: [String]?
     public var name: String
     public var port: Int?
+    /** Child env var that receives the effective port (default `PORT`). */
+    public var portEnv: String?
     /** Runs the command through `/bin/zsh -lc` for shells that need login env (nvm/mise). */
     public var shell: Bool?
     public var url: String?
@@ -119,10 +125,12 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         env: [String: String]? = nil,
         heads: [String: String]? = nil,
         healthcheck: HealthCheckSpec? = nil,
+        host: String? = nil,
         icon: String? = nil,
         locks: [String]? = nil,
         name: String,
         port: Int? = nil,
+        portEnv: String? = nil,
         shell: Bool? = nil,
         url: String? = nil,
         waitFor: WaitTarget? = nil
@@ -133,10 +141,12 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         self.env = env
         self.heads = heads
         self.healthcheck = healthcheck
+        self.host = host
         self.icon = icon
         self.locks = locks
         self.name = name
         self.port = port
+        self.portEnv = portEnv
         self.shell = shell
         self.url = url
         self.waitFor = waitFor
@@ -167,9 +177,27 @@ public struct SpawnError: Codable, Equatable, Sendable {
     }
 }
 
+/** Counted, never quoted: what devctl observed on a server's error stream during
+    the current process's life. Every field is devctl's own arithmetic over the
+    log, which is what makes it safe to put in an agent's session context where a
+    child's own bytes must never go. */
+public struct ErrorSummary: Codable, Equatable, Sendable {
+    public var count: Int
+    public var firstAt: Date
+    public var lastAt: Date
+
+    public init(count: Int, firstAt: Date, lastAt: Date) {
+        self.count = count
+        self.firstAt = firstAt
+        self.lastAt = lastAt
+    }
+}
+
 /** The core status schema agents consume; documented in docs/cli-contract.md. */
 public struct ServerStatus: Codable, Equatable, Sendable {
     public var declaredPort: Int?
+    public var effectivePort: Int?
+    public var errorSummary: ErrorSummary?
     public var heads: [String: String]?
     public var healthcheck: HealthCheckType
     public var icon: String?
@@ -179,6 +207,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var observedPort: Int?
     public var phase: ServerPhase
     public var pid: Int?
+    public var portConflict: PortConflict?
     public var project: String
     public var recentLogTail: [String]?
     public var server: String
@@ -189,6 +218,8 @@ public struct ServerStatus: Codable, Equatable, Sendable {
 
     public init(
         declaredPort: Int? = nil,
+        effectivePort: Int? = nil,
+        errorSummary: ErrorSummary? = nil,
         heads: [String: String]? = nil,
         healthcheck: HealthCheckType = .none,
         icon: String? = nil,
@@ -198,6 +229,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         observedPort: Int? = nil,
         phase: ServerPhase,
         pid: Int? = nil,
+        portConflict: PortConflict? = nil,
         project: String,
         recentLogTail: [String]? = nil,
         server: String,
@@ -207,6 +239,8 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         url: String? = nil
     ) {
         self.declaredPort = declaredPort
+        self.effectivePort = effectivePort
+        self.errorSummary = errorSummary
         self.heads = heads
         self.healthcheck = healthcheck
         self.icon = icon
@@ -216,6 +250,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.observedPort = observedPort
         self.phase = phase
         self.pid = pid
+        self.portConflict = portConflict
         self.project = project
         self.recentLogTail = recentLogTail
         self.server = server
