@@ -304,10 +304,16 @@ public actor Router {
                     target: request.params.name,
                     statuses: statuses,
                     specs: specsByName,
-                    errTail: { server in
-                        LogQuery.run(
+                    evidenceLines: { server in
+                        let since =
+                            statuses[server]?.lastExit?.at
+                            ?? statuses[server]?.uptimeSec.map {
+                                Date().addingTimeInterval(TimeInterval(-$0))
+                            }
+                        return LogQuery.run(
                             current: paths.structuredLogFile(project: project, server: server),
-                            options: LogQueryOptions(streams: [.err], tail: 5)
+                            options: LogQueryOptions(
+                                since: since, streams: [.err, .out, .sys], tail: 40)
                         ).map(\.contextLine)
                     })
                 return try respond(id: head.id, result: result)
@@ -673,62 +679,119 @@ public actor Router {
         var conflict: PortConflict?
         if let port = effective {
             let targetID = id
-            if let holder = await managedHolder(port: port, excluding: targetID) {
-                if CheckoutIdentity.shareCommonDir(target.project, holder.project) {
+            let draft = PortClaim.resolve(spec: spec, effectivePort: port)
+            guard let draftClaim = draft.claim, draft.error == nil else {
+                throw WireError(
+                    code: .configInvalid, hint: "run: devctl config check",
+                    message: draft.error ?? "invalid port claim")
+            }
+            if let busy = await firstBusyPort(in: draftClaim, excluding: targetID) {
+                let holder = await managedHolder(port: busy.port, excluding: targetID)
+                if let holder, CheckoutIdentity.shareCommonDir(target.project, holder.project),
+                    draftClaim.relative.contains(busy.port)
+                {
                     let rebound = await allocateSiblingPort(
-                        declared: declaredPort ?? port, project: target.project, excluding: targetID)
+                        declared: declaredPort ?? port, excluding: targetID, project: target.project,
+                        spec: spec)
                     conflict = PortConflict(
                         declaredPort: declaredPort ?? port,
                         effectivePort: rebound,
                         holder: "\(holder.server)@\(holder.project)",
                         message:
-                            "port \(port) held by sibling '\(holder.server)' in \(holder.project); rebound to \(rebound)",
+                            "port \(busy.port) held by sibling '\(holder.server)' in \(holder.project); rebound to \(rebound)",
                         state: .rebound)
                     effective = rebound
                     try? await registry.updateState(serverID: id) { $0.boundPort = rebound }
-                } else {
+                } else if let holder {
                     DevCtlLog.daemon.error(
-                        "port-held \(port) by \(holder.server)@\(holder.project) for \(target.name)")
+                        "port-held \(busy.port) by \(holder.server)@\(holder.project) for \(target.name)")
                     throw WireError(
                         code: .portHeld,
                         hint: "run: devctl stop \(holder.server) --project \(holder.project)",
                         message:
-                            "port \(port) is held by managed server '\(holder.server)' in \(holder.project)"
+                            "port \(busy.port) is held by managed server '\(holder.server)' in \(holder.project)"
                     )
-                }
-            } else if PortGuard.isListening(port: port) {
-                if let squatter = PortGuard.listenerInfo(port: port) {
+                } else if let squatter = PortGuard.listenerInfo(port: busy.port) {
                     throw WireError(
                         code: .portHeld,
                         hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
                         message:
-                            "port \(port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                            "port \(busy.port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                    )
+                } else {
+                    throw WireError(
+                        code: .portHeld,
+                        message: "port \(busy.port) already has a listener that devctl does not manage"
                     )
                 }
-                throw WireError(
-                    code: .portHeld,
-                    message: "port \(port) already has a listener that devctl does not manage"
-                )
             }
+        }
+        let resolved = PortClaim.resolve(spec: spec, effectivePort: effective)
+        guard let claim = resolved.claim, resolved.error == nil else {
+            throw WireError(
+                code: .configInvalid, hint: "run: devctl config check",
+                message: resolved.error ?? "invalid port claim")
+        }
+        if let busy = await firstBusyPort(in: claim, excluding: id) {
+            throw WireError(
+                code: .portHeld,
+                message: "port \(busy.port) is still busy after rebind resolution")
         }
         let materialized = PortMaterializer.materialize(
             spec: spec, effectivePort: effective, effectiveHost: spec.host, matchHost: matchHost)
         await supervisor.updateSpec(materialized)
         await supervisor.setPortMeta(
-            declaredPort: declaredPort, effectivePort: effective, portConflict: conflict)
+            claim: claim, declaredPort: declaredPort, effectivePort: effective,
+            portConflict: conflict)
     }
 
-    private func allocateSiblingPort(declared: Int, project: String, excluding: String) async -> Int {
+    /** First claimed port that is held (managed or unmanaged). Absolutes and
+        relatives are treated the same for freeness; only sibling rebind cares
+        which set a conflict came from. */
+    private func firstBusyPort(in claim: PortClaim, excluding targetID: String) async -> (
+        port: Int, managed: Bool
+    )? {
+        for port in claim.allPorts {
+            if await managedHolder(port: port, excluding: targetID) != nil {
+                return (port: port, managed: true)
+            }
+            if PortGuard.isListening(port: port) {
+                return (port: port, managed: false)
+            }
+        }
+        return nil
+    }
+
+    private func allocateSiblingPort(
+        declared: Int, excluding: String, project: String, spec: ServerSpec
+    ) async -> Int {
         var candidate = CheckoutIdentity.siblingPortCandidate(declared: declared, project: project)
         for _ in 0..<200 {
-            let held = await managedHolder(port: candidate, excluding: excluding) != nil
-            if !held, !PortGuard.isListening(port: candidate) {
+            let resolved = PortClaim.resolve(spec: spec, effectivePort: candidate)
+            if let claim = resolved.claim, resolved.error == nil,
+                await firstBusyPort(in: claim, excluding: excluding) == nil
+            {
                 return candidate
             }
             candidate += 1
             if candidate > 65_000 { candidate = 10_000 }
         }
         return candidate
+    }
+
+    /** Wait until every claimed port is free, or return the first still-busy port. */
+    private func waitForClaimFree(claim: PortClaim, budgetSeconds: Double = 2) async -> Int? {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
+        while true {
+            var busy: Int?
+            for port in claim.allPorts where PortGuard.isListening(port: port) {
+                busy = port
+                break
+            }
+            if busy == nil { return nil }
+            if ContinuousClock.now >= deadline { return busy }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     private func takenHosts() async -> Set<String> {
@@ -762,6 +825,7 @@ public actor Router {
             if active,
                 status.effectivePort == port || status.declaredPort == port
                     || status.observedPort == port
+                    || (status.ports?.values.contains(port) ?? false)
             {
                 return (project: status.project, server: status.server)
             }
@@ -781,6 +845,10 @@ public actor Router {
                 let spec = merged.specs.first(where: { $0.name == name })
             else { continue }
             let bound = persisted.boundPort ?? spec.port
+            let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
+            if let claim = resolved.claim, claim.allPorts.contains(port) {
+                return (project: project, server: name)
+            }
             guard bound == port else { continue }
             return (project: project, server: name)
         }
@@ -936,8 +1004,14 @@ public actor Router {
                 let merged = try await mergedSpecs(project: project)
                 guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
                 let supervisor = await supervisor(project: project, spec: spec)
-                /** Something else may have taken the port during the pause, so a
-                    resume is a start like any other and can be refused. */
+                let id = serverID(project: project, name: name)
+                let bound = await registry.persistedState(serverID: id)?.boundPort ?? spec.port
+                let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
+                if let claim = resolved.claim, let busy = await waitForClaimFree(claim: claim) {
+                    DevCtlLog.daemon.error(
+                        "lock \(resource) resume refused \(name)@\(project): port \(busy) still busy")
+                    continue
+                }
                 try await prepareSpawn(
                     target: ServerTargetParams(name: name, project: project), supervisor: supervisor)
                 _ = await supervisor.ensure(timeoutSeconds: timeoutSeconds)

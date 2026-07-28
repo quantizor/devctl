@@ -20,6 +20,8 @@ public struct LocalOverlayServer: Codable, Equatable, Sendable {
     public var host: String?
     public var port: Int?
     public var portEnv: String?
+    public var ports: [String: SecondaryPort]?
+    public var portSpan: Int?
     public var shell: Bool?
     public var url: String?
 
@@ -32,6 +34,8 @@ public struct LocalOverlayServer: Codable, Equatable, Sendable {
         host: String? = nil,
         port: Int? = nil,
         portEnv: String? = nil,
+        ports: [String: SecondaryPort]? = nil,
+        portSpan: Int? = nil,
         shell: Bool? = nil,
         url: String? = nil
     ) {
@@ -43,6 +47,8 @@ public struct LocalOverlayServer: Codable, Equatable, Sendable {
         self.host = host
         self.port = port
         self.portEnv = portEnv
+        self.ports = ports
+        self.portSpan = portSpan
         self.shell = shell
         self.url = url
     }
@@ -75,6 +81,8 @@ public enum LocalOverlay {
         if let host = overlay.host { next.host = host }
         if let port = overlay.port { next.port = port }
         if let portEnv = overlay.portEnv { next.portEnv = portEnv }
+        if let ports = overlay.ports { next.ports = ports }
+        if let portSpan = overlay.portSpan { next.portSpan = portSpan }
         if let shell = overlay.shell { next.shell = shell }
         if let url = overlay.url {
             next.url = url

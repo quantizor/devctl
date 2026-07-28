@@ -27,10 +27,13 @@ public actor ServerSupervisor {
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
     private let launcher: any ProcessLauncher
+    /** Resolved named secondaries for this run (status.ports). */
+    private var namedPorts: [String: Int]?
     private var observedPort: Int?
     private let paths: DevCtlPaths
     private var phase: ServerPhase = .stopped
     private var pid: pid_t?
+    private var portClaim: PortClaim?
     private var portConflict: PortConflict?
     private let prober: any HealthProber
     /** Captured when the phase turns terminal, not recomputed per status call:
@@ -48,6 +51,8 @@ public actor ServerSupervisor {
     /** Carries the stop()'s intent into recordOutcome: deliberate clears the
         resume-on-boot flag, a launchd drain keeps it. */
     private var stopWasDeliberate = true
+    /** Durable why evidence across ensure truncate / daemon rehydrate. */
+    private var terminalEvidence: [String]?
 
     public init(
         events: EventStore? = nil,
@@ -74,6 +79,7 @@ public actor ServerSupervisor {
             self.errorSummary = persisted.errorSummary
             self.lastExit = persisted.lastExit
             self.spawnError = persisted.spawnError
+            self.terminalEvidence = persisted.terminalEvidence
             if persisted.phase == .crashed || persisted.phase == .failed {
                 self.phase = persisted.phase
             }
@@ -86,10 +92,13 @@ public actor ServerSupervisor {
 
     /** Port metadata for status/agents. Call after materializing the spawn spec. */
     public func setPortMeta(
+        claim: PortClaim? = nil,
         declaredPort: Int?, effectivePort: Int?, portConflict: PortConflict? = nil
     ) {
         self.declaredPort = declaredPort
         self.effectivePort = effectivePort
+        self.portClaim = claim
+        self.namedPorts = claim.flatMap { $0.named.isEmpty ? nil : $0.named }
         self.portConflict = portConflict
     }
 
@@ -117,6 +126,7 @@ public actor ServerSupervisor {
         stopRequested = false
         spawnError = nil
         errorSummary = nil
+        terminalEvidence = nil
         everHealthy = false
         observedPort = nil
         recentLogTail = nil
@@ -282,6 +292,7 @@ public actor ServerSupervisor {
             (only errorSummary is persisted), so fall back to a live read there,
             which matches the pre-capture behavior for that narrow case. */
         let tail = terminal ? (recentLogTail ?? spoolTail()) : nil
+        let evidence = terminal ? (terminalEvidence ?? tail) : nil
         return ServerStatus(
             declaredPort: declaredPort ?? spec.port,
             effectivePort: effectivePort ?? spec.port,
@@ -296,11 +307,13 @@ public actor ServerSupervisor {
             phase: phase,
             pid: pid.map(Int.init),
             portConflict: portConflict,
+            ports: namedPorts,
             project: projectPath,
             recentLogTail: tail,
             server: spec.name,
             spawnError: spawnError,
             specStale: specStaleFlag(),
+            terminalEvidence: evidence,
             uptimeSec: startedAt.map { Int(Date().timeIntervalSince($0)) },
             url: spec.url
         )
@@ -392,16 +405,25 @@ public actor ServerSupervisor {
     private func recordObservedPort(ports: [Int]) async {
         guard !ports.isEmpty else { return }
         let expected = effectivePort ?? spec.port
+        let claimPorts = Set(portClaim?.allPorts ?? expected.map { [$0] } ?? [])
         if let expected, ports.contains(expected) {
             observedPort = expected
+        } else if let claimed = ports.first(where: { claimPorts.contains($0) }) {
+            observedPort = claimed
         } else {
             observedPort = ports.first
         }
-        /** Strict bind: a managed server that listened elsewhere than effectivePort
-            (Vite silent bump) is not healthy. Fail closed with port-drift metadata. */
-        guard let expected, let observed = observedPort, observed != expected,
+        /** Strict bind: primary must match. Listeners on claimed secondaries are
+            expected for composites; anything outside the claim is drift. */
+        guard let expected, let observed = observedPort,
             phase == .running || phase == .starting
         else { return }
+        if observed == expected || claimPorts.contains(observed) {
+            if observed == expected { return }
+            /** Secondary claimed port observed without primary: still require primary. */
+            if ports.contains(expected) { return }
+        }
+        guard observed != expected else { return }
         portConflict = PortConflict(
             declaredPort: declaredPort ?? expected,
             effectivePort: expected,
@@ -412,6 +434,7 @@ public actor ServerSupervisor {
         spawnError = SpawnError(message: "port drift: expected \(expected), observed \(observed)")
         errorSummary = captureErrorSummary(since: startedAt)
         recentLogTail = spoolTail()
+        terminalEvidence = recentLogTail
         healthTask?.cancel()
         DevCtlLog.supervisor.error(
             "port-drift \(spec.name)@\(projectPath) expected \(expected) observed \(observed)")
@@ -421,10 +444,12 @@ public actor ServerSupervisor {
         let id = serverID(project: projectPath, name: spec.name)
         let summary = errorSummary
         let err = spawnError
+        let evidence = terminalEvidence
         await registryUpdate(id: id) { entry in
             entry.errorSummary = summary
             entry.phase = .failed
             entry.spawnError = err
+            entry.terminalEvidence = evidence
         }
     }
 
@@ -516,11 +541,14 @@ public actor ServerSupervisor {
         healthTask?.cancel()
         healthTask = nil
         recentLogTail = spoolTail()
+        terminalEvidence = recentLogTail
+        let evidence = terminalEvidence
         await registryUpdate(id: id) { entry in
             entry.phase = .failed
             entry.pid = nil
             entry.spawnError = error
             entry.startedAt = nil
+            entry.terminalEvidence = evidence
         }
         settleSpawnWaiters()
     }
@@ -546,6 +574,7 @@ public actor ServerSupervisor {
         /** After the final drain, so the lines that explain the exit are in the
             log before the snapshots are taken. */
         recentLogTail = spoolTail()
+        terminalEvidence = recentLogTail
         errorSummary = captureErrorSummary(since: windowStart)
         pid = nil
         startedAt = nil
@@ -563,6 +592,8 @@ public actor ServerSupervisor {
             kind: finalPhase == .stopped ? .stopped : .crashed,
             project: projectPath, server: spec.name, detail: cause)
         let errors = errorSummary
+        let evidence = finalPhase == .stopped ? nil : terminalEvidence
+        if finalPhase == .stopped { terminalEvidence = nil }
         await registryUpdate(id: id) { entry in
             entry.errorSummary = errors
             entry.lastExit = exit
@@ -570,6 +601,7 @@ public actor ServerSupervisor {
             entry.pid = nil
             if retireIntent { entry.resumeOnBoot = nil }
             entry.startedAt = nil
+            entry.terminalEvidence = evidence
         }
         settleSpawnWaiters()
     }

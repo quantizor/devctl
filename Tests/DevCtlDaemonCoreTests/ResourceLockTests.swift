@@ -66,7 +66,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     return server.phase
 }
 
-@Suite struct ResourceLockTests {
+@Suite(.serialized) struct ResourceLockTests {
     /** Acquire pauses the declaring server, refuses ensure, release brings it
         back. Pause is non-retiring so boot intent survives the hold. */
     @Test func acquirePausesReleaseResumesAndPreservesBootIntent() async throws {
@@ -233,4 +233,154 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             params: ServerTargetParams(name: "db", project: env.projectPath),
             expecting: ServerResult.self)
     }
+
+    /** Experiment L: rapid pause/resume must not leave the declarer in
+        `crashed`. Classifies L1/L2/L3 via phase + lastExit after each cycle. */
+    @Test func rapidAcquireReleaseNeverLeavesCrashed() async throws {
+        let fixture = try #require(fixtureServerPath())
+        let env = try makeLockEnv()
+        let port = 41_000 + Int.random(in: 0..<500)
+        let body = """
+        {
+          "servers": {
+            "db": {
+              "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+              "healthcheck": { "type": "tcp", "port": \(port) },
+              "locks": ["data"],
+              "port": \(port)
+            }
+          },
+          "version": 1
+        }
+        """
+        try Data(body.utf8).write(
+            to: URL(fileURLWithPath: env.projectPath).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await handle(
+            router: router, method: .serverEnsure,
+            params: EnsureParams(name: "db", project: env.projectPath, timeoutSeconds: 10),
+            expecting: EnsureResult.self)
+        var crashCount = 0
+        var lastCrashDetail = ""
+        for cycle in 0..<20 {
+            let holder = Int(getpid())
+            _ = try await handle(
+                router: router, method: .lockAcquire,
+                params: LockParams(
+                    holderPid: holder, project: env.projectPath, resource: "data",
+                    resumeTimeoutSeconds: 15),
+                expecting: LockResult.self)
+            #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") == .stopped)
+            _ = try await handle(
+                router: router, method: .lockRelease,
+                params: LockParams(
+                    holderPid: holder, project: env.projectPath, resource: "data",
+                    resumeTimeoutSeconds: 15),
+                expecting: LockResult.self)
+            let list = try await handle(
+                router: router, method: .serverStatus,
+                params: ProjectParams(project: env.projectPath),
+                expecting: ServerListResult.self)
+            let server = try #require(list.servers.first { $0.server == "db" })
+            if server.phase == .crashed {
+                crashCount += 1
+                lastCrashDetail =
+                    "cycle \(cycle) pid=\(server.pid.map(String.init) ?? "nil") exit=\(String(describing: server.lastExit))"
+            }
+            if server.phase == .starting || server.phase == .running {
+                _ = try await handle(
+                    router: router, method: .serverEnsure,
+                    params: EnsureParams(
+                        name: "db", project: env.projectPath, timeoutSeconds: 10),
+                    expecting: EnsureResult.self)
+            }
+        }
+        let final = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(crashCount == 0, "\(lastCrashDetail)")
+        #expect(final == .running || final == .starting)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
+    /** Experiment L with a grandchild that can outlive a naive root-only stop. */
+    @Test func rapidAcquireReleaseWithGrandchildNeverLeavesCrashed() async throws {
+        let fixture = try #require(fixtureServerPath())
+        let env = try makeLockEnv()
+        let port = 42_000 + Int.random(in: 0..<500)
+        let body = """
+        {
+          "servers": {
+            "db": {
+              "command": ["\(fixture)", "--listen-tcp", "\(port)", "--spawn-grandchild"],
+              "healthcheck": { "type": "tcp", "port": \(port) },
+              "locks": ["data"],
+              "port": \(port)
+            }
+          },
+          "version": 1
+        }
+        """
+        try Data(body.utf8).write(
+            to: URL(fileURLWithPath: env.projectPath).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await handle(
+            router: router, method: .serverEnsure,
+            params: EnsureParams(name: "db", project: env.projectPath, timeoutSeconds: 10),
+            expecting: EnsureResult.self)
+        var crashCount = 0
+        for _ in 0..<12 {
+            let holder = Int(getpid())
+            _ = try await handle(
+                router: router, method: .lockAcquire,
+                params: LockParams(
+                    holderPid: holder, project: env.projectPath, resource: "data",
+                    resumeTimeoutSeconds: 15),
+                expecting: LockResult.self)
+            _ = try await handle(
+                router: router, method: .lockRelease,
+                params: LockParams(
+                    holderPid: holder, project: env.projectPath, resource: "data",
+                    resumeTimeoutSeconds: 15),
+                expecting: LockResult.self)
+            let list = try await handle(
+                router: router, method: .serverStatus,
+                params: ProjectParams(project: env.projectPath),
+                expecting: ServerListResult.self)
+            let server = try #require(list.servers.first { $0.server == "db" })
+            if server.phase == .crashed { crashCount += 1 }
+            if server.phase == .starting || server.phase == .running || server.phase == .crashed
+                || server.phase == .stopped
+            {
+                _ = try? await handle(
+                    router: router, method: .serverEnsure,
+                    params: EnsureParams(
+                        name: "db", project: env.projectPath, timeoutSeconds: 10),
+                    expecting: EnsureResult.self)
+            }
+        }
+        #expect(crashCount == 0)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+}
+
+private func fixtureServerPath() -> String? {
+    let candidates = [
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: ".build/debug/fixture-server"),
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/debug/fixture-server"),
+    ]
+    return candidates.map(\.path).first { FileManager.default.isExecutableFile(atPath: $0) }
 }

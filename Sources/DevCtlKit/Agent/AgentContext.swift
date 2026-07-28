@@ -83,6 +83,12 @@ public enum AgentContext {
         if let port = server.effectivePort ?? server.observedPort ?? server.declaredPort {
             parts.append("port \(port)")
         }
+        if let ports = server.ports, !ports.isEmpty {
+            let rendered = ports.sorted { $0.key < $1.key }
+                .map { "\($0.key) \($0.value)" }
+                .joined(separator: ", ")
+            parts.append("ports: \(rendered)")
+        }
         if let conflict = server.portConflict, conflict.state == .rebound {
             parts.append("rebinding: worktree checkout, not the main origin")
         }

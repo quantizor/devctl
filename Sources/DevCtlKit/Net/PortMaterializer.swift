@@ -16,8 +16,23 @@ public enum PortMaterializer {
         var next = spec
         let host = effectiveHost ?? spec.host
         if let host { next.host = host }
+        let resolved = PortClaim.resolve(spec: spec, effectivePort: effectivePort)
+        let claim =
+            resolved.claim
+            ?? PortClaim(primary: effectivePort, relative: effectivePort.map { [$0] } ?? [])
         if let effectivePort {
             next.port = effectivePort
+        }
+        if !claim.injections.isEmpty {
+            var env = next.env ?? [:]
+            for (key, value) in claim.injections {
+                env[key] = String(value)
+            }
+            if let host {
+                env["DEVCTL_HOST"] = host
+            }
+            next.env = env
+        } else if let effectivePort {
             let envKey = spec.portEnv ?? "PORT"
             var env = next.env ?? [:]
             env[envKey] = String(effectivePort)

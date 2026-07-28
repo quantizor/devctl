@@ -43,6 +43,9 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
     public var icon: String?
     public var locks: [String]?
     public var port: Int?
+    public var portEnv: String?
+    public var ports: [String: SecondaryPort]?
+    public var portSpan: Int?
     public var shell: Bool?
     public var url: String?
     public var waitFor: WaitTarget?
@@ -58,6 +61,9 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
         icon: String? = nil,
         locks: [String]? = nil,
         port: Int? = nil,
+        portEnv: String? = nil,
+        ports: [String: SecondaryPort]? = nil,
+        portSpan: Int? = nil,
         shell: Bool? = nil,
         url: String? = nil,
         waitFor: WaitTarget? = nil
@@ -72,6 +78,9 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
         self.icon = icon
         self.locks = locks
         self.port = port
+        self.portEnv = portEnv
+        self.ports = ports
+        self.portSpan = portSpan
         self.shell = shell
         self.url = url
         self.waitFor = waitFor
@@ -168,23 +177,27 @@ public enum ProjectConfigLoader {
             for dep in entry.dependsOn ?? [] where config.servers[dep] == nil {
                 view.errors.append("server '\(name)' depends on unknown server '\(dep)'")
             }
-            specs.append(
-                ServerSpec(
-                    command: entry.command,
-                    cwd: entry.cwd,
-                    dependsOn: entry.dependsOn,
-                    env: entry.env,
-                    heads: entry.heads,
-                    healthcheck: entry.healthcheck,
-                    host: serverHost,
-                    icon: iconPath,
-                    locks: entry.locks,
-                    name: name,
-                    port: entry.port,
-                    shell: entry.shell,
-                    url: url,
-                    waitFor: entry.waitFor
-                ))
+            let draft = ServerSpec(
+                command: entry.command,
+                cwd: entry.cwd,
+                dependsOn: entry.dependsOn,
+                env: entry.env,
+                heads: entry.heads,
+                healthcheck: entry.healthcheck,
+                host: serverHost,
+                icon: iconPath,
+                locks: entry.locks,
+                name: name,
+                port: entry.port,
+                portEnv: entry.portEnv,
+                ports: entry.ports,
+                portSpan: entry.portSpan,
+                shell: entry.shell,
+                url: url,
+                waitFor: entry.waitFor
+            )
+            view.errors.append(contentsOf: PortClaim.configErrors(spec: draft))
+            specs.append(draft)
         }
         switch DependencyGraph.waves(specs: specs) {
         case .success:

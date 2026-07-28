@@ -113,6 +113,11 @@ public struct ServerSpec: Codable, Equatable, Sendable {
     public var port: Int?
     /** Child env var that receives the effective port (default `PORT`). */
     public var portEnv: String?
+    /** Named secondary listeners (relative offsets or absolute singletons). */
+    public var ports: [String: SecondaryPort]?
+    /** Claim `effectivePort ..< effectivePort+portSpan` without naming each
+        secondary. Sugar for apps that derive children from the primary env. */
+    public var portSpan: Int?
     /** Runs the command through `/bin/zsh -lc` for shells that need login env (nvm/mise). */
     public var shell: Bool?
     public var url: String?
@@ -131,6 +136,8 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         name: String,
         port: Int? = nil,
         portEnv: String? = nil,
+        ports: [String: SecondaryPort]? = nil,
+        portSpan: Int? = nil,
         shell: Bool? = nil,
         url: String? = nil,
         waitFor: WaitTarget? = nil
@@ -147,6 +154,8 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         self.name = name
         self.port = port
         self.portEnv = portEnv
+        self.ports = ports
+        self.portSpan = portSpan
         self.shell = shell
         self.url = url
         self.waitFor = waitFor
@@ -208,11 +217,15 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var phase: ServerPhase
     public var pid: Int?
     public var portConflict: PortConflict?
+    /** Resolved named secondary ports when the spec declares `ports`. */
+    public var ports: [String: Int]?
     public var project: String
     public var recentLogTail: [String]?
     public var server: String
     public var spawnError: SpawnError?
     public var specStale: Bool?
+    /** Short spool evidence persisted across ensure/rehydrate for `why`. */
+    public var terminalEvidence: [String]?
     public var uptimeSec: Int?
     public var url: String?
 
@@ -230,11 +243,13 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         phase: ServerPhase,
         pid: Int? = nil,
         portConflict: PortConflict? = nil,
+        ports: [String: Int]? = nil,
         project: String,
         recentLogTail: [String]? = nil,
         server: String,
         spawnError: SpawnError? = nil,
         specStale: Bool? = nil,
+        terminalEvidence: [String]? = nil,
         uptimeSec: Int? = nil,
         url: String? = nil
     ) {
@@ -251,11 +266,13 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.phase = phase
         self.pid = pid
         self.portConflict = portConflict
+        self.ports = ports
         self.project = project
         self.recentLogTail = recentLogTail
         self.server = server
         self.spawnError = spawnError
         self.specStale = specStale
+        self.terminalEvidence = terminalEvidence
         self.uptimeSec = uptimeSec
         self.url = url
     }

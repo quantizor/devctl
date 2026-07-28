@@ -99,6 +99,69 @@ import Testing
             ServerResult.self)
     }
 
+    @Test func siblingWorktreePortSpanRebindsAsBlock() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-span-\(UUID().uuidString)")
+        let main = base.appending(path: "main")
+        let worktree = base.appending(path: "worktrees/review")
+        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try run(in: main.path, "/usr/bin/git", "config", "user.email", "devctl@test")
+        try run(in: main.path, "/usr/bin/git", "config", "user.name", "devctl")
+        try Data("ok\n".utf8).write(to: main.appending(path: "README"))
+        try run(in: main.path, "/usr/bin/git", "add", "README")
+        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try FileManager.default.createDirectory(
+            at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try run(
+            in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
+        let fixture = try #require(Self.fixtureServerPath())
+        let body = """
+            {
+              "host": "app.localhost",
+              "servers": {
+                "web": {
+                  "command": ["\(fixture)", "--listen-tcp", "{port}"],
+                  "healthcheck": { "type": "tcp", "port": 45200 },
+                  "port": 45200,
+                  "portEnv": "PUBLIC_PORT",
+                  "portSpan": 3,
+                  "url": "http://app.localhost:45200/"
+                }
+              },
+              "version": 1
+            }
+            """
+        for root in [main, worktree] {
+            try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
+        }
+        let paths = DevCtlPaths(
+            dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
+        let registry = Registry(paths: paths)
+        try await registry.setTrusted(project: main.path)
+        try await registry.setTrusted(project: worktree.path)
+        let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
+        let mainResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: main.path, timeoutSeconds: 10), EnsureResult.self)
+        #expect(mainResult.server.effectivePort == 45200)
+        let wtResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: worktree.path, timeoutSeconds: 10), EnsureResult.self)
+        let rebound = try #require(wtResult.server.effectivePort)
+        #expect(rebound != 45200)
+        /** Rebound base must clear the whole span away from main's 45200..45202. */
+        #expect(Set(rebound..<(rebound + 3)).isDisjoint(with: Set(45200..<45203)))
+        #expect(PortGuard.isListening(port: rebound))
+        #expect(PortGuard.isListening(port: 45200))
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: worktree.path),
+            ServerResult.self)
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: main.path),
+            ServerResult.self)
+    }
+
     /** Discarding a worktree path stops its children and forgets registry/state
         without touching the main checkout. */
     @Test func discardedWorktreeIsPrunedOnMachineWideStatus() async throws {

@@ -49,6 +49,8 @@ public struct PersistedServerState: Codable, Sendable {
     public var resumeOnBoot: Bool?
     public var spawnError: SpawnError?
     public var startedAt: Date?
+    /** Last terminal spool lines for `why` after ensure truncate / rehydrate. */
+    public var terminalEvidence: [String]?
 
     public init(
         boundPort: Int? = nil,
@@ -58,7 +60,8 @@ public struct PersistedServerState: Codable, Sendable {
         pid: Int? = nil,
         resumeOnBoot: Bool? = nil,
         spawnError: SpawnError? = nil,
-        startedAt: Date? = nil
+        startedAt: Date? = nil,
+        terminalEvidence: [String]? = nil
     ) {
         self.boundPort = boundPort
         self.errorSummary = errorSummary
@@ -68,6 +71,7 @@ public struct PersistedServerState: Codable, Sendable {
         self.resumeOnBoot = resumeOnBoot
         self.spawnError = spawnError
         self.startedAt = startedAt
+        self.terminalEvidence = terminalEvidence
     }
 }
 
