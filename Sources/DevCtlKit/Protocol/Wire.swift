@@ -63,6 +63,7 @@ public enum WireErrorCode: String, Codable, Sendable {
     case internalError = "internal-error"
     case notFound = "not-found"
     case notTrusted = "not-trusted"
+    case portDrift = "port-drift"
     case portHeld = "port-held"
     case resourceLocked = "resource-locked"
     case spawnFailed = "spawn-failed"
@@ -183,10 +184,12 @@ public enum WireMethod: String, Sendable {
 
 public struct ServerTargetParams: Codable, Equatable, Sendable {
     public var name: String
+    public var port: Int?
     public var project: String
 
-    public init(name: String, project: String) {
+    public init(name: String, port: Int? = nil, project: String) {
         self.name = name
+        self.port = port
         self.project = project
     }
 }
@@ -213,11 +216,14 @@ public struct RegisterParams: Codable, Equatable, Sendable {
 
 public struct EnsureParams: Codable, Equatable, Sendable {
     public var name: String
+    /** One-shot port override for this ensure/start; flows through effectivePort. */
+    public var port: Int?
     public var project: String
     public var timeoutSeconds: Double
 
-    public init(name: String, project: String, timeoutSeconds: Double) {
+    public init(name: String, port: Int? = nil, project: String, timeoutSeconds: Double) {
         self.name = name
+        self.port = port
         self.project = project
         self.timeoutSeconds = timeoutSeconds
     }
@@ -259,11 +265,16 @@ public struct ServerListResult: Codable, Equatable, Sendable {
 
 public struct GroupParams: Codable, Equatable, Sendable {
     public var only: [String]?
+    /** One-shot port override applied to each server this up starts. */
+    public var port: Int?
     public var project: String
     public var timeoutSeconds: Double
 
-    public init(only: [String]? = nil, project: String, timeoutSeconds: Double = 60) {
+    public init(
+        only: [String]? = nil, port: Int? = nil, project: String, timeoutSeconds: Double = 60
+    ) {
         self.only = only
+        self.port = port
         self.project = project
         self.timeoutSeconds = timeoutSeconds
     }
@@ -281,6 +292,9 @@ public struct LockParams: Codable, Equatable, Sendable {
     /** The lock auto-releases when this pid dies (a crashed harness never
         wedges the resource). */
     public var holderPid: Int
+    /** When false, acquire the mutex without stopping servers that declare the
+        resource. Optional so older clients keep decoding (default: pause). */
+    public var pause: Bool?
     public var project: String
     public var resource: String
     /** Per-server health wait used when this hold ends (release or orphan
@@ -288,9 +302,14 @@ public struct LockParams: Codable, Equatable, Sendable {
     public var resumeTimeoutSeconds: Double?
 
     public init(
-        holderPid: Int, project: String, resource: String, resumeTimeoutSeconds: Double? = nil
+        holderPid: Int,
+        pause: Bool? = nil,
+        project: String,
+        resource: String,
+        resumeTimeoutSeconds: Double? = nil
     ) {
         self.holderPid = holderPid
+        self.pause = pause
         self.project = project
         self.resource = resource
         self.resumeTimeoutSeconds = resumeTimeoutSeconds

@@ -12,6 +12,6 @@ public enum DiscoveryStanza {
         naming/host conventions sentence is constant either way. */
     public static func render(serverNames: [String]) -> String {
         let example = serverNames.first ?? "<name>"
-        return "- This project is registered with devctl (devservers.json). Prefer `devctl ensure \(example)` / `devctl status` / `devctl logs \(example)` over launching the server directly. Name servers after the project (not `web`); use `<project>.localhost` hosts, not bare `localhost`."
+        return "- This project is registered with devctl (devservers.json). Prefer `devctl ensure \(example)` / `devctl status` / `devctl logs \(example)` over launching the server directly. Name servers after the project (not `web`); use `<project>.localhost` hosts, not bare `localhost`. In a git worktree, ensure still manages the server: the live URL comes from `status` / session context (may be `worktree-*.<preferred>.localhost` on another port). If context warns about a port conflict, follow that URL or hint; do not edit `devservers.json` just to change ports; do not start an unmanaged `pnpm dev --port`."
     }
 }

@@ -31,7 +31,9 @@ struct GlobalOptions: ParsableArguments {
     var project: String?
 
     /** Resolution order: nearest ancestor with devservers.json → git root → cwd,
-        canonicalized so worktrees/symlinks cannot mint duplicate identities. */
+        then canonicalized (symlinks and on-disk case). A git worktree is a real
+        distinct path and keeps its own project identity; canonicalization does
+        not collapse sibling checkouts into one. */
     func resolvedProject() -> String {
         if let project { return canonicalProjectPath(project) }
         return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
@@ -98,7 +100,8 @@ enum CLIRunner {
             Foundation.exit(4)
         case .usage:
             Foundation.exit(2)
-        case .configInvalid, .internalError, .notTrusted, .portHeld, .resourceLocked, .spawnFailed:
+        case .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld, .resourceLocked,
+            .spawnFailed:
             Foundation.exit(1)
         }
     }
@@ -168,11 +171,15 @@ struct Ensure: AsyncParsableCommand {
     @Argument(help: "Server name.")
     var name: String
 
+    @Option(help: "Override the declared port for this run.")
+    var port: Int?
+
     @Option(help: "Seconds to wait for health before giving up.")
     var timeout: Double = 60
 
     func run() async throws {
-        let params = EnsureParams(name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
+        let params = EnsureParams(
+            name: name, port: port, project: global.resolvedProject(), timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverEnsure, params: params, expecting: EnsureResult.self)
         }
@@ -269,8 +276,11 @@ struct Start: AsyncParsableCommand {
     @Argument(help: "Server name.")
     var name: String
 
+    @Option(help: "Override the declared port for this run.")
+    var port: Int?
+
     func run() async throws {
-        let params = ServerTargetParams(name: name, project: global.resolvedProject())
+        let params = ServerTargetParams(name: name, port: port, project: global.resolvedProject())
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStart, params: params, expecting: ServerResult.self)
         }
@@ -291,11 +301,15 @@ struct Status: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    @Argument(help: "Server name (omit for all).")
+    @Flag(help: "List every project the daemon knows (machine-wide).")
+    var all = false
+
+    @Argument(help: "Server name (omit for all servers in the project).")
     var name: String?
 
     func run() async throws {
-        let params = ProjectParams(name: name, project: global.resolvedProject())
+        let project = all ? "" : global.resolvedProject()
+        let params = ProjectParams(name: name, project: project)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
@@ -596,7 +610,7 @@ struct Context: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
-        if let text = await AgentContext.render(project: global.resolvedProject()) {
+        if let text = await HookContext.render(project: global.resolvedProject()) {
             print(text)
         }
     }
@@ -672,7 +686,7 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
             hook cwd by chdir-ing there first. */
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await AgentContext.render(project: project) else { return }
+        guard let text = await HookContext.render(project: project) else { return }
         let output: [String: Any] = [
             "hookSpecificOutput": [
                 "additionalContext": text,
@@ -696,7 +710,7 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await AgentContext.render(project: project) else { return }
+        guard let text = await HookContext.render(project: project) else { return }
         let output: [String: Any] = ["additional_context": text]
         if let data = try? JSONSerialization.data(withJSONObject: output) {
             FileHandle.standardOutput.write(data)
@@ -750,12 +764,16 @@ struct Up: AsyncParsableCommand {
     @Option(help: "Comma-separated server names (their dependencies come along).")
     var only: String?
 
+    @Option(help: "Override the declared port for each server this up starts.")
+    var port: Int?
+
     @Option(help: "Per-server seconds to wait for health.")
     var timeout: Double = 60
 
     func run() async throws {
         let params = GroupParams(
             only: only.map { $0.split(separator: ",").map(String.init) },
+            port: port,
             project: global.resolvedProject(),
             timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
@@ -1057,7 +1075,7 @@ struct Doctor: AsyncParsableCommand {
                                 kind: "signature", severity: "info"))
                     }
                     if server.phase == .stopped || server.phase == .crashed,
-                        PortGuardProbe.isListening(port: port) {
+                        LoopbackProbe.isListening(port: port) {
                         findings.append(
                             Finding(
                                 detail: "port \(port) has an unmanaged listener while \(server.server) is down",
@@ -1079,7 +1097,8 @@ struct Doctor: AsyncParsableCommand {
                 } else {
                     findings.append(
                         Finding(
-                            detail: "\(project) no longer exists on disk (devctl doctor --fix prunes it)",
+                            detail:
+                                "\(project) no longer exists on disk (daemon auto-prunes missing projects; doctor --fix forces leftovers)",
                             kind: "stale-project", severity: "warning"))
                 }
             }
@@ -1097,26 +1116,6 @@ struct Doctor: AsyncParsableCommand {
         if findings.contains(where: { $0.severity == "error" }) {
             Foundation.exit(1)
         }
-    }
-}
-
-/** TCP listen probe for doctor, duplicated minimally from the daemon's health
-    prober (the CLI cannot import DevCtlDaemonCore, which links swift-subprocess). */
-enum PortGuardProbe {
-    static func isListening(port: Int) -> Bool {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { close(sock) }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
-        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-        let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        return result == 0
     }
 }
 
@@ -1408,11 +1407,9 @@ struct Switch: AsyncParsableCommand {
     }
 }
 
-/** Runs a command while holding a named resource exclusively. The daemon
-    pauses managed servers that declare the resource, refuses their starts for
-    the duration, and resumes them on release (or on recover when this process
-    dies), so a test harness's private server never contends with the managed
-    one over shared mutable state (a local database, a fixture tree). */
+/** Runs a command while holding a named resource exclusively. By default the
+    daemon pauses managed servers that declare the resource; `--no-pause` takes
+    the mutex without stopping them (for harnesses that reuse the live server). */
 struct Lock: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Run a command holding a project resource; conflicting servers pause and return.")
@@ -1421,23 +1418,37 @@ struct Lock: AsyncParsableCommand {
 
     /** Positional order is load-bearing: the resource comes first, everything
         after -- is the command, so declaration order deliberately breaks the
-        alphabet. */
+        alphabet. Options and flags must appear before the passthrough argv so
+        `--no-pause` is not captured into the command. */
     @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
     var resource: String
-
-    @Argument(parsing: .captureForPassthrough, help: "Command to run while holding the resource.")
-    var command: [String]
 
     @Option(help: "Seconds to wait for the resource if another holder has it.")
     var acquireTimeout: Double = 300
 
+    /** Explicit long name: `@Flag(inversion: .prefixedNo)` on a default-true
+        `pause` was still pausing under `--no-pause` in the smoke gate (daemon
+        unit tests with `pause: false` were fine), so the wire bit is driven by
+        this opt-out flag instead. */
+    @Flag(name: .customLong("no-pause"), help: "Hold the mutex without stopping servers that declare the resource.")
+    var noPause = false
+
     @Option(help: "Per-server seconds to wait for health when servers return.")
     var timeout: Double = 120
 
+    @Argument(parsing: .captureForPassthrough, help: "Command to run while holding the resource.")
+    var command: [String]
+
     func run() async throws {
+        var noPause = noPause
+        var command = command
+        if !noPause, let flagIndex = command.firstIndex(of: "--no-pause") {
+            noPause = true
+            command.remove(at: flagIndex)
+        }
         guard !command.isEmpty else {
             CLIRunner.fail(
-                WireError(code: .usage, message: "usage: devctl lock <resource> -- <command…>"),
+                WireError(code: .usage, message: "usage: devctl lock <resource> [--no-pause] -- <command…>"),
                 json: global.json)
         }
         let project = global.resolvedProject()
@@ -1453,7 +1464,7 @@ struct Lock: AsyncParsableCommand {
                 acquired = try await client.request(
                     .lockAcquire,
                     params: LockParams(
-                        holderPid: holderPid, project: project, resource: resource,
+                        holderPid: holderPid, pause: !noPause, project: project, resource: resource,
                         resumeTimeoutSeconds: timeout),
                     expecting: LockResult.self)
                 break

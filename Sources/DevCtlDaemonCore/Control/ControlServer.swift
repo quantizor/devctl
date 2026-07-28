@@ -23,7 +23,26 @@ public actor Router {
         self.paths = paths
         self.registry = registry
         self.resourceLocks =
-            AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:]
+            Self.normalizedLocks(
+                AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
+    }
+
+    private static func lockKey(project: String, resource: String) -> String {
+        "\(canonicalProjectPath(project))::\(resource)"
+    }
+
+    private static func normalizedLocks(_ locks: [String: LockHolder]) -> [String: LockHolder] {
+        var out: [String: LockHolder] = [:]
+        for (key, holder) in locks {
+            guard let separator = key.range(of: "::") else {
+                out[key] = holder
+                continue
+            }
+            let project = String(key[key.startIndex..<separator.lowerBound])
+            let resource = String(key[separator.upperBound...])
+            out[lockKey(project: project, resource: resource)] = holder
+        }
+        return out
     }
 
     /** Decodes the typed request for `method` and returns the encoded response
@@ -58,53 +77,67 @@ public actor Router {
                 return frame
             case .serverRegister:
                 let request = try decoder.decode(WireRequest<RegisterParams>.self, from: line)
-                try await registry.register(project: request.params.project, spec: request.params.spec)
-                let supervisor = await supervisor(project: request.params.project, spec: request.params.spec)
+                let project = canonicalProjectPath(request.params.project)
+                try await registry.register(project: project, spec: request.params.spec)
+                let supervisor = await supervisor(project: project, spec: request.params.spec)
                 await events.post(
-                    kind: .registered, project: request.params.project, server: request.params.spec.name)
+                    kind: .registered, project: project, server: request.params.spec.name)
                 return try respond(id: head.id, result: ServerResult(server: await supervisor.status()))
             case .serverEnsure:
                 let request = try decoder.decode(WireRequest<EnsureParams>.self, from: line)
-                let target = ServerTargetParams(name: request.params.name, project: request.params.project)
-                let merged = try await mergedSpecs(project: target.project)
+                let project = canonicalProjectPath(request.params.project)
+                let target = ServerTargetParams(
+                    name: request.params.name, port: request.params.port, project: project)
+                let merged = try await mergedSpecs(project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                await recordTrustIfNeeded(project: target.project, name: target.name, fileNames: merged.fileNames)
+                await recordTrustIfNeeded(project: project, name: target.name, fileNames: merged.fileNames)
                 if let spec = merged.specs.first(where: { $0.name == target.name }) {
-                    try await lockGate(project: target.project, spec: spec)
+                    try await lockGate(project: project, spec: spec)
                 }
-                try await portPreCheck(target: target, supervisor: supervisor)
+                try await prepareSpawn(target: target, supervisor: supervisor, portOverride: request.params.port)
                 let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
                 DevCtlLog.daemon.info(
-                    "ensure \(target.name)@\(target.project) -> \(result.server.phase.rawValue)")
+                    "ensure \(target.name)@\(project) -> \(result.server.phase.rawValue)")
                 return try respond(id: head.id, result: result)
             case .serverStart:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
-                let merged = try await mergedSpecs(project: request.params.project)
-                let supervisor = try await resolvedSupervisor(request.params)
+                let project = canonicalProjectPath(request.params.project)
+                let target = ServerTargetParams(
+                    name: request.params.name, port: request.params.port, project: project)
+                let merged = try await mergedSpecs(project: project)
+                let supervisor = try await resolvedSupervisor(target)
                 await recordTrustIfNeeded(
-                    project: request.params.project, name: request.params.name, fileNames: merged.fileNames)
-                if let spec = merged.specs.first(where: { $0.name == request.params.name }) {
-                    try await lockGate(project: request.params.project, spec: spec)
+                    project: project, name: target.name, fileNames: merged.fileNames)
+                if let spec = merged.specs.first(where: { $0.name == target.name }) {
+                    try await lockGate(project: project, spec: spec)
                 }
-                try await portPreCheck(target: request.params, supervisor: supervisor)
+                try await prepareSpawn(target: target, supervisor: supervisor, portOverride: request.params.port)
                 return try respond(id: head.id, result: ServerResult(server: await supervisor.start()))
             case .serverStatus:
                 let request = try decoder.decode(WireRequest<ProjectParams>.self, from: line)
-                return try respond(id: head.id, result: try await statusList(request.params))
+                /** Empty project means machine-wide; do not canonicalize it or it
+                    becomes the daemon cwd and the sweep never runs. */
+                let project = request.params.project.isEmpty
+                    ? ""
+                    : canonicalProjectPath(request.params.project)
+                let params = ProjectParams(name: request.params.name, project: project)
+                return try respond(id: head.id, result: try await statusList(params))
             case .projectTrust:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
-                try await registry.setTrusted(project: request.params.project)
+                try await registry.setTrusted(
+                    project: canonicalProjectPath(request.params.project))
                 return try respond(id: head.id, result: WireEmpty())
             case .projectCheck:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
-                let url = ProjectConfigLoader.configURL(project: request.params.project)
+                let project = canonicalProjectPath(request.params.project)
+                let url = ProjectConfigLoader.configURL(project: project)
                 guard FileManager.default.fileExists(atPath: url.path) else {
                     return try respond(
                         id: head.id,
                         result: CheckResult(errors: ["no devservers.json at \(url.path)"]))
                 }
                 do {
-                    guard let view = try ProjectConfigLoader.load(project: request.params.project) else {
+                    guard let view = try ProjectConfigLoader.load(project: project) else {
                         return try respond(
                             id: head.id, result: CheckResult(errors: ["cannot read \(url.path)"]))
                     }
@@ -152,19 +185,28 @@ public actor Router {
                         host: view.host, servers: view.specs.map(\.name), warnings: view.warnings))
             case .groupUp:
                 let request = try decoder.decode(WireRequest<GroupParams>.self, from: line)
-                return try respond(id: head.id, result: try await groupUp(request.params))
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                return try respond(id: head.id, result: try await groupUp(params))
             case .groupDown:
                 let request = try decoder.decode(WireRequest<GroupParams>.self, from: line)
-                return try respond(id: head.id, result: try await groupDown(request.params))
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                return try respond(id: head.id, result: try await groupDown(params))
             case .serverStop:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
-                let supervisor = try await resolvedSupervisor(request.params)
+                let target = ServerTargetParams(
+                    name: request.params.name, port: request.params.port,
+                    project: canonicalProjectPath(request.params.project))
+                let supervisor = try await resolvedSupervisor(target)
                 let stopped = await supervisor.stop()
-                DevCtlLog.daemon.info("stop \(request.params.name)@\(request.params.project)")
+                DevCtlLog.daemon.info("stop \(target.name)@\(target.project)")
                 return try respond(id: head.id, result: ServerResult(server: stopped))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
-                let target = ServerTargetParams(name: request.params.name, project: request.params.project)
+                let target = ServerTargetParams(
+                    name: request.params.name,
+                    project: canonicalProjectPath(request.params.project))
                 let supervisor = try await resolvedSupervisor(target)
                 let reason = await supervisor.wait(
                     for: request.params.condition, timeoutSeconds: request.params.timeoutSeconds)
@@ -172,11 +214,15 @@ public actor Router {
                     id: head.id, result: EnsureResult(reason: reason, server: await supervisor.status()))
             case .lockAcquire:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
-                let result = try await acquireLock(request.params)
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                let result = try await acquireLock(params)
                 return try respond(id: head.id, result: result)
             case .lockRelease:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
-                let result = try await releaseLock(request.params)
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                let result = try await releaseLock(params)
                 return try respond(id: head.id, result: result)
             case .logsQuery:
                 let request = try decoder.decode(WireRequest<LogsQueryParams>.self, from: line)
@@ -191,6 +237,12 @@ public actor Router {
                             message: "no mark with id '\(markID)' in \(request.params.name)'s log")
                     }
                     since = markDate
+                }
+                if let pattern = request.params.grep, let why = LogQuery.grepRejection(pattern) {
+                    throw WireError(
+                        code: .usage,
+                        hint: "fix the pattern, or drop --grep to see every line",
+                        message: "--grep is not a valid regular expression: \(why)")
                 }
                 let options = LogQueryOptions(
                     grep: request.params.grep,
@@ -239,9 +291,10 @@ public actor Router {
             case .serverWhy:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
                 _ = try await resolvedSupervisor(request.params)
+                let merged = try await mergedSpecs(project: request.params.project)
                 var statuses: [String: ServerStatus] = [:]
                 var specsByName: [String: ServerSpec] = [:]
-                for spec in await registry.specs(project: request.params.project) {
+                for spec in merged.specs {
                     let supervisor = await supervisor(project: request.params.project, spec: spec)
                     statuses[spec.name] = await supervisor.status()
                     specsByName[spec.name] = spec
@@ -252,11 +305,17 @@ public actor Router {
                     target: request.params.name,
                     statuses: statuses,
                     specs: specsByName,
-                    errTail: { server in
-                        LogQuery.run(
+                    evidenceLines: { server in
+                        let since =
+                            statuses[server]?.lastExit?.at
+                            ?? statuses[server]?.uptimeSec.map {
+                                Date().addingTimeInterval(TimeInterval(-$0))
+                            }
+                        return LogQuery.run(
                             current: paths.structuredLogFile(project: project, server: server),
-                            options: LogQueryOptions(streams: [.err], tail: 5)
-                        ).map(\.text)
+                            options: LogQueryOptions(
+                                since: since, streams: [.err, .out, .sys], tail: 40)
+                        ).map(\.contextLine)
                     })
                 return try respond(id: head.id, result: result)
             case .serverUnregister:
@@ -289,15 +348,29 @@ public actor Router {
         }
     }
 
-    /** Startup recovery: reconcile persisted locks first, then restore servers
-        with boot intent. A recorded pid that is gone becomes crashed(daemon-restart);
-        a live orphan (its spool fd kept it healthy while the daemon was away) is
-        group-killed, since exit forensics are unknowable for non-children. Never
-        adopted silently. What comes back: any server whose start intent survives
-        (resumeOnBoot), which a machine shutdown's drain leaves set, plus the
-        classic daemon-crash case of a phase left running/starting. A deliberate
-        stop clears the flag, so only those stay down. Servers still paused under
-        a live resource lock are left alone: starting them would fight the harness.
+    /** Forget registered projects whose checkout path is gone: stop children,
+        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
+        (boot + machine-wide status), not a watcher. */
+    /** Forget registered projects whose checkout path is gone: stop children,
+        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
+        (boot + machine-wide status), not a watcher. */
+    public func pruneMissingProjects() async {
+        for project in await registry.allProjects() {
+            if FileManager.default.fileExists(atPath: project) { continue }
+            await forgetMissingProject(project)
+        }
+    }
+
+    /** Startup recovery: prune vanished checkouts first, reconcile persisted
+        locks, then restore servers with boot intent. A recorded pid that is gone
+        becomes crashed(daemon-restart); a live orphan (its spool fd kept it
+        healthy while the daemon was away) is group-killed, since exit forensics
+        are unknowable for non-children. Never adopted silently. What comes back:
+        any server whose start intent survives (resumeOnBoot), which a machine
+        shutdown's drain leaves set, plus the classic daemon-crash case of a
+        phase left running/starting. A deliberate stop clears the flag, so only
+        those stay down. Servers still paused under a live resource lock are left
+        alone: starting them would fight the harness.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
@@ -305,6 +378,7 @@ public actor Router {
         committed server on boot. A rename/delete with no matching spec drops the
         orphaned state row instead of retrying forever. */
     public func recoverAtStartup() async {
+        await pruneMissingProjects()
         await reconcileLocksAtStartup()
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
@@ -330,27 +404,10 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
-                if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
-                    let sweep = ProcessTree.descendants(of: pid)
-                    if case .failed(let code) = sweep {
-                        DevCtlLog.daemon.error(
-                            "orphan bounce descendant sweep failed (errno \(code)); group-only")
-                    }
-                    let descendants = sweep.identities
-                    ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
-                    /** Poll instead of a fixed 2s sleep: most orphans die on
-                        SIGTERM in well under a second. */
-                    let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
-                    while ContinuousClock.now < graceDeadline, kill(pid, 0) == 0 {
-                        try? await Task.sleep(for: .milliseconds(50))
-                    }
-                    if kill(pid, 0) == 0 {
-                        ProcessTree.signalTree(
-                            rootPid: pid, descendants: descendants, signal: SIGKILL, revalidate: true)
-                    }
-                    await events.post(
-                        kind: .crashed, project: project, server: name,
-                        detail: "daemon-restart: orphan pid \(pid) bounced")
+                if let pid = persisted.pid.map(pid_t.init),
+                    let identity = ProcessTree.identity(of: pid)
+                {
+                    await bounceOrphan(identity, project: project, name: name)
                 } else if leftActive {
                     await events.post(
                         kind: .crashed, project: project, server: name, detail: "daemon-restart")
@@ -365,19 +422,23 @@ public actor Router {
                 }
             }
         }
-        /** Start restores in parallel: a serial loop made a multi-server boot
-            look like a slow daemon even after the socket was already up. */
-        if !toStart.isEmpty {
-            await withTaskGroup(of: Void.self) { group in
-                for item in toStart {
-                    group.addTask {
-                        DevCtlLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
-                        let supervisor = await self.supervisor(
-                            project: item.project, spec: item.spec)
-                        _ = await supervisor.start()
-                    }
-                }
+        for item in toStart {
+            let supervisor = await self.supervisor(project: item.project, spec: item.spec)
+            do {
+                try await self.prepareSpawn(
+                    target: ServerTargetParams(name: item.spec.name, project: item.project),
+                    supervisor: supervisor)
+            } catch let error as WireError {
+                DevCtlLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.message)")
+                continue
+            } catch {
+                DevCtlLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.localizedDescription)")
+                continue
             }
+            DevCtlLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
+            _ = await supervisor.start()
         }
         /** Second pass: drop leftover rows for renamed/deleted servers even when
             they carry no resume intent (e.g. a deliberate stop under the old
@@ -391,6 +452,119 @@ public actor Router {
                 DevCtlLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
                 try? await registry.removeState(serverID: id)
             }
+        }
+    }
+
+    /** Group-kill a live non-child left over from a prior daemon (or a prune that
+        could not stop through the supervisor). Signals only while the snapshotted
+        start time still matches: a recycled pid must not be killed. */
+    private func bounceOrphan(
+        _ root: ProcessIdentity, project: String, name: String
+    ) async {
+        guard ProcessTree.shouldSignal(
+            snapshotted: root, live: ProcessTree.identity(of: root.pid))
+        else {
+            DevCtlLog.daemon.info(
+                "orphan bounce skip \(name)@\(project): pid \(root.pid) gone or reused")
+            return
+        }
+        let pid = root.pid
+        let sweep = ProcessTree.descendants(of: pid)
+        if case .failed(let code) = sweep {
+            DevCtlLog.daemon.error(
+                "orphan bounce descendant sweep failed (errno \(code)); group-only")
+        }
+        let descendants = sweep.identities
+        ProcessTree.signalTree(
+            descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
+            signal: SIGTERM)
+        /** Poll with identity, not kill(pid,0): a recycled number must end the
+            wait as "gone" rather than escalate into the new process. */
+        let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < graceDeadline,
+            ProcessTree.shouldSignal(
+                snapshotted: root, live: ProcessTree.identity(of: pid))
+        {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if ProcessTree.shouldSignal(
+            snapshotted: root, live: ProcessTree.identity(of: pid))
+        {
+            ProcessTree.signalTree(
+                descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
+                signal: SIGKILL)
+        }
+        await events.post(
+            kind: .crashed, project: project, server: name,
+            detail: "daemon-restart: orphan pid \(pid) bounced")
+    }
+
+    /** Stop and forget one vanished checkout. Config is unreadable once the path
+        is gone, so this walks supervisors + registry + state directly instead of
+        groupDown / mergedSpecs. `project` must be the registry key as stored
+        (already canonical at registration): re-canonicalizing a deleted path can
+        change `/private/var` ↔ `/var` spelling and miss every lookup. */
+    private func forgetMissingProject(_ project: String) async {
+        let prefix = "\(project)::"
+        /** Snapshot identities before teardown: a composite tree can outlive a
+            no-op stop (phase already crashed/failed after the checkout vanished),
+            so we keep the recorded ProcessIdentity and bounce only while that
+            start time still matches. */
+        var liveRoots: [(identity: ProcessIdentity, name: String)] = []
+        var names = Set(await registry.specs(project: project).map(\.name))
+        for (id, supervisor) in supervisors where id.hasPrefix(prefix) {
+            guard let separator = id.range(of: "::") else { continue }
+            let name = String(id[separator.upperBound...])
+            names.insert(name)
+            let status = await supervisor.status()
+            if let pid = status.pid.map(pid_t.init),
+                let identity = ProcessTree.identity(of: pid)
+            {
+                liveRoots.append((identity: identity, name: name))
+            }
+        }
+        for (id, persisted) in await registry.allPersistedState() where id.hasPrefix(prefix) {
+            guard let separator = id.range(of: "::") else { continue }
+            let name = String(id[separator.upperBound...])
+            names.insert(name)
+            if let pid = persisted.pid.map(pid_t.init),
+                let identity = ProcessTree.identity(of: pid),
+                !liveRoots.contains(where: { $0.identity.pid == pid })
+            {
+                liveRoots.append((identity: identity, name: name))
+            }
+        }
+        let sortedNames = names.sorted()
+        DevCtlLog.daemon.info(
+            "prune missing project \(project) (\(sortedNames.joined(separator: ",")))")
+        for name in sortedNames {
+            let id = serverID(project: project, name: name)
+            if let supervisor = supervisors[id] {
+                _ = await supervisor.stop()
+                await events.post(
+                    kind: .stopped, project: project, server: name, detail: "project path gone")
+            }
+            supervisors[id] = nil
+        }
+        for entry in liveRoots {
+            guard ProcessTree.shouldSignal(
+                snapshotted: entry.identity, live: ProcessTree.identity(of: entry.identity.pid))
+            else { continue }
+            await bounceOrphan(entry.identity, project: project, name: entry.name)
+        }
+        configCache[project] = nil
+        let lockKeys = resourceLocks.keys.filter { $0.hasPrefix(prefix) }
+        if !lockKeys.isEmpty {
+            for key in lockKeys {
+                resourceLocks[key] = nil
+            }
+            persistLocks()
+        }
+        try? await registry.removeState(forProject: project)
+        try? await registry.removeProject(project)
+        for name in sortedNames {
+            await events.post(
+                kind: .unregistered, project: project, server: name, detail: "project path gone")
         }
     }
 
@@ -436,12 +610,12 @@ public actor Router {
         exit(0)
     }
 
-    /** Fails a start-shaped request when the declared port is already held: by a
-        managed server elsewhere (the two-worktrees case, named precisely) or by
-        an unmanaged squatter (pid + command when lsof can see it). Runs only when
-        the target itself is not already up, so a server never conflicts with its
-        own listener. */
-    private func portPreCheck(target: ServerTargetParams, supervisor: ServerSupervisor) async throws {
+    /** Resolve effective port, apply overlay/worktree host/materialization, and
+        either auto-rebind a sibling conflict or refuse with port-held. Every
+        start-shaped path routes through here. */
+    private func prepareSpawn(
+        target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil
+    ) async throws {
         let current = await supervisor.status()
         switch current.phase {
         case .running, .starting, .stopping, .unhealthy:
@@ -449,45 +623,236 @@ public actor Router {
         case .crashed, .failed, .stopped:
             break
         }
-        guard let port = current.declaredPort else { return }
-        let targetID = serverID(project: target.project, name: target.name)
-        for (id, other) in supervisors where id != targetID {
-            let status = await other.status()
-            let active = status.phase == .running || status.phase == .starting || status.phase == .unhealthy
-            if active, status.declaredPort == port || status.observedPort == port {
-                DevCtlLog.daemon.error(
-                    "port-held \(port) by \(status.server)@\(status.project) for \(target.name)")
-                throw WireError(
-                    code: .portHeld,
-                    hint: "run: devctl stop \(status.server) --project \(status.project)",
-                    message: "port \(port) is held by managed server '\(status.server)' in \(status.project)"
-                )
+        let merged = try await mergedSpecs(project: target.project)
+        guard var spec = merged.specs.first(where: { $0.name == target.name }) else {
+            throw WireError(
+                code: .notFound,
+                hint: "run: devctl status --json",
+                message: "no server named '\(target.name)' in \(target.project)")
+        }
+        let overlay = LocalOverlay.load(project: target.project)
+        let overlayServer = overlay?.servers?[target.name]
+        spec = LocalOverlay.apply(spec: spec, overlay: overlayServer, project: target.project)
+        let committedHost = merged.host
+        let preferred = CheckoutIdentity.preferredSubdomain(
+            project: target.project, committedHost: committedHost)
+        let taken = await takenHosts()
+        let defaultSlugHost =
+            "\(ProjectConfigLoader.defaultSlug(project: target.project)).localhost"
+        /** Host printed in committed urls/heads before any worktree swap; materialize
+            matches against this so preferred-host URLs rewrite to the ephemeral
+            label even after `spec.host` already moved. */
+        let matchHost = spec.host ?? committedHost ?? defaultSlugHost
+        if let worktreeHost = CheckoutIdentity.worktreeHost(
+            project: target.project, preferred: preferred, takenHosts: taken),
+            overlayServer?.host == nil,
+            spec.host == nil || spec.host == committedHost || spec.host == defaultSlugHost
+        {
+            spec.host = worktreeHost
+            if let port = spec.port {
+                let urlHost = URL(string: spec.url ?? "")?.host
+                if spec.url == nil || urlHost == committedHost || urlHost == defaultSlugHost {
+                    spec.url = "http://\(worktreeHost):\(port)/"
+                }
             }
         }
-        if PortGuard.isListening(port: port) {
-            if let squatter = PortGuard.listenerInfo(port: port) {
+        let declaredPort = spec.port
+        let id = serverID(project: target.project, name: target.name)
+        let persistedBound = await registry.persistedState(serverID: id)?.boundPort
+        var effective =
+            portOverride ?? overlayServer?.port ?? persistedBound ?? declaredPort
+        var conflict: PortConflict?
+        if let port = effective {
+            let targetID = id
+            let draft = PortClaim.resolve(spec: spec, effectivePort: port)
+            guard let draftClaim = draft.claim, draft.error == nil else {
                 throw WireError(
-                    code: .portHeld,
-                    hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
-                    message: "port \(port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
-                )
+                    code: .configInvalid, hint: "run: devctl config check",
+                    message: draft.error ?? "invalid port claim")
             }
+            if let busy = await firstBusyPort(in: draftClaim, excluding: targetID) {
+                let holder = await managedHolder(port: busy.port, excluding: targetID)
+                if let holder, CheckoutIdentity.shareCommonDir(target.project, holder.project),
+                    draftClaim.relative.contains(busy.port)
+                {
+                    let rebound = await allocateSiblingPort(
+                        declared: declaredPort ?? port, excluding: targetID, project: target.project,
+                        spec: spec)
+                    conflict = PortConflict(
+                        declaredPort: declaredPort ?? port,
+                        effectivePort: rebound,
+                        holder: "\(holder.server)@\(holder.project)",
+                        message:
+                            "port \(busy.port) held by sibling '\(holder.server)' in \(holder.project); rebound to \(rebound)",
+                        state: .rebound)
+                    effective = rebound
+                    try? await registry.updateState(serverID: id) { $0.boundPort = rebound }
+                } else if let holder {
+                    DevCtlLog.daemon.error(
+                        "port-held \(busy.port) by \(holder.server)@\(holder.project) for \(target.name)")
+                    throw WireError(
+                        code: .portHeld,
+                        hint: "run: devctl stop \(holder.server) --project \(holder.project)",
+                        message:
+                            "port \(busy.port) is held by managed server '\(holder.server)' in \(holder.project)"
+                    )
+                } else if let squatter = PortGuard.listenerInfo(port: busy.port) {
+                    throw WireError(
+                        code: .portHeld,
+                        hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
+                        message:
+                            "port \(busy.port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                    )
+                } else {
+                    throw WireError(
+                        code: .portHeld,
+                        message: "port \(busy.port) already has a listener that devctl does not manage"
+                    )
+                }
+            }
+        }
+        let resolved = PortClaim.resolve(spec: spec, effectivePort: effective)
+        guard let claim = resolved.claim, resolved.error == nil else {
+            throw WireError(
+                code: .configInvalid, hint: "run: devctl config check",
+                message: resolved.error ?? "invalid port claim")
+        }
+        if let busy = await firstBusyPort(in: claim, excluding: id) {
             throw WireError(
                 code: .portHeld,
-                message: "port \(port) already has a listener that devctl does not manage"
-            )
+                message: "port \(busy.port) is still busy after rebind resolution")
         }
+        let materialized = PortMaterializer.materialize(
+            spec: spec, effectivePort: effective, effectiveHost: spec.host, matchHost: matchHost)
+        await supervisor.updateSpec(materialized)
+        await supervisor.setPortMeta(
+            claim: claim, declaredPort: declaredPort, effectivePort: effective,
+            portConflict: conflict)
+    }
+
+    /** First claimed port that is held (managed or unmanaged). Absolutes and
+        relatives are treated the same for freeness; only sibling rebind cares
+        which set a conflict came from. */
+    private func firstBusyPort(in claim: PortClaim, excluding targetID: String) async -> (
+        port: Int, managed: Bool
+    )? {
+        for port in claim.allPorts {
+            if await managedHolder(port: port, excluding: targetID) != nil {
+                return (port: port, managed: true)
+            }
+            if PortGuard.isListening(port: port) {
+                return (port: port, managed: false)
+            }
+        }
+        return nil
+    }
+
+    private func allocateSiblingPort(
+        declared: Int, excluding: String, project: String, spec: ServerSpec
+    ) async -> Int {
+        var candidate = CheckoutIdentity.siblingPortCandidate(declared: declared, project: project)
+        for _ in 0..<200 {
+            let resolved = PortClaim.resolve(spec: spec, effectivePort: candidate)
+            if let claim = resolved.claim, resolved.error == nil,
+                await firstBusyPort(in: claim, excluding: excluding) == nil
+            {
+                return candidate
+            }
+            candidate += 1
+            if candidate > 65_000 { candidate = 10_000 }
+        }
+        return candidate
+    }
+
+    /** Wait until every claimed port is free, or return the first still-busy port. */
+    private func waitForClaimFree(claim: PortClaim, budgetSeconds: Double = 2) async -> Int? {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
+        while true {
+            var busy: Int?
+            for port in claim.allPorts where PortGuard.isListening(port: port) {
+                busy = port
+                break
+            }
+            if busy == nil { return nil }
+            if ContinuousClock.now >= deadline { return busy }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    private func takenHosts() async -> Set<String> {
+        var hosts: Set<String> = []
+        for project in await registry.allProjects() {
+            if let view = try? loadConfig(project: project) {
+                hosts.insert(view.host)
+                for spec in view.specs {
+                    if let host = spec.host { hosts.insert(host) }
+                    if let url = spec.url, let host = URL(string: url)?.host {
+                        hosts.insert(host)
+                    }
+                }
+            }
+        }
+        return hosts
+    }
+
+    /** Which managed server holds `port`, if any. The resident supervisor pool
+        answers for servers this daemon has been asked about; state.json answers
+        for the rest, since the pool is built lazily and a server started before
+        this daemon's first request for it has no entry there at all. A persisted
+        row counts only while its recorded pid is still alive. */
+    private func managedHolder(port: Int, excluding targetID: String) async -> (
+        project: String, server: String
+    )? {
+        for (id, other) in supervisors where id != targetID {
+            let status = await other.status()
+            let active =
+                status.phase == .running || status.phase == .starting || status.phase == .unhealthy
+            if active,
+                status.effectivePort == port || status.declaredPort == port
+                    || status.observedPort == port
+                    || (status.ports?.values.contains(port) ?? false)
+            {
+                return (project: status.project, server: status.server)
+            }
+        }
+        for (id, persisted) in await registry.allPersistedState() where id != targetID {
+            guard supervisors[id] == nil else { continue }
+            let active =
+                persisted.phase == .running || persisted.phase == .starting
+                || persisted.phase == .unhealthy
+            guard active, let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 else {
+                continue
+            }
+            guard let separator = id.range(of: "::") else { continue }
+            let project = String(id[id.startIndex..<separator.lowerBound])
+            let name = String(id[separator.upperBound...])
+            guard let merged = try? await mergedSpecs(project: project),
+                let spec = merged.specs.first(where: { $0.name == name })
+            else { continue }
+            let bound = persisted.boundPort ?? spec.port
+            let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
+            if let claim = resolved.claim, claim.allPorts.contains(port) {
+                return (project: project, server: name)
+            }
+            guard bound == port else { continue }
+            return (project: project, server: name)
+        }
+        return nil
     }
 
     /** The merged project view: committed devservers.json specs (source of
         truth for their names) plus ad-hoc registry entries. Throws
         config-invalid when the file exists but cannot be used. */
-    private func mergedSpecs(project: String) async throws -> (specs: [ServerSpec], fileNames: Set<String>) {
+    private func mergedSpecs(project: String) async throws -> (
+        host: String?, specs: [ServerSpec], fileNames: Set<String>
+    ) {
+        let project = canonicalProjectPath(project)
         var specs: [String: ServerSpec] = [:]
         for spec in await registry.specs(project: project) {
             specs[spec.name] = spec
         }
         var fileNames: Set<String> = []
+        var host: String?
         if let view = try loadConfig(project: project) {
             guard view.errors.isEmpty else {
                 throw WireError(
@@ -495,12 +860,15 @@ public actor Router {
                     hint: "run: devctl config check",
                     message: "devservers.json is invalid: \(view.errors.joined(separator: "; "))")
             }
+            host = view.host
             for spec in view.specs {
                 specs[spec.name] = spec
                 fileNames.insert(spec.name)
             }
         }
-        return (specs: specs.values.sorted { $0.name < $1.name }, fileNames: fileNames)
+        return (
+            host: host, specs: specs.values.sorted { $0.name < $1.name }, fileNames: fileNames
+        )
     }
 
     private func loadConfig(project: String) throws -> ProjectConfigView? {
@@ -530,7 +898,7 @@ public actor Router {
     /** Acquire: refuse if another live holder owns it, pause active declarers
         without retiring boot intent, persist the hold, return who was paused. */
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
-        let key = "\(params.project)::\(params.resource)"
+        let key = Self.lockKey(project: params.project, resource: params.resource)
         await releaseOrphanedLock(key: key)
         if let holder = resourceLocks[key], holder.pid != params.holderPid {
             throw WireError(
@@ -546,23 +914,26 @@ public actor Router {
             return LockResult(paused: existing.paused)
         }
         var paused: [String] = []
+        let shouldPause = params.pause ?? true
         let merged = try? await mergedSpecs(project: params.project)
-        for spec in merged?.specs ?? [] where (spec.locks ?? []).contains(params.resource) {
-            let supervisor = await supervisor(project: params.project, spec: spec)
-            let status = await supervisor.status()
-            switch status.phase {
-            case .running, .starting, .unhealthy, .stopping:
-                /** Non-retiring stop: boot intent survives so a daemon crash
-                    mid-hold can still bring the server back if the holder is gone. */
-                _ = await supervisor.stop(deliberate: false)
-                paused.append(spec.name)
-                DevCtlLog.daemon.info(
-                    "lock \(params.resource) paused \(spec.name)@\(params.project)")
-            case .stopped, .crashed, .failed:
-                break
+        if shouldPause {
+            for spec in merged?.specs ?? [] where (spec.locks ?? []).contains(params.resource) {
+                let supervisor = await supervisor(project: params.project, spec: spec)
+                let status = await supervisor.status()
+                switch status.phase {
+                case .running, .starting, .unhealthy, .stopping:
+                    /** Non-retiring stop: boot intent survives so a daemon crash
+                        mid-hold can still bring the server back if the holder is gone. */
+                    _ = await supervisor.stop(deliberate: false)
+                    paused.append(spec.name)
+                    DevCtlLog.daemon.info(
+                        "lock \(params.resource) paused \(spec.name)@\(params.project)")
+                case .stopped, .crashed, .failed:
+                    break
+                }
             }
+            paused.sort()
         }
-        paused.sort()
         resourceLocks[key] = LockHolder(
             paused: paused, pid: params.holderPid,
             resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
@@ -573,7 +944,7 @@ public actor Router {
     /** Release: only the matching holder clears the lock; then ensure everyone
         that was paused. */
     private func releaseLock(_ params: LockParams) async throws -> LockResult {
-        let key = "\(params.project)::\(params.resource)"
+        let key = Self.lockKey(project: params.project, resource: params.resource)
         guard let holder = resourceLocks[key], holder.pid == params.holderPid else {
             return LockResult(paused: [])
         }
@@ -618,8 +989,21 @@ public actor Router {
                 let merged = try await mergedSpecs(project: project)
                 guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
                 let supervisor = await supervisor(project: project, spec: spec)
+                let id = serverID(project: project, name: name)
+                let bound = await registry.persistedState(serverID: id)?.boundPort ?? spec.port
+                let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
+                if let claim = resolved.claim, let busy = await waitForClaimFree(claim: claim) {
+                    DevCtlLog.daemon.error(
+                        "lock \(resource) resume refused \(name)@\(project): port \(busy) still busy")
+                    continue
+                }
+                try await prepareSpawn(
+                    target: ServerTargetParams(name: name, project: project), supervisor: supervisor)
                 _ = await supervisor.ensure(timeoutSeconds: timeoutSeconds)
                 DevCtlLog.daemon.info("lock \(resource) resumed \(name)@\(project)")
+            } catch let error as WireError {
+                DevCtlLog.daemon.error(
+                    "lock \(resource) could not resume \(name)@\(project): \(error.message)")
             } catch {
                 DevCtlLog.daemon.error(
                     "lock \(resource) could not resume \(name)@\(project): \(error.localizedDescription)"
@@ -642,8 +1026,9 @@ public actor Router {
     }
 
     private func isPausedUnderLiveLock(project: String, name: String) -> Bool {
+        let prefix = "\(canonicalProjectPath(project))::"
         for (key, holder) in resourceLocks {
-            guard key.hasPrefix("\(project)::") else { continue }
+            guard key.hasPrefix(prefix) else { continue }
             guard kill(pid_t(holder.pid), 0) == 0 else { continue }
             if holder.paused.contains(name) { return true }
         }
@@ -661,7 +1046,7 @@ public actor Router {
         the lock exists to prevent. */
     private func lockGate(project: String, spec: ServerSpec) async throws {
         for resource in spec.locks ?? [] {
-            let key = "\(project)::\(resource)"
+            let key = Self.lockKey(project: project, resource: resource)
             await releaseOrphanedLock(key: key)
             if let holder = resourceLocks[key] {
                 throw WireError(
@@ -690,6 +1075,7 @@ public actor Router {
         /** An empty project means machine-wide (daemon restart, doctor, the app);
             machine-wide reads skip config errors rather than failing the sweep. */
         if params.project.isEmpty {
+            await pruneMissingProjects()
             var statuses: [ServerStatus] = []
             for project in await registry.allProjects() {
                 var specs = (try? await mergedSpecs(project: project))?.specs
@@ -710,10 +1096,46 @@ public actor Router {
         for spec in merged.specs {
             if let name = params.name, name != spec.name { continue }
             let supervisor = await supervisor(project: params.project, spec: spec)
-            statuses.append(await supervisor.status())
+            var status = await supervisor.status()
+            status = await annotateLatentPortConflict(status, excluding: serverID(project: params.project, name: spec.name))
+            statuses.append(status)
         }
         return ServerListResult(
             servers: statuses, trusted: await registry.isTrusted(project: params.project))
+    }
+
+    /** When a server is not up but its declared port is held, surface a latent
+        conflict so session context warns before the agent runs ensure. */
+    private func annotateLatentPortConflict(_ status: ServerStatus, excluding: String) async -> ServerStatus {
+        guard status.portConflict == nil else { return status }
+        switch status.phase {
+        case .stopped, .crashed, .failed:
+            break
+        case .running, .starting, .stopping, .unhealthy:
+            return status
+        }
+        guard let port = status.declaredPort ?? status.effectivePort else { return status }
+        var annotated = status
+        if let holder = await managedHolder(port: port, excluding: excluding) {
+            let sibling = CheckoutIdentity.shareCommonDir(status.project, holder.project)
+            annotated.portConflict = PortConflict(
+                declaredPort: port,
+                holder: "\(holder.server)@\(holder.project)",
+                message: sibling
+                    ? "port \(port) held by sibling '\(holder.server)' in \(holder.project); ensure will auto-rebind"
+                    : "port \(port) held by '\(holder.server)' in \(holder.project); run: devctl stop \(holder.server) --project \(holder.project)",
+                state: .held)
+        } else if PortGuard.isListening(port: port) {
+            let detail = PortGuard.listenerInfo(port: port).map {
+                "unmanaged pid \($0.pid) (\($0.command))"
+            } ?? "an unmanaged listener"
+            annotated.portConflict = PortConflict(
+                declaredPort: port,
+                holder: detail,
+                message: "port \(port) held by \(detail)",
+                state: .held)
+        }
+        return annotated
     }
 
     /** Wave-parallel group start honoring the dependency graph: a wave holds
@@ -740,6 +1162,18 @@ public actor Router {
         for spec in wanted {
             await recordTrustIfNeeded(
                 project: params.project, name: spec.name, fileNames: merged.fileNames)
+        }
+        /** Port ownership is checked for the whole set before anything spawns, so
+            a held port refuses the rollout instead of leaving half a project up
+            next to a server that lost a race it never knew it entered. Servers
+            already up skip the check against their own listeners. */
+        for spec in wanted {
+            let target = ServerTargetParams(
+                name: spec.name, port: params.port, project: params.project)
+            try await prepareSpawn(
+                target: target,
+                supervisor: await supervisor(project: params.project, spec: spec),
+                portOverride: params.port)
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
             throw WireError(
@@ -817,9 +1251,19 @@ public actor Router {
     }
 
     private func supervisor(project: String, spec: ServerSpec) async -> ServerSupervisor {
+        let project = canonicalProjectPath(project)
         let id = serverID(project: project, name: spec.name)
         if let existing = supervisors[id] {
-            await existing.updateSpec(spec)
+            /** A live run holds a materialized spawn spec (effective port, worktree
+                host, rewritten url). Re-resolving committed config for status must
+                not clobber that, or agents see the declared origin and a false
+                "config changed since start". */
+            switch await existing.status().phase {
+            case .running, .starting, .unhealthy, .stopping:
+                break
+            case .stopped, .crashed, .failed:
+                await existing.updateSpec(spec)
+            }
             return existing
         }
         let created = ServerSupervisor(

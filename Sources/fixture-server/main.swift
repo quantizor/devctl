@@ -7,6 +7,7 @@ import Foundation
     --spawn-grandchild     spawn a `sleep 1000` child (group-kill verification)
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
+    --err-lines N          write N lines to stderr at startup (error-tally fixture)
     --flood                write lines as fast as possible
     Default behavior: print a heartbeat line every 200ms. */
 
@@ -16,6 +17,7 @@ var exitCode: Int32 = 0
 var spawnGrandchild = false
 var ignoreSigterm = false
 var emitBinary = false
+var errLines = 0
 var flood = false
 
 var argIterator = CommandLine.arguments.dropFirst().makeIterator()
@@ -33,6 +35,8 @@ while let arg = argIterator.next() {
         ignoreSigterm = true
     case "--emit-binary":
         emitBinary = true
+    case "--err-lines":
+        errLines = argIterator.next().flatMap { Int($0) } ?? 0
     case "--flood":
         flood = true
     default:
@@ -58,6 +62,12 @@ if spawnGrandchild {
 if emitBinary {
     let junk: [UInt8] = [0xFF, 0xFE, 0x00, 0x80, 0x0A]
     FileHandle.standardOutput.write(Data(junk))
+}
+
+/** A distinctive token so a test can assert the raw child bytes never leak into
+    the agent context block, while its count is still surfaced. */
+for index in 0..<errLines {
+    FileHandle.standardError.write(Data("FIXTURE-ERR-TOKEN line \(index)\n".utf8))
 }
 
 if let listenPort {

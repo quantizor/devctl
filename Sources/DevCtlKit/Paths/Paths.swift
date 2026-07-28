@@ -47,6 +47,7 @@ public struct DevCtlPaths: Sendable {
     /** Per-server log directory: `<slug>-<hash8>/<server>`. The slug keeps paths
         human-readable; the hash keeps distinct projects with one basename apart. */
     public func serverLogDir(project: String, server: String) -> URL {
+        let project = canonicalProjectPath(project)
         let slug = (project as NSString).lastPathComponent
             .lowercased()
             .replacing(/[^a-z0-9-]+/) { _ in "-" }

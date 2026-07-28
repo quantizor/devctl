@@ -165,4 +165,46 @@ private func stopServer(router: Router, project: String, name: String) async {
         #expect(api?.pid != nil)
         await stopServer(router: router, project: env.projectPath, name: "api")
     }
+
+    @Test func whyDiagnosesConfigDefinedServer() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "exit 7"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        #expect(await registry.spec(project: env.projectPath, name: "web") == nil)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let startLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "start", method: WireMethod.serverStart.rawValue,
+                params: ServerTargetParams(name: "web", project: env.projectPath)))
+        _ = await router.handle(line: startLine)
+        var phase: ServerPhase = .starting
+        for _ in 0..<50 {
+            let web = try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "web" }
+            phase = web?.phase ?? .starting
+            if phase == .crashed { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(phase == .crashed)
+        let whyLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "why", method: WireMethod.serverWhy.rawValue,
+                params: ServerTargetParams(name: "web", project: env.projectPath)))
+        let whyData = await router.handle(line: whyLine)
+        let whyResponse = try JSONCoding.decoder().decode(
+            WireResponse<WhyResult>.self, from: whyData)
+        #expect(whyResponse.ok == true)
+        #expect(whyResponse.result?.findings.isEmpty == false)
+        #expect(whyResponse.result?.findings.first?.server == "web")
+        #expect(whyResponse.result?.rootCause?.contains("crashed") == true)
+    }
 }

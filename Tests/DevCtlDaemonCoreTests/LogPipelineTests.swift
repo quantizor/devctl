@@ -110,9 +110,12 @@ private func tempDir() throws -> URL {
             "web": ServerSpec(command: ["w"], dependsOn: ["api"], name: "web"),
             "api": ServerSpec(command: ["a"], name: "api"),
         ]
+        /** The caller supplies already stream-tagged lines (production passes
+            LogRecord.contextLine), so the engine appends them verbatim rather
+            than owning the prefix. */
         let result = WhyEngine.diagnose(
             target: "web", statuses: statuses, specs: specs,
-            errTail: { name in name == "api" ? ["ECONNREFUSED db:5432"] : [] })
+            evidenceLines: { name in name == "api" ? ["err: ECONNREFUSED db:5432"] : [] })
         #expect(result.rootCause?.hasPrefix("api: crashed (exit 1)") == true)
         #expect(result.findings.count == 2)
         #expect(result.findings.first?.server == "web")
@@ -125,7 +128,7 @@ private func tempDir() throws -> URL {
             target: "web",
             statuses: ["web": status("web", .running)],
             specs: ["web": ServerSpec(command: ["w"], name: "web")],
-            errTail: { _ in [] })
+            evidenceLines: { _ in [] })
         #expect(result.rootCause == nil)
         #expect(result.findings.first?.summary == "running and healthy")
     }
@@ -138,7 +141,34 @@ private func tempDir() throws -> URL {
             target: "web",
             statuses: ["web": mismatched],
             specs: ["web": ServerSpec(command: ["w"], name: "web", port: 3000)],
-            errTail: { _ in [] })
+            evidenceLines: { _ in [] })
         #expect(result.findings.first?.summary.contains("listening on 3001") == true)
+    }
+
+    @Test func crashedExit0SurfacesStdoutEvidence() {
+        var crashed = status("web", .crashed, exit: 0)
+        crashed.recentLogTail = ["[out] Another vinext REFUSAL-TOKEN already running"]
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": crashed],
+            specs: ["web": ServerSpec(command: ["true"], name: "web")],
+            evidenceLines: { _ in [] })
+        let finding = result.findings.first
+        #expect(finding?.summary.contains("exit 0") == true)
+        #expect(finding?.summary.contains("controlled refusal") == true)
+        #expect(finding?.evidence.contains(where: { $0.contains("REFUSAL-TOKEN") }) == true)
+    }
+
+    @Test func prefersTerminalEvidenceWhenTailCleared() {
+        var crashed = status("web", .crashed, exit: 0)
+        crashed.terminalEvidence = ["[out] persisted REFUSAL-TOKEN"]
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": crashed],
+            specs: ["web": ServerSpec(command: ["true"], name: "web")],
+            evidenceLines: { _ in ["[err] should-not-win"] })
+        let finding = result.findings.first
+        #expect(finding?.evidence.contains(where: { $0.contains("persisted REFUSAL-TOKEN") }) == true)
+        #expect(finding?.evidence.contains(where: { $0.contains("should-not-win") }) != true)
     }
 }

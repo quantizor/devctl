@@ -162,6 +162,11 @@ public struct DeepLink: Sendable, Equatable, Codable {
         case 1:
             return .success(matches[0])
         default:
+            /** Prefer the main checkout when a worktree shares the basename. */
+            let mains = matches.filter { !CheckoutIdentity.isLinkedWorktree(project: $0) }
+            if mains.count == 1 {
+                return .success(mains[0])
+            }
             let candidates = matches.sorted().joined(separator: ", ")
             return .failure(
                 WireError(

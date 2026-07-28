@@ -20,6 +20,8 @@ cleanup() {
   # Grandchildren escape the process group on purpose (that is what the teardown
   # assertions exercise), so a group kill leaves them behind. Reap them by pid.
   for stray in ${STRAY_PIDS:-}; do kill -9 "$stray" 2>/dev/null || true; done
+  # Orphans from a mid-smoke abort can hold fixed listen ports across reruns.
+  pkill -f "$BIN/fixture-server" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -65,7 +67,7 @@ pass "ensure no-op on healthy server"
 # Cross-project port conflict: a second project declaring the same port must be refused.
 PROJECT2="$WORK/project2"
 mkdir -p "$PROJECT2"
-TCP_PORT=39871
+TCP_PORT=$((39000 + (RANDOM % 500)))
 "$DEVCTL" register --name tcp --cmd "$BIN/fixture-server" --cmd --listen-tcp --cmd "$TCP_PORT" --port "$TCP_PORT" --json > /dev/null
 "$DEVCTL" ensure tcp --timeout 10 --json > /dev/null || fail "tcp fixture never became healthy"
 pass "tcp healthcheck (port $TCP_PORT)"
@@ -126,13 +128,15 @@ CHILD_PID=""
 # Phase 5: a real devservers.json project with dependencies, trust, up/down.
 PROJECT3="$WORK/project3"
 mkdir -p "$PROJECT3"
+P3_DB=$((41000 + (RANDOM % 500)))
+P3_WEB=$((P3_DB + 1))
 cat > "$PROJECT3/devservers.json" <<CFG
 {
   "version": 1,
   "host": "smoketest.localhost",
   "servers": {
-    "db": { "command": ["$BIN/fixture-server", "--listen-tcp", "39901"], "port": 39901 },
-    "web": { "command": ["$BIN/fixture-server", "--listen-tcp", "39902"], "dependsOn": ["db"], "port": 39902 }
+    "db": { "command": ["$BIN/fixture-server", "--listen-tcp", "$P3_DB"], "port": $P3_DB },
+    "web": { "command": ["$BIN/fixture-server", "--listen-tcp", "$P3_WEB"], "dependsOn": ["db"], "port": $P3_WEB }
   }
 }
 CFG
@@ -145,11 +149,15 @@ cd "$PROJECT3"
 "$DEVCTL" config check --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["errors"]==[], d; assert d["host"]=="smoketest.localhost", d' || fail "config check"
 pass "config check validates devservers.json"
 
-UP_OUT="$("$DEVCTL" up --timeout 15 --json)"
+set +e
+UP_OUT="$("$DEVCTL" up --timeout 15 --json 2>/tmp/devctl-smoke-up.err)"
+UP_EXIT=$?
+set -e
+[[ "$UP_EXIT" -eq 0 ]] || fail "up exit $UP_EXIT: $UP_OUT $(cat /tmp/devctl-smoke-up.err 2>/dev/null)"
 echo "$UP_OUT" | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert all(r.get("reason") is None for r in d["results"]), d; assert len(d["results"])==2, d' || fail "up did not bring both servers healthy: $UP_OUT"
 pass "up brings the project healthy in dependency order"
 
-"$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)["servers"][0]; assert d["url"]=="http://smoketest.localhost:39902/", d' || fail "derived url wrong"
+"$DEVCTL" status web --json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['servers'][0]; assert d['url']=='http://smoketest.localhost:$P3_WEB/', d" || fail "derived url wrong"
 pass "host signature url derived"
 
 "$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("trusted") is True, d' || fail "project not trusted after up"
@@ -158,6 +166,44 @@ pass "trust recorded by explicit up"
 "$DEVCTL" down --json > /dev/null
 "$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert all(s["phase"]=="stopped" for s in d["servers"]), d' || fail "down left servers running"
 pass "down stops the project"
+
+# Derived error facts + agent context safety: a crasher writes distinctively
+# tagged stderr, then dies. devctl must count those lines (its own arithmetic)
+# and inject a `devctl why` command, while never leaking the raw child bytes
+# into the context block the session hook feeds an agent.
+PROJECT_CRASH="$WORK/project-crash"
+mkdir -p "$PROJECT_CRASH"
+cat > "$PROJECT_CRASH/devservers.json" <<CFG
+{
+  "version": 1,
+  "host": "crash.localhost",
+  "servers": {
+    "flaky": { "command": ["$BIN/fixture-server", "--err-lines", "3", "--exit-after", "0.4", "--code", "1"] }
+  }
+}
+CFG
+cd "$PROJECT_CRASH"
+set +e
+"$DEVCTL" ensure flaky --timeout 5 --json > /dev/null 2>&1
+set -e
+# Poll for the terminal phase; the fixture exits shortly after start.
+for i in {1..50}; do
+  CRASH_PHASE="$("$DEVCTL" status flaky --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["phase"])')"
+  [[ "$CRASH_PHASE" == "crashed" ]] && break
+  sleep 0.1
+done
+[[ "$CRASH_PHASE" == "crashed" ]] || fail "crasher never reached crashed (was $CRASH_PHASE)"
+"$DEVCTL" status flaky --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)["servers"][0]; s=d.get("errorSummary"); assert s and s["count"]>=3, d' || fail "errorSummary did not count the stderr lines"
+pass "status carries a derived error count"
+
+CONTEXT_OUT="$("$DEVCTL" context)"
+echo "$CONTEXT_OUT" | grep -q "run: devctl why flaky --json" || fail "context omitted the why recommendation: $CONTEXT_OUT"
+echo "$CONTEXT_OUT" | grep -q "error line" || fail "context omitted the error count line: $CONTEXT_OUT"
+if echo "$CONTEXT_OUT" | grep -q "FIXTURE-ERR-TOKEN"; then
+  fail "SECURITY: raw child stderr leaked into the agent context block"
+fi
+pass "context recommends devctl why and never leaks raw child output"
+cd "$PROJECT3"
 
 # Resource locks: db declares the resource; lock pauses it, refuses ensure, resumes after.
 /usr/bin/python3 - "$PROJECT3/devservers.json" <<'PY'
@@ -174,6 +220,83 @@ LOCK_EXIT=$?
 PHASE_AFTER="$("$DEVCTL" wait db --healthy --timeout 15 --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["phase"])')"
 [[ "$PHASE_AFTER" == "running" ]] || fail "db did not resume after lock (phase $PHASE_AFTER)"
 pass "resource lock pauses holder, refuses ensure, resumes after"
+"$DEVCTL" down --json > /dev/null
+
+# Deep-link and lock --no-pause coverage stay below; worktree coexistence first.
+
+# Sibling worktree coexistence: shared git common-dir auto-rebinds the linked
+# checkout onto a free port and a worktree-* host while main keeps the declared
+# origin. Fixture listens on {port} so materialization is load-bearing.
+WT_ROOT="$WORK/wt-coexist"
+mkdir -p "$WT_ROOT/main"
+cd "$WT_ROOT/main"
+git init -b main >/dev/null
+git config user.email "smoke@devctl.test"
+git config user.name "devctl-smoke"
+echo ok > README
+git add README
+git commit -m init >/dev/null
+mkdir -p "$WT_ROOT/worktrees"
+git worktree add -b review "$WT_ROOT/worktrees/review" >/dev/null
+WT_PORT=$((52000 + (RANDOM % 1000)))
+cat > "$WT_ROOT/main/devservers.json" <<CFG
+{
+  "host": "smoke.localhost",
+  "servers": {
+    "web": {
+      "command": ["$BIN/fixture-server", "--listen-tcp", "{port}"],
+      "healthcheck": { "type": "tcp", "port": $WT_PORT },
+      "port": $WT_PORT,
+      "url": "http://smoke.localhost:$WT_PORT/"
+    }
+  },
+  "version": 1
+}
+CFG
+cp "$WT_ROOT/main/devservers.json" "$WT_ROOT/worktrees/review/devservers.json"
+cd "$WT_ROOT/main"
+set +e
+MAIN_ENSURE="$("$DEVCTL" ensure web --timeout 15 --json 2>/tmp/devctl-smoke-main-ensure.err)"
+MAIN_ENSURE_EXIT=$?
+set -e
+[[ "$MAIN_ENSURE_EXIT" -eq 0 ]] || fail "main worktree ensure exit $MAIN_ENSURE_EXIT: $MAIN_ENSURE $(cat /tmp/devctl-smoke-main-ensure.err 2>/dev/null)"
+echo "$MAIN_ENSURE" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['server']; assert d['phase']=='running', d; assert d.get('effectivePort')==$WT_PORT, d; assert d['url']=='http://smoke.localhost:$WT_PORT/', d; assert d.get('portConflict') is None, d" || fail "main worktree ensure: $MAIN_ENSURE"
+pass "main checkout keeps declared host and port"
+cd "$WT_ROOT/worktrees/review"
+set +e
+WT_ENSURE="$("$DEVCTL" ensure web --timeout 15 --json 2>/tmp/devctl-smoke-wt-ensure.err)"
+WT_ENSURE_EXIT=$?
+set -e
+[[ "$WT_ENSURE_EXIT" -eq 0 ]] || fail "linked worktree ensure exit $WT_ENSURE_EXIT: $WT_ENSURE $(cat /tmp/devctl-smoke-wt-ensure.err 2>/dev/null)"
+echo "$WT_ENSURE" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['server']; assert d['phase']=='running', d; assert d.get('effectivePort')!=$WT_PORT, d; assert d.get('portConflict',{}).get('state')=='rebound', d; assert 'worktree-review.smoke.localhost' in (d.get('url') or ''), d" || fail "linked worktree ensure: $WT_ENSURE"
+pass "linked worktree auto-rebinds with worktree-* host"
+CTX="$("$DEVCTL" context)"
+echo "$CTX" | grep -q "worktree-review.smoke.localhost" || fail "context omitted worktree URL: $CTX"
+pass "worktree context advertises ephemeral URL"
+"$DEVCTL" stop web --json > /dev/null
+cd "$WT_ROOT/main"
+"$DEVCTL" stop web --json > /dev/null
+"$DEVCTL" unregister web --json > /dev/null || true
+cd "$WT_ROOT/worktrees/review"
+"$DEVCTL" unregister web --json > /dev/null || true
+pass "worktree coexistence cleaned up"
+
+# lock --no-pause: holder stays up while the lock is held.
+cd "$PROJECT3"
+"$DEVCTL" up --timeout 15 --json > /dev/null || fail "up before --no-pause"
+NO_PAUSE_STATUS="$WORK/no-pause-status.json"
+set +e
+"$DEVCTL" lock data --no-pause -- "$DEVCTL" status db --json > "$NO_PAUSE_STATUS" 2>"$WORK/no-pause.err"
+NO_PAUSE_EXIT=$?
+set -e
+[[ "$NO_PAUSE_EXIT" -eq 0 ]] || fail "lock --no-pause failed ($NO_PAUSE_EXIT): $(head -c 400 "$NO_PAUSE_STATUS" 2>/dev/null) $(cat "$WORK/no-pause.err" 2>/dev/null)"
+# Drop any human pause lines lock might print; the status JSON is the last object.
+NO_PAUSE_PHASE="$(/usr/bin/python3 -c 'import json,sys; lines=open(sys.argv[1]).read().splitlines();
+objs=[json.loads(l) for l in lines if l.strip().startswith("{")];
+assert objs, open(sys.argv[1]).read();
+print(objs[-1]["servers"][0]["phase"])' "$NO_PAUSE_STATUS")"
+[[ "$NO_PAUSE_PHASE" == "running" ]] || fail "lock --no-pause paused db (phase $NO_PAUSE_PHASE; out=$(cat "$NO_PAUSE_STATUS"))"
+pass "lock --no-pause leaves declarer running"
 "$DEVCTL" down --json > /dev/null
 
 # Deep links: print URL + dispatch via x-url (no Launch Services).

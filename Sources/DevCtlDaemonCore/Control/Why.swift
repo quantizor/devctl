@@ -2,7 +2,7 @@ import DevCtlKit
 import Foundation
 
 /** The rule-based diagnosis behind `devctl why`: turn the data the daemon
-    already holds (phase, forensics, health, err-stream tails, the dependency
+    already holds (phase, forensics, health, spool evidence, the dependency
     graph) into a finding chain with a root-cause statement. */
 enum WhyEngine {
     /** Diagnoses `target` and walks dependsOn to find the deepest broken
@@ -11,7 +11,9 @@ enum WhyEngine {
         target: String,
         statuses: [String: ServerStatus],
         specs: [String: ServerSpec],
-        errTail: (String) -> [String]
+        /** Fallback evidence when status has no recentLogTail / terminalEvidence
+            (structured-log window since last exit or start). */
+        evidenceLines: (String) -> [String]
     ) -> WhyResult {
         var findings: [WhyFinding] = []
         var visited = Set<String>()
@@ -19,7 +21,7 @@ enum WhyEngine {
         var frontier = [target]
         while let name = frontier.popLast() {
             guard visited.insert(name).inserted, let status = statuses[name] else { continue }
-            let finding = describe(status: status, errTail: errTail)
+            let finding = describe(status: status, evidenceLines: evidenceLines)
             findings.append(finding)
             let broken = status.phase != .running && status.phase != .stopped
             if broken || status.phase == .stopped {
@@ -38,7 +40,9 @@ enum WhyEngine {
         return WhyResult(findings: findings, rootCause: rootCause)
     }
 
-    private static func describe(status: ServerStatus, errTail: (String) -> [String]) -> WhyFinding {
+    private static func describe(
+        status: ServerStatus, evidenceLines: (String) -> [String]
+    ) -> WhyFinding {
         var evidence: [String] = []
         var summary: String
         switch status.phase {
@@ -50,11 +54,13 @@ enum WhyEngine {
                 ?? status.lastExit?.signal.map { "signal \($0)" } ?? "unknown cause"
             let when = status.lastExit.map { JSONCoding.formatISO8601($0.at) } ?? "unknown time"
             summary = "crashed (\(cause)) at \(when)"
-            evidence.append(contentsOf: errTail(status.server).map { "err: \($0)" })
+            if status.lastExit?.code == 0 {
+                summary +=
+                    "; exit 0 is often a controlled refusal (framework lock, bind failure), not a crash"
+            }
         case .unhealthy:
             let since = status.lastHealthAt.map { JSONCoding.formatISO8601($0) } ?? "startup"
             summary = "healthcheck failing; last healthy \(since)"
-            evidence.append(contentsOf: errTail(status.server).map { "err: \($0)" })
         case .starting:
             summary = "still starting; healthcheck (\(status.healthcheck.rawValue)) has not passed yet"
         case .stopped:
@@ -64,9 +70,37 @@ enum WhyEngine {
         case .running:
             summary = "running and healthy"
         }
-        if let declared = status.declaredPort, let observed = status.observedPort, declared != observed {
+        switch status.phase {
+        case .crashed, .failed, .unhealthy, .starting:
+            if let tail = status.recentLogTail, !tail.isEmpty {
+                evidence.append(contentsOf: tail)
+            } else if let persisted = status.terminalEvidence, !persisted.isEmpty {
+                evidence.append(contentsOf: persisted)
+            } else {
+                evidence.append(contentsOf: evidenceLines(status.server))
+            }
+        case .running, .stopped, .stopping:
+            break
+        }
+        if let effective = status.effectivePort, let observed = status.observedPort,
+            effective != observed
+        {
+            summary += "; NOTE: listening on \(observed), not the effective \(effective)"
+            evidence.append("effective port \(effective), observed \(observed)")
+        } else if let declared = status.declaredPort, let observed = status.observedPort,
+            declared != observed
+        {
             summary += "; NOTE: listening on \(observed), not the declared \(declared)"
             evidence.append("declared port \(declared), observed \(observed)")
+        }
+        if let conflict = status.portConflict {
+            evidence.append("port conflict (\(conflict.state.rawValue)): \(conflict.message)")
+        }
+        if let ports = status.ports, !ports.isEmpty {
+            let rendered = ports.sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ", ")
+            evidence.append("named ports: \(rendered)")
         }
         if status.specStale == true {
             evidence.append("config changed since this process started (restart to apply)")

@@ -57,10 +57,31 @@ import Testing
             server: "web"
         )
         let json = String(data: try JSONCoding.encoder().encode(status), encoding: .utf8)!
-        /** Sorted keys make this deterministic; the golden string is the contract. */
+        /** Sorted keys make this deterministic; the golden string is the contract.
+            A nil errorSummary is omitted, so this shape is unchanged by the field. */
         #expect(
             json
                 == #"{"declaredPort":3000,"healthcheck":"none","lastExit":{"at":"2025-07-18T19:46:40.000Z","code":1},"logPath":"/logs/web/current.log","phase":"crashed","project":"/tmp/proj","server":"web"}"#
+        )
+    }
+
+    @Test func errorSummarySchemaGolden() throws {
+        let status = ServerStatus(
+            declaredPort: 3000,
+            errorSummary: ErrorSummary(
+                count: 3,
+                firstAt: Date(timeIntervalSince1970: 1_752_868_000),
+                lastAt: Date(timeIntervalSince1970: 1_752_868_004)),
+            healthcheck: .none,
+            logPath: "/logs/web/current.log",
+            phase: .crashed,
+            project: "/tmp/proj",
+            server: "web"
+        )
+        let json = String(data: try JSONCoding.encoder().encode(status), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"declaredPort":3000,"errorSummary":{"count":3,"firstAt":"2025-07-18T19:46:40.000Z","lastAt":"2025-07-18T19:46:44.000Z"},"healthcheck":"none","logPath":"/logs/web/current.log","phase":"crashed","project":"/tmp/proj","server":"web"}"#
         )
     }
 }
