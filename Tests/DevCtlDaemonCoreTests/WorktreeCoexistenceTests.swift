@@ -99,6 +99,76 @@ import Testing
             ServerResult.self)
     }
 
+    /** Discarding a worktree path stops its children and forgets registry/state
+        without touching the main checkout. */
+    @Test func discardedWorktreeIsPrunedOnMachineWideStatus() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let mainResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        #expect(mainResult.server.phase == .running)
+        let mainPid = try #require(mainResult.server.pid)
+        let mainProject = mainResult.server.project
+
+        let wtResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        #expect(wtResult.server.phase == .running)
+        let wtPid = try #require(wtResult.server.pid)
+        let wtPort = try #require(wtResult.server.effectivePort)
+        let wtProject = wtResult.server.project
+
+        try FileManager.default.removeItem(atPath: env.worktree)
+        #expect(!FileManager.default.fileExists(atPath: env.worktree))
+
+        let after = try await handle(
+            router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
+        #expect(!after.servers.contains { $0.project == wtProject })
+        #expect(after.servers.contains { $0.project == mainProject && $0.phase == .running })
+        #expect(await registry.project(wtProject) == nil)
+        #expect(await registry.persistedState(serverID: serverID(project: wtProject, name: "web")) == nil)
+        #expect(kill(pid_t(wtPid), 0) != 0)
+        #expect(kill(pid_t(mainPid), 0) == 0)
+        #expect(!LoopbackProbe.isListening(port: wtPort))
+
+        /** Second prune is a no-op: machine-wide status still lists main only. */
+        let again = try await handle(
+            router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
+        #expect(again.servers.allSatisfy { $0.project == mainProject })
+        #expect(await registry.project(mainProject) != nil)
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: mainProject),
+            ServerResult.self)
+    }
+
+    @Test func discardedWorktreeIsPrunedOnRecoverAtStartup() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let wtResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        #expect(wtResult.server.phase == .running)
+        let wtPid = try #require(wtResult.server.pid)
+        let wtProject = wtResult.server.project
+        let mainProject = canonicalProjectPath(env.main)
+
+        try FileManager.default.removeItem(atPath: env.worktree)
+        await router.recoverAtStartup()
+        #expect(await registry.project(wtProject) == nil)
+        #expect(kill(pid_t(wtPid), 0) != 0)
+        #expect(await registry.project(mainProject) != nil)
+    }
+
     private func run(in cwd: String, _ exe: String, _ args: String...) throws {
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: cwd)

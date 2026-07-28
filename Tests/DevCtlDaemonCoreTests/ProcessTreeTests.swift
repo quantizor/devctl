@@ -27,6 +27,18 @@ import Testing
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: snap) == true)
     }
 
+    @Test func identityOfSelfMatchesLiveProcess() throws {
+        let pid = getpid()
+        let identity = try #require(ProcessTree.identity(of: pid))
+        #expect(identity.pid == pid)
+        #expect(ProcessTree.shouldSignal(snapshotted: identity, live: ProcessTree.identity(of: pid)))
+        let forged = ProcessIdentity(
+            pid: pid, startSeconds: identity.startSeconds &+ 1, startMicroseconds: 0)
+        #expect(
+            ProcessTree.shouldSignal(snapshotted: forged, live: ProcessTree.identity(of: pid))
+                == false)
+    }
+
     @Test func failedDescendantsAreNotEmptySuccess() {
         /** Live sweep against a nonsense pid still returns .ok([]) (no children),
             never .failed. Failure is a sysctl errno path; assert the result type

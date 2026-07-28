@@ -231,13 +231,17 @@ public actor ServerSupervisor {
         stopRequested = true
         stopWasDeliberate = deliberate
         phase = .stopping
+        /** Capture before any signal: after the grace window the pid number may
+            name a different process, and SIGKILL must not follow a recycled id. */
+        let rootIdentity = ProcessTree.identity(of: target)
         let snapshotResult = ProcessTree.descendants(of: target)
         if case .failed(let code) = snapshotResult {
             DevCtlLog.supervisor.error(
                 "descendant sweep failed before SIGTERM (errno \(code)); group-only teardown")
         }
         let snapshot = snapshotResult.identities
-        ProcessTree.signalTree(rootPid: target, descendants: snapshot, signal: SIGTERM)
+        ProcessTree.signalTree(
+            descendants: snapshot, rootPid: target, signal: SIGTERM)
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
         while ContinuousClock.now < deadline {
             if runTask == nil { break }
@@ -256,9 +260,13 @@ public actor ServerSupervisor {
             byPid[identity.pid] = identity
         }
         let escalation = Array(byPid.values)
-        if kill(target, 0) == 0 {
+        if let rootIdentity,
+            ProcessTree.shouldSignal(
+                snapshotted: rootIdentity, live: ProcessTree.identity(of: target))
+        {
             ProcessTree.signalTree(
-                rootPid: target, descendants: escalation, signal: SIGKILL, revalidate: true)
+                descendants: escalation, revalidate: true, rootIdentity: rootIdentity,
+                rootPid: target, signal: SIGKILL)
         } else {
             ProcessTree.escalateIndividuals(escalation)
         }

@@ -115,9 +115,12 @@ public actor Router {
                 return try respond(id: head.id, result: ServerResult(server: await supervisor.start()))
             case .serverStatus:
                 let request = try decoder.decode(WireRequest<ProjectParams>.self, from: line)
-                let params = ProjectParams(
-                    name: request.params.name,
-                    project: canonicalProjectPath(request.params.project))
+                /** Empty project means machine-wide; do not canonicalize it or it
+                    becomes the daemon cwd and the sweep never runs. */
+                let project = request.params.project.isEmpty
+                    ? ""
+                    : canonicalProjectPath(request.params.project)
+                let params = ProjectParams(name: request.params.name, project: project)
                 return try respond(id: head.id, result: try await statusList(params))
             case .projectTrust:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
@@ -338,15 +341,29 @@ public actor Router {
         }
     }
 
-    /** Startup recovery: reconcile persisted locks first, then restore servers
-        with boot intent. A recorded pid that is gone becomes crashed(daemon-restart);
-        a live orphan (its spool fd kept it healthy while the daemon was away) is
-        group-killed, since exit forensics are unknowable for non-children. Never
-        adopted silently. What comes back: any server whose start intent survives
-        (resumeOnBoot), which a machine shutdown's drain leaves set, plus the
-        classic daemon-crash case of a phase left running/starting. A deliberate
-        stop clears the flag, so only those stay down. Servers still paused under
-        a live resource lock are left alone: starting them would fight the harness.
+    /** Forget registered projects whose checkout path is gone: stop children,
+        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
+        (boot + machine-wide status), not a watcher. */
+    /** Forget registered projects whose checkout path is gone: stop children,
+        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
+        (boot + machine-wide status), not a watcher. */
+    public func pruneMissingProjects() async {
+        for project in await registry.allProjects() {
+            if FileManager.default.fileExists(atPath: project) { continue }
+            await forgetMissingProject(project)
+        }
+    }
+
+    /** Startup recovery: prune vanished checkouts first, reconcile persisted
+        locks, then restore servers with boot intent. A recorded pid that is gone
+        becomes crashed(daemon-restart); a live orphan (its spool fd kept it
+        healthy while the daemon was away) is group-killed, since exit forensics
+        are unknowable for non-children. Never adopted silently. What comes back:
+        any server whose start intent survives (resumeOnBoot), which a machine
+        shutdown's drain leaves set, plus the classic daemon-crash case of a
+        phase left running/starting. A deliberate stop clears the flag, so only
+        those stay down. Servers still paused under a live resource lock are left
+        alone: starting them would fight the harness.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
@@ -354,6 +371,7 @@ public actor Router {
         committed server on boot. A rename/delete with no matching spec drops the
         orphaned state row instead of retrying forever. */
     public func recoverAtStartup() async {
+        await pruneMissingProjects()
         await reconcileLocksAtStartup()
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
@@ -379,27 +397,10 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
-                if let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 {
-                    let sweep = ProcessTree.descendants(of: pid)
-                    if case .failed(let code) = sweep {
-                        DevCtlLog.daemon.error(
-                            "orphan bounce descendant sweep failed (errno \(code)); group-only")
-                    }
-                    let descendants = sweep.identities
-                    ProcessTree.signalTree(rootPid: pid, descendants: descendants, signal: SIGTERM)
-                    /** Poll instead of a fixed 2s sleep: most orphans die on
-                        SIGTERM in well under a second. */
-                    let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
-                    while ContinuousClock.now < graceDeadline, kill(pid, 0) == 0 {
-                        try? await Task.sleep(for: .milliseconds(50))
-                    }
-                    if kill(pid, 0) == 0 {
-                        ProcessTree.signalTree(
-                            rootPid: pid, descendants: descendants, signal: SIGKILL, revalidate: true)
-                    }
-                    await events.post(
-                        kind: .crashed, project: project, server: name,
-                        detail: "daemon-restart: orphan pid \(pid) bounced")
+                if let pid = persisted.pid.map(pid_t.init),
+                    let identity = ProcessTree.identity(of: pid)
+                {
+                    await bounceOrphan(identity, project: project, name: name)
                 } else if leftActive {
                     await events.post(
                         kind: .crashed, project: project, server: name, detail: "daemon-restart")
@@ -460,6 +461,119 @@ public actor Router {
                 DevCtlLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
                 try? await registry.removeState(serverID: id)
             }
+        }
+    }
+
+    /** Group-kill a live non-child left over from a prior daemon (or a prune that
+        could not stop through the supervisor). Signals only while the snapshotted
+        start time still matches: a recycled pid must not be killed. */
+    private func bounceOrphan(
+        _ root: ProcessIdentity, project: String, name: String
+    ) async {
+        guard ProcessTree.shouldSignal(
+            snapshotted: root, live: ProcessTree.identity(of: root.pid))
+        else {
+            DevCtlLog.daemon.info(
+                "orphan bounce skip \(name)@\(project): pid \(root.pid) gone or reused")
+            return
+        }
+        let pid = root.pid
+        let sweep = ProcessTree.descendants(of: pid)
+        if case .failed(let code) = sweep {
+            DevCtlLog.daemon.error(
+                "orphan bounce descendant sweep failed (errno \(code)); group-only")
+        }
+        let descendants = sweep.identities
+        ProcessTree.signalTree(
+            descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
+            signal: SIGTERM)
+        /** Poll with identity, not kill(pid,0): a recycled number must end the
+            wait as "gone" rather than escalate into the new process. */
+        let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < graceDeadline,
+            ProcessTree.shouldSignal(
+                snapshotted: root, live: ProcessTree.identity(of: pid))
+        {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if ProcessTree.shouldSignal(
+            snapshotted: root, live: ProcessTree.identity(of: pid))
+        {
+            ProcessTree.signalTree(
+                descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
+                signal: SIGKILL)
+        }
+        await events.post(
+            kind: .crashed, project: project, server: name,
+            detail: "daemon-restart: orphan pid \(pid) bounced")
+    }
+
+    /** Stop and forget one vanished checkout. Config is unreadable once the path
+        is gone, so this walks supervisors + registry + state directly instead of
+        groupDown / mergedSpecs. `project` must be the registry key as stored
+        (already canonical at registration): re-canonicalizing a deleted path can
+        change `/private/var` ↔ `/var` spelling and miss every lookup. */
+    private func forgetMissingProject(_ project: String) async {
+        let prefix = "\(project)::"
+        /** Snapshot identities before teardown: a composite tree can outlive a
+            no-op stop (phase already crashed/failed after the checkout vanished),
+            so we keep the recorded ProcessIdentity and bounce only while that
+            start time still matches. */
+        var liveRoots: [(identity: ProcessIdentity, name: String)] = []
+        var names = Set(await registry.specs(project: project).map(\.name))
+        for (id, supervisor) in supervisors where id.hasPrefix(prefix) {
+            guard let separator = id.range(of: "::") else { continue }
+            let name = String(id[separator.upperBound...])
+            names.insert(name)
+            let status = await supervisor.status()
+            if let pid = status.pid.map(pid_t.init),
+                let identity = ProcessTree.identity(of: pid)
+            {
+                liveRoots.append((identity: identity, name: name))
+            }
+        }
+        for (id, persisted) in await registry.allPersistedState() where id.hasPrefix(prefix) {
+            guard let separator = id.range(of: "::") else { continue }
+            let name = String(id[separator.upperBound...])
+            names.insert(name)
+            if let pid = persisted.pid.map(pid_t.init),
+                let identity = ProcessTree.identity(of: pid),
+                !liveRoots.contains(where: { $0.identity.pid == pid })
+            {
+                liveRoots.append((identity: identity, name: name))
+            }
+        }
+        let sortedNames = names.sorted()
+        DevCtlLog.daemon.info(
+            "prune missing project \(project) (\(sortedNames.joined(separator: ",")))")
+        for name in sortedNames {
+            let id = serverID(project: project, name: name)
+            if let supervisor = supervisors[id] {
+                _ = await supervisor.stop()
+                await events.post(
+                    kind: .stopped, project: project, server: name, detail: "project path gone")
+            }
+            supervisors[id] = nil
+        }
+        for entry in liveRoots {
+            guard ProcessTree.shouldSignal(
+                snapshotted: entry.identity, live: ProcessTree.identity(of: entry.identity.pid))
+            else { continue }
+            await bounceOrphan(entry.identity, project: project, name: entry.name)
+        }
+        configCache[project] = nil
+        let lockKeys = resourceLocks.keys.filter { $0.hasPrefix(prefix) }
+        if !lockKeys.isEmpty {
+            for key in lockKeys {
+                resourceLocks[key] = nil
+            }
+            persistLocks()
+        }
+        try? await registry.removeState(forProject: project)
+        try? await registry.removeProject(project)
+        for name in sortedNames {
+            await events.post(
+                kind: .unregistered, project: project, server: name, detail: "project path gone")
         }
     }
 
@@ -902,6 +1016,7 @@ public actor Router {
         /** An empty project means machine-wide (daemon restart, doctor, the app);
             machine-wide reads skip config errors rather than failing the sweep. */
         if params.project.isEmpty {
+            await pruneMissingProjects()
             var statuses: [ServerStatus] = []
             for project in await registry.allProjects() {
                 var specs = (try? await mergedSpecs(project: project))?.specs

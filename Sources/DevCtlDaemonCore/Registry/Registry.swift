@@ -131,6 +131,15 @@ public actor Registry {
         try persistRegistry()
     }
 
+    /** Drop a project entirely (trust + ad-hoc servers). Used when the checkout
+        path is gone so registry/Spotlight stop claiming it. */
+    public func removeProject(_ path: String) throws {
+        let project = Self.normalize(path)
+        guard registry.projects[project] != nil else { return }
+        registry.projects[project] = nil
+        try persistRegistry()
+    }
+
     public func persistedState(serverID: String) -> PersistedServerState? {
         state.servers[Self.normalizeServerID(serverID)]
     }
@@ -153,6 +162,17 @@ public actor Registry {
         let serverID = Self.normalizeServerID(serverID)
         guard state.servers[serverID] != nil else { return }
         state.servers[serverID] = nil
+        try persistState()
+    }
+
+    /** Drop every state row whose project prefix matches (discarded checkout). */
+    public func removeState(forProject path: String) throws {
+        let prefix = "\(Self.normalize(path))::"
+        let keys = state.servers.keys.filter { $0.hasPrefix(prefix) }
+        guard !keys.isEmpty else { return }
+        for key in keys {
+            state.servers[key] = nil
+        }
         try persistState()
     }
 

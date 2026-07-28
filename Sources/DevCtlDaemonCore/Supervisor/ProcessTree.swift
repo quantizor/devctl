@@ -86,18 +86,34 @@ public enum ProcessTree {
     }
 
     /** Signals the process group and every stray descendant outside it.
-        When `revalidate` is true, skip identities whose start time no longer
-        matches (PID reuse after a grace window). */
+        When `revalidate` is true, skip the root group signal and any descendant
+        whose start time no longer matches (PID reuse after a grace window).
+        `rootIdentity` is required for a revalidated group kill; without it only
+        matching descendants are signaled. */
     public static func signalTree(
-        rootPid: pid_t,
         descendants: [ProcessIdentity],
-        signal: Int32,
-        revalidate: Bool = false
+        revalidate: Bool = false,
+        rootIdentity: ProcessIdentity? = nil,
+        rootPid: pid_t,
+        signal: Int32
     ) {
-        kill(-rootPid, signal)
+        let rootStillOurs: Bool
+        if revalidate {
+            if let rootIdentity {
+                rootStillOurs = shouldSignal(
+                    snapshotted: rootIdentity, live: identity(of: rootPid))
+            } else {
+                rootStillOurs = false
+            }
+        } else {
+            rootStillOurs = true
+        }
+        if rootStillOurs {
+            kill(-rootPid, signal)
+        }
         for identity in descendants {
             if revalidate {
-                let live = liveIdentity(of: identity.pid)
+                let live = self.identity(of: identity.pid)
                 guard shouldSignal(snapshotted: identity, live: live) else { continue }
             }
             if getpgid(identity.pid) != rootPid {
@@ -110,7 +126,7 @@ public enum ProcessTree {
         root is already gone so group-directed kill no longer applies. */
     public static func escalateIndividuals(_ identities: [ProcessIdentity]) {
         for identity in identities {
-            let live = liveIdentity(of: identity.pid)
+            let live = self.identity(of: identity.pid)
             guard shouldSignal(snapshotted: identity, live: live) else { continue }
             kill(identity.pid, SIGKILL)
         }
@@ -153,7 +169,8 @@ public enum ProcessTree {
         return .failed(errno: ENOMEM)
     }
 
-    private static func liveIdentity(of pid: pid_t) -> ProcessIdentity? {
+    /** Live identity for `pid`, or nil if gone / not readable. */
+    public static func identity(of pid: pid_t) -> ProcessIdentity? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var length = MemoryLayout<kinfo_proc>.stride
         var info = kinfo_proc()

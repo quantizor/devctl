@@ -301,11 +301,15 @@ struct Status: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    @Argument(help: "Server name (omit for all).")
+    @Flag(help: "List every project the daemon knows (machine-wide).")
+    var all = false
+
+    @Argument(help: "Server name (omit for all servers in the project).")
     var name: String?
 
     func run() async throws {
-        let params = ProjectParams(name: name, project: global.resolvedProject())
+        let project = all ? "" : global.resolvedProject()
+        let params = ProjectParams(name: name, project: project)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
@@ -1093,7 +1097,8 @@ struct Doctor: AsyncParsableCommand {
                 } else {
                     findings.append(
                         Finding(
-                            detail: "\(project) no longer exists on disk (devctl doctor --fix prunes it)",
+                            detail:
+                                "\(project) no longer exists on disk (daemon auto-prunes missing projects; doctor --fix forces leftovers)",
                             kind: "stale-project", severity: "warning"))
                 }
             }
