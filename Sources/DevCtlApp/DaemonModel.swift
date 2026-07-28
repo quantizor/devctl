@@ -381,7 +381,8 @@ final class DaemonModel {
         else { return }
         for event in feed.events where event.at > lastEventCheck {
             lastEventCheck = max(lastEventCheck, event.at)
-            guard event.kind == .crashed || event.kind == .failed else { continue }
+            guard CrashNotificationPolicy.shouldNotify(kind: event.kind, detail: event.detail)
+            else { continue }
             let content = UNMutableNotificationContent()
             content.title = "\(event.server) \(event.kind.rawValue)"
             content.body = event.detail.map { "\($0) · \((event.project as NSString).lastPathComponent)" }

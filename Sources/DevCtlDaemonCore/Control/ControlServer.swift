@@ -291,9 +291,10 @@ public actor Router {
             case .serverWhy:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
                 _ = try await resolvedSupervisor(request.params)
+                let merged = try await mergedSpecs(project: request.params.project)
                 var statuses: [String: ServerStatus] = [:]
                 var specsByName: [String: ServerSpec] = [:]
-                for spec in await registry.specs(project: request.params.project) {
+                for spec in merged.specs {
                     let supervisor = await supervisor(project: request.params.project, spec: spec)
                     statuses[spec.name] = await supervisor.status()
                     specsByName[spec.name] = spec
@@ -421,39 +422,23 @@ public actor Router {
                 }
             }
         }
-        /** Start restores in parallel: a serial loop made a multi-server boot
-            look like a slow daemon even after the socket was already up. */
-        if !toStart.isEmpty {
-            await withTaskGroup(of: Void.self) { group in
-                for item in toStart {
-                    group.addTask {
-                        let supervisor = await self.supervisor(
-                            project: item.project, spec: item.spec)
-                        /** A boot restore is a spawn, so it can lose a port to a
-                            server another checkout already brought up (or to an
-                            unmanaged listener that survived the reboot). Refusing
-                            leaves the row crashed with a reason a human can read,
-                            which beats a silent second binder. */
-                        do {
-                            try await self.prepareSpawn(
-                                target: ServerTargetParams(
-                                    name: item.spec.name, project: item.project),
-                                supervisor: supervisor)
-                        } catch let error as WireError {
-                            DevCtlLog.daemon.error(
-                                "recover skip \(item.spec.name)@\(item.project): \(error.message)")
-                            return
-                        } catch {
-                            DevCtlLog.daemon.error(
-                                "recover skip \(item.spec.name)@\(item.project): \(error.localizedDescription)"
-                            )
-                            return
-                        }
-                        DevCtlLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
-                        _ = await supervisor.start()
-                    }
-                }
+        for item in toStart {
+            let supervisor = await self.supervisor(project: item.project, spec: item.spec)
+            do {
+                try await self.prepareSpawn(
+                    target: ServerTargetParams(name: item.spec.name, project: item.project),
+                    supervisor: supervisor)
+            } catch let error as WireError {
+                DevCtlLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.message)")
+                continue
+            } catch {
+                DevCtlLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.localizedDescription)")
+                continue
             }
+            DevCtlLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
+            _ = await supervisor.start()
         }
         /** Second pass: drop leftover rows for renamed/deleted servers even when
             they carry no resume intent (e.g. a deliberate stop under the old

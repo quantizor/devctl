@@ -26,6 +26,7 @@ public actor ServerSupervisor {
     private var healthTask: Task<Void, Never>?
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
+    private var lastDescendantSnapshot: [ProcessIdentity] = []
     private let launcher: any ProcessLauncher
     /** Resolved named secondaries for this run (status.ports). */
     private var namedPorts: [String: Int]?
@@ -130,6 +131,7 @@ public actor ServerSupervisor {
         everHealthy = false
         observedPort = nil
         recentLogTail = nil
+        lastDescendantSnapshot = []
         consecutiveFailures = 0
         consecutiveSuccesses = 0
         runningSpecHash = Self.specHash(spec)
@@ -356,6 +358,9 @@ public actor ServerSupervisor {
     private func recordProbe(success: Bool) {
         /** Probes landing after the process died must not resurrect state. */
         guard phase == .starting || phase == .running || phase == .unhealthy else { return }
+        if pid != nil {
+            refreshDescendantSnapshot()
+        }
         let healthyAfter = spec.healthcheck?.healthyAfter ?? 1
         let unhealthyAfter = spec.healthcheck?.unhealthyAfter ?? 3
         if success {
@@ -495,6 +500,7 @@ public actor ServerSupervisor {
 
     private func recordSpawn(pid childPid: pid_t, id: String) async {
         pid = childPid
+        refreshDescendantSnapshot()
         let spawnedAt = Date()
         startedAt = spawnedAt
         let out = SpoolTailer(
@@ -510,6 +516,10 @@ public actor ServerSupervisor {
         await logStore.append(stream: .sys, text: "started pid=\(childPid)")
         await events?.post(kind: .started, project: projectPath, server: spec.name, detail: "pid \(childPid)")
         startHealthMonitor()
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            await self?.refreshDescendantSnapshot()
+        }
         await registryUpdate(id: id) { entry in
             entry.lastExit = nil
             entry.phase = .starting
@@ -519,6 +529,11 @@ public actor ServerSupervisor {
             entry.startedAt = spawnedAt
         }
         settleSpawnWaiters()
+    }
+
+    private func refreshDescendantSnapshot() {
+        guard let pid else { return }
+        lastDescendantSnapshot = ProcessTree.descendants(of: pid).identities
     }
 
     /** Snapshot the err-stream tally for the run that just started at
@@ -576,6 +591,11 @@ public actor ServerSupervisor {
         recentLogTail = spoolTail()
         terminalEvidence = recentLogTail
         errorSummary = captureErrorSummary(since: windowStart)
+        if !stopRequested, let rootPid = pid {
+            ProcessTree.signalTree(
+                descendants: lastDescendantSnapshot, rootPid: rootPid, signal: SIGTERM)
+        }
+        lastDescendantSnapshot = []
         pid = nil
         startedAt = nil
         observedPort = nil

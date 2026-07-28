@@ -139,13 +139,6 @@ do {
     FileHandle.standardError.write(Data("devctld: cannot bind \(paths.socketPath): \(error)\n".utf8))
     exit(1)
 }
-server.start()
-
-/** Reconcile persisted state with reality: dead pids become crashed, live
-    orphans are bounced and previously-running servers come back up. */
-Task {
-    await router.recoverAtStartup()
-}
 
 /** Graceful termination: drain-stop every supervised server through the normal
     teardown path, unregister power notifications, then exit 0 (a deliberate
@@ -175,7 +168,13 @@ terminationSource.setEventHandler {
 }
 terminationSource.resume()
 
-FileHandle.standardError.write(
-    Data("devctld \(DevCtlVersion.version) listening on \(paths.socketPath) (pid \(getpid()))\n".utf8))
+/** Finish boot restore before accepting clients so install/restart re-ensure
+    cannot race a half-finished restore. */
+Task {
+    await router.recoverAtStartup()
+    server.start()
+    FileHandle.standardError.write(
+        Data("devctld \(DevCtlVersion.version) listening on \(paths.socketPath) (pid \(getpid()))\n".utf8))
+}
 
 dispatchMain()

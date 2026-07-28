@@ -116,6 +116,41 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.lastExit?.code == 3)
     }
 
+    @Test func crashKillsSessionGrandchild() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(
+            command: [fixture, "--spawn-grandchild", "--exit-after", "0.6", "--code", "1"],
+            name: "composite")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        #expect(started.pid != nil)
+        var grandchild: pid_t?
+        for _ in 0..<40 {
+            let spool =
+                (try? String(
+                    contentsOf: paths.structuredLogFile(
+                        project: env.projectPath, server: "composite"),
+                    encoding: .utf8)) ?? ""
+            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
+                let line = String(spool[match])
+                grandchild = line.split(separator: " ").last.flatMap { pid_t($0) }
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let child = try #require(grandchild)
+        #expect(kill(child, 0) == 0)
+        let crashed = try await waitForPhase(supervisor, .crashed, tries: 80)
+        #expect(crashed.phase == .crashed)
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(kill(child, 0) != 0)
+    }
+
     /** Poll the supervisor until it reaches `phase` or the budget runs out. */
     private func waitForPhase(
         _ supervisor: ServerSupervisor, _ phase: ServerPhase, tries: Int = 50
@@ -228,4 +263,17 @@ private func makeEnv() throws -> TestEnv {
         try await registry.unregister(project: "/p", name: "web")
         #expect(await registry.project("/p") == nil)
     }
+}
+
+private func fixtureServerExecutable() -> String? {
+    let candidates = [
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: ".build/debug/fixture-server"),
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/debug/fixture-server"),
+    ]
+    return candidates.map(\.path).first { FileManager.default.isExecutableFile(atPath: $0) }
 }
