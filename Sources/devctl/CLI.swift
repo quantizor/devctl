@@ -1290,8 +1290,18 @@ struct DaemonStatusCommand: AsyncParsableCommand {
             struct StatusPayload: Codable {
                 var daemon: DaemonInfo?
                 var launchd: String
+                /** Stated outright because every other command's hint sends the
+                    reader here, and the answer has to be readable by a machine.
+                    Without it the only signal is an absent `daemon` key next to
+                    a reassuring launchd line, which reads as healthy: launchd
+                    reporting `running` says a job is loaded, not that anything
+                    is accepting on the socket. */
+                var reachable: Bool
             }
-            CLIRunner.emit(StatusPayload(daemon: info, launchd: launchdLine), json: true) { _ in "" }
+            CLIRunner.emit(
+                StatusPayload(daemon: info, launchd: launchdLine, reachable: info != nil),
+                json: true
+            ) { _ in "" }
         } else if let info {
             print("launchd: \(launchdLine)\ndaemon: v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)")
         } else {

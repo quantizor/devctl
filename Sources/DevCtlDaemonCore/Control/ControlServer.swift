@@ -1290,9 +1290,11 @@ public actor Router {
 public final class ControlServer: Sendable {
     private let listener: NWListener
     private let router: Router
+    private let socketPath: String
 
     public init(router: Router, socketPath: String) throws {
         self.router = router
+        self.socketPath = socketPath
         let socketDir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(
             atPath: socketDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -1304,8 +1306,32 @@ public final class ControlServer: Sendable {
         params.requiredLocalEndpoint = NWEndpoint.unix(path: socketPath)
         params.allowLocalEndpointReuse = true
         self.listener = try NWListener(using: params)
+        listener.newConnectionHandler = { [router] connection in
+            Self.serve(connection: connection, router: router)
+        }
+    }
+
+    /** `onReady` fires when the listener is actually accepting, which is not
+        when this returns: `NWListener.start` is asynchronous, and the socket
+        path is unlinked during init and only recreated on the way to `.ready`.
+        Announcing readiness on the next statement therefore told clients the
+        daemon was up while a connect still got ENOENT, which is how a readiness
+        check comes to pass for the wrong reason. */
+    public func start(onReady: @escaping @Sendable () -> Void = {}) {
+        let socketPath = self.socketPath
         listener.stateUpdateHandler = { state in
             switch state {
+            case .ready:
+                /** Owner-only, and it has to run here: the socket file does not
+                    exist until the listener is ready, so a chmod any earlier
+                    targets an empty path and silently does nothing. The
+                    containing directory is 0700, making this the second layer
+                    rather than the only one. */
+                if chmod(socketPath, 0o600) != 0 {
+                    DevCtlLog.daemon.error(
+                        "cannot restrict the control socket to owner-only: errno \(errno)")
+                }
+                onReady()
             case .failed(let error):
                 DevCtlLog.daemon.error("control listener failed: \(String(describing: error))")
             case .cancelled:
@@ -1314,13 +1340,6 @@ public final class ControlServer: Sendable {
                 break
             }
         }
-        listener.newConnectionHandler = { [router] connection in
-            Self.serve(connection: connection, router: router)
-        }
-        chmod(socketPath, 0o600)
-    }
-
-    public func start() {
         listener.start(queue: DispatchQueue(label: "devctl.control"))
     }
 

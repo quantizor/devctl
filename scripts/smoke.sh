@@ -14,6 +14,22 @@ mkdir -p "$PROJECT"
 fail() { echo "SMOKE FAIL: $1" >&2; exit 1 }
 pass() { echo "  ok: $1" }
 
+# Wait until the daemon ANSWERS OVER THE SOCKET, never until the socket file
+# merely exists. Two traps this avoids, both of which report ready for the wrong
+# reason: a daemon killed with -9 leaves its socket file behind, so a file test
+# passes instantly against a dead listener; and `daemon status` falls back to
+# launchd state and exits 0 without connecting, so it answers even when nothing
+# is listening. Requiring daemonVersion in the payload forces a real round trip.
+# Fails loudly rather than letting a later command report a confusing error.
+await_daemon() {
+  local label="$1"
+  for i in {1..100}; do
+    "$BIN/devctl" daemon status --json 2>/dev/null | grep -q '"reachable":true' && return 0
+    sleep 0.1
+  done
+  fail "daemon never answered over $DEVCTL_SOCKET ($label); it may be alive without having bound the socket"
+}
+
 cleanup() {
   [[ -n "${DAEMON_PID:-}" ]] && kill -9 "$DAEMON_PID" 2>/dev/null || true
   [[ -n "${CHILD_PID:-}" ]] && kill -9 "-$CHILD_PID" 2>/dev/null || true
@@ -32,8 +48,7 @@ swift build --package-path "$ROOT" > /dev/null
 echo "starting daemon..."
 "$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" &
 DAEMON_PID=$!
-for i in {1..50}; do [[ -S "$DEVCTL_SOCKET" ]] && break; sleep 0.1; done
-[[ -S "$DEVCTL_SOCKET" ]] || fail "daemon socket never appeared"
+await_daemon "first boot"
 pass "daemon up (pid $DAEMON_PID)"
 
 cd "$PROJECT"
@@ -143,7 +158,7 @@ CFG
 # restart the smoke daemon (killed above) for the project phase
 "$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" &
 DAEMON_PID=$!
-for i in {1..50}; do [[ -S "$DEVCTL_SOCKET" ]] && break; sleep 0.1; done
+await_daemon "project phase restart"
 cd "$PROJECT3"
 
 "$DEVCTL" config check --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["errors"]==[], d; assert d["host"]=="smoketest.localhost", d' || fail "config check"
