@@ -4,7 +4,7 @@ import DevCtlKit
 import Foundation
 
 /** Spotlight integration: every server and every head becomes a searchable item
-    ("candor · operator" opens the surface). Titles lead with the project/head;
+    ("myproj · operator" opens the surface). Titles lead with the project/head;
     `devctl` lives in the subtitle. Ranking above filesystem Top Hits is not
     something Core Spotlight can force; within our own items we preserve
     last-used engagement across syncs, update in place instead of wipe-rebuild,

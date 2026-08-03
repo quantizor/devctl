@@ -115,7 +115,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
-    /** The candor failure: daemon dies mid-hold, holder is gone, recover must
+    /** The reported failure: daemon dies mid-hold, holder is gone, recover must
         resume the paused set from locks.json. */
     @Test func recoverResumesWhenHolderIsDead() async throws {
         let env = try makeLockEnv()

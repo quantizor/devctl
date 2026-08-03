@@ -6,7 +6,7 @@ import Foundation
     without burying the match. */
 public enum SpotlightLabel {
     /** Human title shown in Spotlight. Server name is omitted when it equals
-        the project leaf (the common `candor`/`candor` case). */
+        the project leaf (the common `myproj`/`myproj` case). */
     public static func title(project: String, server: String, head: String?) -> String {
         if let head {
             return "\(project) · \(head)"
@@ -51,7 +51,7 @@ public enum SpotlightLabel {
     }
 
     /** Keyword tokens: project, server, head, distinctive host/path parts, plus
-        the standing "devctl" / "dev server" anchors so a typed "devctl candor"
+        the standing "devctl" / "dev server" anchors so a typed "devctl myproj"
         still lands. */
     public static func keywords(project: String, server: String, head: String?, url: String)
         -> [String]

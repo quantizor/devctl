@@ -72,9 +72,9 @@ import Testing
         for link in [
             DeepLink(verb: .open, projectSlug: "my-proj", server: "web"),
             DeepLink(verb: .open, projectSlug: "my-proj", server: "web", head: "wren-hollow"),
-            DeepLink(verb: .ensure, projectSlug: "candor", server: "cms"),
-            DeepLink(verb: .stop, projectSlug: "candor", server: "cms"),
-            DeepLink(verb: .why, projectSlug: "candor", server: "cms"),
+            DeepLink(verb: .ensure, projectSlug: "myproj", server: "cms"),
+            DeepLink(verb: .stop, projectSlug: "myproj", server: "cms"),
+            DeepLink(verb: .why, projectSlug: "myproj", server: "cms"),
         ] {
             let reparsed = try DeepLink.parse(link.urlString()).get()
             #expect(reparsed == link)
@@ -96,19 +96,19 @@ import Testing
 
 @Suite struct DeepLinkResolveTests {
     private let paths = [
-        "/Users/x/code/candor",
+        "/Users/x/code/myproj",
         "/Users/x/code/other",
         "/Users/x/work/other",
     ]
 
     @Test func uniqueMatch() throws {
-        let path = try DeepLink.resolveProject(slug: "candor", against: paths).get()
-        #expect(path == "/Users/x/code/candor")
+        let path = try DeepLink.resolveProject(slug: "myproj", against: paths).get()
+        #expect(path == "/Users/x/code/myproj")
     }
 
     @Test func matchIsCaseInsensitive() throws {
-        let path = try DeepLink.resolveProject(slug: "CANDOR", against: paths).get()
-        #expect(path == "/Users/x/code/candor")
+        let path = try DeepLink.resolveProject(slug: "MYPROJ", against: paths).get()
+        #expect(path == "/Users/x/code/myproj")
     }
 
     @Test func ambiguousNamesCandidates() {
@@ -129,8 +129,8 @@ import Testing
     }
 
     @Test func trailingSlashPathResolves() throws {
-        let path = try DeepLink.resolveProject(slug: "candor", against: ["/Users/x/code/candor/"]).get()
-        #expect(path == "/Users/x/code/candor/")
+        let path = try DeepLink.resolveProject(slug: "myproj", against: ["/Users/x/code/myproj/"]).get()
+        #expect(path == "/Users/x/code/myproj/")
     }
 
     @Test func traversalSlugRejected() {

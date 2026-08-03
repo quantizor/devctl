@@ -818,7 +818,7 @@ enum PresenceDots {
 }
 
 /** Pinned-head preference, persisted across launches (UserDefaults). Keys are
-    `project::server::head`. A server rename (dev → candor) orphans the old key;
+    `project::server::head`. A server rename (dev → web) orphans the old key;
     `reconcile` remaps when the project still has exactly one server that exposes
     that head, otherwise drops the dead pin. */
 @Observable
