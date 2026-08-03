@@ -144,6 +144,16 @@ public enum ProjectConfigLoader {
             if entry.command.isEmpty {
                 view.errors.append("server '\(name)': command is empty")
             }
+            /** `type: http` with no url silently falls back to a TCP probe on
+                the declared port, so a mistyped `url` key yields a server that
+                reports healthy while its HTTP layer was never checked. A warning
+                rather than an error, because configs relying on that fallback
+                start today and blocking them here would be a bigger change than
+                the mistake it catches. */
+            if entry.healthcheck?.type == .http, entry.healthcheck?.url == nil {
+                warnings.append(
+                    "server '\(name)': healthcheck type is http but no url is set, so it will be probed over TCP instead; add a url or set type to tcp")
+            }
             if let explicitHost = entry.host, isBareLoopback(explicitHost) {
                 warnings.append(
                     "server '\(name)': host '\(explicitHost)' is a bare loopback address; prefer a '\(recommendedHost)' subdomain")

@@ -17,6 +17,26 @@ import Testing
         #expect(web?.url == "http://my-proj.localhost:3000/")
     }
 
+    /** An http healthcheck with no url falls back to a TCP probe, so the server
+        can report healthy while its HTTP layer was never checked. The config has
+        to say so, since nothing downstream can tell the fallback from intent. */
+    @Test func httpHealthcheckWithoutURLWarns() {
+        let config = ProjectFileConfig(
+            servers: [
+                "typo": ProjectFileServer(
+                    command: ["x"], healthcheck: HealthCheckSpec(type: .http), port: 5000),
+                "ok": ProjectFileServer(
+                    command: ["x"],
+                    healthcheck: HealthCheckSpec(type: .http, url: "http://x.localhost:5001/"),
+                    port: 5001),
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.errors.isEmpty)
+        let warned = view.warnings.filter { $0.contains("healthcheck type is http") }
+        #expect(warned.count == 1)
+        #expect(warned.first?.contains("'typo'") == true)
+    }
+
     @Test func explicitHostAndPerServerOverride() {
         let config = ProjectFileConfig(
             host: "shop.localhost",
