@@ -229,9 +229,7 @@ public enum ProjectConfigLoader {
     }
 
     public static func defaultSlug(project: String) -> String {
-        (project as NSString).lastPathComponent
-            .lowercased()
-            .replacing(/[^a-z0-9-]+/) { _ in "-" }
+        projectSlug(project)
     }
 
     /** Decode failures become a message a non-engineer can act on: the file,
