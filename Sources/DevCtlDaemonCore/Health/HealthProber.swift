@@ -140,14 +140,34 @@ public enum PortGuard {
         LoopbackProbe.isListening(port: port)
     }
 
+    /** Every pid listening on a port, not just the first.
+
+        One port routinely has two owners: a process bound to IPv4 `127.0.0.1`
+        and another bound to the IPv6 wildcard coexist with no EADDRINUSE, and
+        which one answers a probe depends on how the client resolves the name.
+        Reading only the first pid reports a single owner for that case and hides
+        the ambiguity that makes a health signal untrustworthy. */
+    public static func listenerPids(port: Int) -> [Int] {
+        guard let output = shell("/usr/sbin/lsof", ["-nP", "-tiTCP:\(port)", "-sTCP:LISTEN"])
+        else { return [] }
+        var pids: [Int] = []
+        for line in output.split(separator: "\n") {
+            guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
+            if !pids.contains(pid) { pids.append(pid) }
+        }
+        return pids
+    }
+
+    /** The command behind a pid, for naming a holder in an error. */
+    public static func commandForPid(_ pid: Int) -> String {
+        shell("/bin/ps", ["-o", "command=", "-p", String(pid)])?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
+    }
+
     /** The pid + command listening on a port, when lsof can name it. */
     public static func listenerInfo(port: Int) -> (pid: Int, command: String)? {
-        guard let output = shell("/usr/sbin/lsof", ["-nP", "-tiTCP:\(port)", "-sTCP:LISTEN"]),
-            let pid = Int(output.split(separator: "\n").first ?? "")
-        else { return nil }
-        let command = shell("/bin/ps", ["-o", "command=", "-p", String(pid)])?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
-        return (pid: pid, command: command)
+        guard let pid = listenerPids(port: port).first else { return nil }
+        return (pid: pid, command: commandForPid(pid))
     }
 
     /** TCP ports the given processes are listening on. */

@@ -295,8 +295,8 @@ public actor Router {
                 var statuses: [String: ServerStatus] = [:]
                 var specsByName: [String: ServerSpec] = [:]
                 for spec in merged.specs {
-                    let supervisor = await supervisor(project: request.params.project, spec: spec)
-                    statuses[spec.name] = await supervisor.status()
+                    statuses[spec.name] = await annotatedStatus(
+                        project: request.params.project, spec: spec)
                     specsByName[spec.name] = spec
                 }
                 let project = request.params.project
@@ -1085,8 +1085,7 @@ public actor Router {
                 guard let specs else { continue }
                 for spec in specs {
                     if let name = params.name, name != spec.name { continue }
-                    let supervisor = await supervisor(project: project, spec: spec)
-                    statuses.append(await supervisor.status())
+                    statuses.append(await annotatedStatus(project: project, spec: spec))
                 }
             }
             return ServerListResult(servers: statuses)
@@ -1095,13 +1094,20 @@ public actor Router {
         var statuses: [ServerStatus] = []
         for spec in merged.specs {
             if let name = params.name, name != spec.name { continue }
-            let supervisor = await supervisor(project: params.project, spec: spec)
-            var status = await supervisor.status()
-            status = await annotateLatentPortConflict(status, excluding: serverID(project: params.project, name: spec.name))
-            statuses.append(status)
+            statuses.append(await annotatedStatus(project: params.project, spec: spec))
         }
         return ServerListResult(
             servers: statuses, trusted: await registry.isTrusted(project: params.project))
+    }
+
+    /** The supported way to read a status for a response: every reader gets the
+        latent-port-conflict annotation. A handler that calls `supervisor.status()`
+        directly reports a stopped server without naming the holder keeping it
+        down, so route status reads through here. */
+    private func annotatedStatus(project: String, spec: ServerSpec) async -> ServerStatus {
+        let status = await supervisor(project: project, spec: spec).status()
+        return await annotateLatentPortConflict(
+            status, excluding: serverID(project: project, name: spec.name))
     }
 
     /** When a server is not up but its declared port is held, surface a latent

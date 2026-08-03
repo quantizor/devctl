@@ -400,10 +400,129 @@ public actor ServerSupervisor {
         the declared one. */
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
+        let expected = effectivePort ?? spec.port
         Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = PortGuard.listeningPorts(pids: pids)
             await self?.recordObservedPort(ports: ports)
+            guard let expected else { return }
+            let owners = PortGuard.listenerPids(port: expected)
+            await self?.recordPortOwnership(
+                expected: expected, owners: owners, ours: pids.map(Int.init))
+        }
+    }
+
+    /** The managed server whose recorded pid holds one of these listeners, if
+        any. This is what separates "another devctl server took the port" from
+        "the listener is simply not my child", which look identical from lsof
+        alone. Returns the `server@project` id so the message can name it. */
+    private func managedOwner(among foreign: [Int]) async -> String? {
+        let myID = serverID(project: projectPath, name: spec.name)
+        let candidates = Set(foreign)
+        for (id, entry) in await registry.allPersistedState() where id != myID {
+            guard let pid = entry.pid, candidates.contains(pid) else { continue }
+            /** A recorded pid is not an identity: macOS recycles pid numbers, so
+                a stale row left by a killed daemon can name a pid that now
+                belongs to something else entirely. Accusing on the number alone
+                would blame an innocent server and take this one down with it.
+                The recorded server's process must have started no later than the
+                moment devctl recorded it starting; a recycled pid was born long
+                after. One second of slack covers the spawn-to-record gap. */
+            guard let startedAt = entry.startedAt,
+                let identity = ProcessTree.identity(of: pid_t(pid))
+            else { continue }
+            let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
+            guard processStart <= startedAt.addingTimeInterval(1) else { continue }
+            return id
+        }
+        return nil
+    }
+
+    /** A passing healthcheck proves something answered, never that this server
+        answered. When every listener on the expected port sits outside this
+        server's process tree, something else is serving on it.
+
+        Two rules keep this from firing on healthy setups:
+
+        Positive identification only. An empty listener list means lsof told us
+        nothing, and lsof can be missing, restricted, or slow; treating silence
+        as proof would fail healthy servers whenever the instrument is
+        unavailable. Absence of evidence ends the check.
+
+        Failing needs a named managed thief. A listener outside the process tree
+        is not by itself a fault: a container-backed server (docker compose) or
+        anything that daemonizes has its socket held by a process devctl never
+        parented, and killing those runs would be wrong. Only when the owning pid
+        belongs to another server this daemon supervises is theft proven, and
+        only then does the phase change. Everything else is annotated so a reader
+        can see the ambiguity without the server being taken down for it. */
+    private func recordPortOwnership(expected: Int, owners: [Int], ours: [Int]) async {
+        guard phase == .running || phase == .starting else { return }
+        guard portConflict == nil else { return }
+        guard !owners.isEmpty else { return }
+        let mine = Set(ours)
+        let foreign = owners.filter { !mine.contains($0) }
+        guard !foreign.isEmpty else { return }
+        let described = foreign
+            .map { "pid \($0) (\(PortGuard.commandForPid($0)))" }
+            .joined(separator: ", ")
+        let thief = await managedOwner(among: foreign)
+        /** We hold a listener too, so the server is serving; the port is just
+            not exclusively ours and a probe may reach either side. */
+        if owners.contains(where: { mine.contains($0) }) {
+            portConflict = PortConflict(
+                declaredPort: declaredPort ?? expected,
+                effectivePort: expected,
+                holder: described,
+                message:
+                    "port \(expected) is held by this server and also by \(described); a health probe may reach either one",
+                state: .shared)
+            DevCtlLog.supervisor.error(
+                "port-shared \(spec.name)@\(projectPath) port \(expected) with \(described)")
+            return
+        }
+        guard let thief else {
+            /** Outside the tree but unattributable: could be this server's own
+                container or daemonized helper. Say so, change nothing. */
+            portConflict = PortConflict(
+                declaredPort: declaredPort ?? expected,
+                effectivePort: expected,
+                holder: described,
+                message:
+                    "port \(expected) is held by \(described), which is outside this server's process tree; that is expected for a container-backed or daemonizing server, but a health probe cannot tell that apart from another process answering for it",
+                state: .foreign)
+            DevCtlLog.supervisor.info(
+                "port-foreign-unattributed \(spec.name)@\(projectPath) port \(expected) owned by \(described)")
+            return
+        }
+        portConflict = PortConflict(
+            declaredPort: declaredPort ?? expected,
+            effectivePort: expected,
+            holder: thief,
+            message:
+                "healthcheck passed but managed server '\(thief)' owns port \(expected), not this server; run: devctl stop for that server or give this one its own port",
+            state: .foreign)
+        phase = .failed
+        spawnError = SpawnError(
+            message: "port \(expected) is owned by managed server '\(thief)', so the healthcheck was answered by another devctl server")
+        errorSummary = captureErrorSummary(since: startedAt)
+        recentLogTail = spoolTail()
+        terminalEvidence = recentLogTail
+        healthTask?.cancel()
+        DevCtlLog.supervisor.error(
+            "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief)")
+        await events?.post(
+            kind: .failed, project: projectPath, server: spec.name,
+            detail: "port \(expected) owned by managed server \(thief)")
+        let id = serverID(project: projectPath, name: spec.name)
+        let summary = errorSummary
+        let err = spawnError
+        let evidence = terminalEvidence
+        await registryUpdate(id: id) { entry in
+            entry.errorSummary = summary
+            entry.phase = .failed
+            entry.spawnError = err
+            entry.terminalEvidence = evidence
         }
     }
 

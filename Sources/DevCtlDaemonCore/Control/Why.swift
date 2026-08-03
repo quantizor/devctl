@@ -93,7 +93,23 @@ enum WhyEngine {
             summary += "; NOTE: listening on \(observed), not the declared \(declared)"
             evidence.append("declared port \(declared), observed \(observed)")
         }
-        if let conflict = status.portConflict {
+        /** A held port is the reason a down server cannot come back, so it belongs
+            in the summary that becomes the root cause, not only in evidence the
+            reader has to assemble. Phases that are up describe themselves. */
+        var foldedIntoSummary = false
+        if let conflict = status.portConflict, conflict.state == .held {
+            switch status.phase {
+            case .crashed, .failed, .stopped:
+                summary += "; \(conflict.message)"
+                foldedIntoSummary = true
+            case .running, .starting, .stopping, .unhealthy:
+                break
+            }
+        }
+        /** Only when the summary did not already say it: the summary also
+            becomes the root cause, so emitting it here too prints one fact three
+            times. */
+        if let conflict = status.portConflict, !foldedIntoSummary {
             evidence.append("port conflict (\(conflict.state.rawValue)): \(conflict.message)")
         }
         if let ports = status.ports, !ports.isEmpty {
