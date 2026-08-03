@@ -159,9 +159,11 @@ private func pollPhase(
     }
 
     @Test func tcpProbeAgainstRealListener() throws {
-        /** A live in-test listener answers; a closed port refuses. */
+        /** A live in-test listener answers; a port nobody is accepting on
+            refuses. Closed exactly once: this suite shares a process with the
+            others, so closing an fd twice can shut one another thread just
+            opened and was handed the same number. */
         let sock = socket(AF_INET, SOCK_STREAM, 0)
-        defer { close(sock) }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0
@@ -180,7 +182,32 @@ private func pollPhase(
         let port = Int(UInt16(bigEndian: bound.sin_port))
         #expect(NetworkHealthProber.tcpConnects(port: port, timeoutMs: 500))
         close(sock)
-        #expect(!NetworkHealthProber.tcpConnects(port: port, timeoutMs: 200))
+
+        /** The negative uses a port this test holds and never listens on, so no
+            other socket can take it. Asserting the released port above stays
+            free would race: `bind(0)` returns an ephemeral port, the range the
+            kernel hands to outbound connections. Re-binding it is no better,
+            since a closed listener leaves TIME_WAIT behind. */
+        let quiet = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(quiet) }
+        var quietAddr = sockaddr_in()
+        quietAddr.sin_family = sa_family_t(AF_INET)
+        quietAddr.sin_port = 0
+        quietAddr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        _ = withUnsafePointer(to: &quietAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(quiet, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        var quietBound = sockaddr_in()
+        var quietLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &quietBound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(quiet, $0, &quietLen)
+            }
+        }
+        let quietPort = Int(UInt16(bigEndian: quietBound.sin_port))
+        #expect(!NetworkHealthProber.tcpConnects(port: quietPort, timeoutMs: 200))
     }
 
     @Test func tcpProbeAgainstIPv6OnlyListener() throws {

@@ -100,9 +100,13 @@ if let listenPort {
 }
 
 if let exitAfter {
+    /** Captured here rather than read inside the closure: a top-level `var` is
+        main-actor isolated, and the dispatch closure is not. Argument parsing is
+        already done, so the value cannot change after this point. */
+    let code = exitCode
     DispatchQueue.global().asyncAfter(deadline: .now() + exitAfter) {
-        print("exiting with code \(exitCode)")
-        exit(exitCode)
+        print("exiting with code \(code)")
+        exit(code)
     }
 }
 
