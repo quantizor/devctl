@@ -35,7 +35,7 @@ Commit that file where the whole team runs the same servers. Keep it gitignored 
 ## The parts
 
 - `devctld`: the daemon. Spool-file output capture (children survive daemon restarts without SIGPIPE), process-group plus descendant-sweep teardown, health-gated phases, crash forensics, structured logs with correlation marks, a unified event feed.
-- `devctl`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `why`, `open`, `switch`, `lock` (pause servers sharing a resource while a test harness runs, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. Agents are the first-class consumer.
+- `devctl`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `lock` (pause servers sharing a resource while a test harness runs, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and devctl restarts it when one changes. Agents are the first-class consumer.
 - `devctl.app`: the menu bar. Presence dots with counts, per-project rows with click-to-open heads (pinnable), crash notifications, a dashboard with live logs, an event timeline, and a validating config editor. Every server and head is Spotlight-searchable.
 
 ## Building

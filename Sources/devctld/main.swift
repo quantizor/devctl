@@ -181,6 +181,18 @@ Task {
                 "devctld \(DevCtlVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
                     .utf8))
     }
+    /** The watch sweep starts only after restore, so a boot-time spawn is never
+        mistaken for a config change. Polling rather than an fd-based watcher:
+        nearly every editor and build tool saves by writing a temp file and
+        renaming it over the target, after which a held fd names an unlinked
+        inode and goes deaf to the path it was watching. */
+    Task {
+        DevCtlLog.daemon.info("watch sweep started")
+        while true {
+            _ = await router.sweepWatches()
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+    }
 }
 
 dispatchMain()

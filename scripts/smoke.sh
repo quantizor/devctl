@@ -456,6 +456,59 @@ set -e
 pass "restart under a live lock is refused and the server stays up"
 
 "$DEVCTL" down --json > /dev/null
+
+# watch: a config the server reads at boot changes, and the server comes back
+# having read it. The pid moving is not the point; the new value in the log is.
+WATCHP="$WORK/watchproj"
+mkdir -p "$WATCHP"
+echo v1 > "$WATCHP/app.config.json"
+W_PORT=$((43100 + (RANDOM % 300)))
+cat > "$WATCHP/devservers.json" <<CFG
+{
+  "version": 1,
+  "host": "watchsmoke.localhost",
+  "servers": {
+    "web": {
+      "command": ["$BIN/fixture-server", "--listen-tcp", "$W_PORT", "--print-file", "$WATCHP/app.config.json"],
+      "healthcheck": { "type": "tcp", "port": $W_PORT },
+      "port": $W_PORT,
+      "watch": ["app.config.json"]
+    }
+  }
+}
+CFG
+cd "$WATCHP"
+"$DEVCTL" ensure web --timeout 15 --json > /dev/null || fail "ensure watch server"
+"$DEVCTL" logs web --json | grep -q "config: v1" || fail "watch fixture never read its config"
+W_PID_BEFORE="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
+# The baseline is taken once the run has been alive for the settle window, which
+# is what stops a server that writes its own config during boot from bouncing
+# itself. Editing before then is folded into the baseline by design, so wait it
+# out rather than racing it.
+/bin/sleep 3
+echo v2 > "$WATCHP/app.config.json"
+for _ in $(seq 1 80); do
+  W_PID_NOW="$("$DEVCTL" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0].get("pid"))' 2>/dev/null || echo none)"
+  [[ "$W_PID_NOW" != "$W_PID_BEFORE" && "$W_PID_NOW" != "none" && "$W_PID_NOW" != "None" ]] && break
+  /bin/sleep 0.25
+done
+[[ "$W_PID_NOW" != "$W_PID_BEFORE" ]] || fail "a watched file changed and the server never restarted (status: $("$DEVCTL" status web --json 2>&1 | head -c 400))"
+"$DEVCTL" wait web --healthy --timeout 15 --json > /dev/null || fail "watch restart never became healthy"
+"$DEVCTL" logs web --json | grep -q "config: v2" || fail "the restarted server did not read the new config"
+pass "a watched file change restarts the server and it reads the new config"
+
+# A server that declares no watch must behave exactly as before.
+cd "$PROJECT3"
+"$DEVCTL" up --timeout 15 --json > /dev/null || fail "up for the no-watch check"
+NOWATCH_PID="$("$DEVCTL" status db --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
+echo changed > "$PROJECT3/state/db.sqlite"
+/bin/sleep 2
+"$DEVCTL" status db --json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['servers'][0]; assert d['pid']==$NOWATCH_PID, d" || fail "a server with no watch was restarted"
+pass "a server that declares no watch is left alone"
+"$DEVCTL" down --json > /dev/null
+cd "$WATCHP"
+"$DEVCTL" stop web --json > /dev/null 2>&1 || true
+cd "$PROJECT3"
 "$DEVCTL" down --json > /dev/null
 
 # Deep links: print URL + dispatch via x-url (no Launch Services).

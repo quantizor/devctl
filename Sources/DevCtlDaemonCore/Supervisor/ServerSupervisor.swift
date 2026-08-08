@@ -48,6 +48,15 @@ public actor ServerSupervisor {
     private var spawnWaiters: [CheckedContinuation<Void, Never>] = []
     private var spec: ServerSpec
     private var startedAt: Date?
+    /** Taken once the run has been alive for the settle window rather than at
+        spawn, so a server that writes its own watched file while booting folds
+        that write into the baseline instead of bouncing itself for it. */
+    private var watchBaseline: WatchFingerprint?
+    private var watchPending: (at: Date, stamp: WatchFingerprint)?
+    /** Deliberately not cleared at spawn: the oscillation the breaker detects
+        spans restarts by definition. */
+    private var watchRestarts: [Date] = []
+    private var watchSuspended = false
     private var stopRequested = false
     /** Carries the stop()'s intent into recordOutcome: deliberate clears the
         resume-on-boot flag, a launchd drain keeps it. */
@@ -89,6 +98,76 @@ public actor ServerSupervisor {
 
     public func updateSpec(_ newSpec: ServerSpec) {
         spec = newSpec
+    }
+
+    /** Absolute watched paths for this run, empty when the server declares no
+        `watch`, which is the whole no-configuration-needed path: everything
+        below returns immediately. */
+    private var watchPaths: [String] {
+        WatchPaths.resolve(entries: spec.watch ?? [], project: projectPath).paths
+    }
+
+    /** One watch evaluation. Returns the changed paths only when the caller
+        should restart: nil for idle, still settling, waiting out the quiet
+        window, suspended, or not running. The stats happen here so the Router's
+        sweep stays a fan-out. */
+    public func evaluateWatch(now: Date = Date()) async -> [String]? {
+        guard !watchSuspended, phase == .running || phase == .unhealthy else { return nil }
+        let paths = watchPaths
+        guard !paths.isEmpty, let startedAt else { return nil }
+        let limits = WatchPolicy.Limits()
+        guard now.timeIntervalSince(startedAt) >= limits.settleSeconds else { return nil }
+        let observed = WatchFingerprint.take(paths: paths)
+        guard let baseline = watchBaseline else {
+            watchBaseline = observed
+            return nil
+        }
+        let decision = WatchPolicy.decide(
+            baseline: baseline, limits: limits, now: now, observed: observed,
+            pending: watchPending, recentRestarts: watchRestarts)
+        switch decision {
+        case .idle:
+            watchPending = nil
+            return nil
+        case .restart(let changed):
+            return changed
+        case .suspend(let changed):
+            /** A watch that quietly stopped working is worse than one that never
+                existed, so say which paths keep moving and stop. */
+            watchSuspended = true
+            watchPending = nil
+            await logStore.append(
+                stream: .sys,
+                text: "watch suspended: \(changed.joined(separator: ", ")) keeps changing")
+            await events?.post(
+                kind: .marked, project: projectPath, server: spec.name,
+                detail: "watch suspended: \(changed.joined(separator: ", "))")
+            return nil
+        case .waiting:
+            if watchPending?.stamp != observed { watchPending = (at: now, stamp: observed) }
+            return nil
+        }
+    }
+
+    /** The Router refused this restart (a held resource, a held port). Keep the
+        pending change so it fires once the refusal clears rather than dropping
+        the edit on the floor. */
+    public func deferWatchRestart(now: Date) {
+        watchPending = nil
+    }
+
+    public func recordWatchRestart(_ at: Date) {
+        watchRestarts.append(at)
+        watchPending = nil
+        watchBaseline = nil
+    }
+
+    /** An explicit restart re-arms a tripped breaker: the feature must not be
+        dead for the rest of the daemon's life after one bad afternoon. */
+    public func rearmWatch() {
+        watchSuspended = false
+        watchPending = nil
+        watchBaseline = nil
     }
 
     /** Port metadata for status/agents. Call after materializing the spawn spec. */
