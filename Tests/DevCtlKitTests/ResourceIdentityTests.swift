@@ -19,6 +19,27 @@ import Testing
         #expect(DevCtlPaths.hashHex([]).count == 64)
     }
 
+    /** Literal digests, not a self-comparison. Every other assertion here would
+        pass just as happily against a wrong-but-consistent hash, which would
+        move every project's log directory on disk with nothing to say so. The
+        first two are the FIPS 180-4 published vectors for "" and "abc", so this
+        pins the implementation to standard SHA-256 rather than to whatever it
+        currently emits. */
+    @Test func hashHexMatchesPublishedSHA256Vectors() {
+        #expect(
+            DevCtlPaths.hashHex([])
+                == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        #expect(
+            DevCtlPaths.hashHex(Array("abc".utf8))
+                == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        /** Longer than one 64-byte block and not block-aligned, so a padding or
+            multi-chunk bug cannot hide behind the two short vectors. */
+        #expect(
+            DevCtlPaths.hashHex(Array(String(repeating: "x", count: 100_000).utf8))
+                == "d69e68988157833272305aaf21f453c800346e8a3640db6578e260215542e5d4")
+        #expect(DevCtlPaths.hash8("/Users/x/code/shop") == "b71a7735")
+    }
+
     @Test func aContentChangeAtEqualSizeIsDetected() throws {
         let dir = try scratch()
         let file = dir.appending(path: "db.sqlite")
@@ -149,34 +170,55 @@ import Testing
         #expect(ResourceFingerprint.compare(after: ResourceFingerprint.capture(path: link.path), before: before) != .unchanged)
     }
 
-    /** Above the cap the digest is head, tail, size, and mtime, so a tail edit
-        is caught and a middle-only rewrite that preserves all four is not. The
-        limit is asserted rather than left to prose. */
-    @Test func aLargeFileIsSampledAndSaysSo() throws {
+    /** The incident shape, at a size that used to be sampled rather than read: a
+        middle-only rewrite holding size and mtime steady. Head-and-tail sampling
+        called this pair identical, which is the worst possible answer from a
+        check whose only job is noticing a change to a database. */
+    @Test func aMiddleOnlyRewriteOfALargeFileIsCaughtAtEqualSizeAndMtime() throws {
         let dir = try scratch()
         let file = dir.appending(path: "big.sqlite")
-        let size = ResourceFingerprint.fileByteCap + 4096
+        /** Comfortably past the 8 MiB cap that used to switch this file to
+            head-and-tail sampling, and past any plausible read chunk, so the
+            digest has to span many chunks to be right. */
+        let size = (8 << 20) + 4096
         var bytes = Data(repeating: 0x41, count: size)
         try bytes.write(to: file)
         let before = ResourceFingerprint.capture(path: file.path)
-        #expect(before.exact == false)
+        #expect(before.exact == true)
 
-        bytes[size - 1] = 0x42
+        let stamp = try #require(
+            try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date)
+
+        bytes[size / 2] = 0x43
         try bytes.write(to: file)
-        var attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-        let stamp = try #require(attributes[.modificationDate] as? Date)
-        #expect(ResourceFingerprint.compare(after: ResourceFingerprint.capture(path: file.path), before: before) != .unchanged)
-
-        /** The documented blind spot: same size, same mtime, same head and tail. */
-        var middle = Data(repeating: 0x41, count: size)
-        middle[size / 2] = 0x43
-        middle[size - 1] = 0x42
-        try middle.write(to: file)
-        attributes[.modificationDate] = stamp
+        /** Restored so size, mtime, head, and tail all match the baseline and the
+            content digest is the only thing left that can differ. */
         try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: file.path)
-        let sampledAfter = ResourceFingerprint.capture(path: file.path)
-        let tailEdited = ResourceFingerprint.capture(path: file.path)
-        #expect(sampledAfter.digest == tailEdited.digest)
-        #expect(sampledAfter.exact == false)
+        let after = ResourceFingerprint.capture(path: file.path)
+
+        #expect(after.bytes == before.bytes)
+        #expect(after.exact == true)
+        #expect(after.digest != before.digest)
+        #expect(ResourceFingerprint.compare(after: after, before: before) == .changed(.content))
+    }
+
+    /** The streaming reader on its own, against a whole-buffer digest of the same
+        bytes. A chunk-boundary bug would show here as a mismatch even though
+        every fingerprint comparison above still agreed with itself. */
+    @Test func streamedFileDigestMatchesTheWholeBufferDigest() throws {
+        let dir = try scratch()
+        let file = dir.appending(path: "spans-chunks.bin")
+        /** Deliberately not a multiple of the 1 MiB chunk, so the last read is
+            short and padding lands mid-chunk. */
+        var bytes = Data(repeating: 0x00, count: (3 << 20) + 12345)
+        for index in stride(from: 0, to: bytes.count, by: 997) { bytes[index] = UInt8(index % 251) }
+        try bytes.write(to: file)
+        #expect(DevCtlPaths.hashHex(contentsOf: file.path) == DevCtlPaths.hashHex(Array(bytes)))
+    }
+
+    /** An unreadable file must not borrow the digest of an empty read, which
+        every other unreadable file would also have and which compares equal. */
+    @Test func anUnreadableFileIsInexactRatherThanEmptyDigested() throws {
+        #expect(DevCtlPaths.hashHex(contentsOf: "/nonexistent/devctl/never") == nil)
     }
 }
