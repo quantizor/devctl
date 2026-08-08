@@ -1076,7 +1076,8 @@ public actor Router {
         var paused: [String] = []
         let shouldPause = params.pause ?? true
         let merged = try? await mergedSpecs(project: params.project)
-        for spec in merged?.specs ?? [] where (spec.locks ?? []).contains(params.resource) {
+        for spec in merged?.specs ?? []
+        where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
             let status = await supervisor.status()
             switch status.phase {
@@ -1100,11 +1101,16 @@ public actor Router {
         }
         live.sort()
         paused.sort()
+        /** Refusing here is correct when devctl cannot tell which state the lock
+            guards: taking it anyway would report on the wrong file. */
+        let statePath = try LockResource.statePath(
+            project: params.project, resource: params.resource, specs: merged?.specs ?? [])
         resourceLocks[key] = LockHolder(
             live: live.isEmpty ? nil : live, pause: shouldPause, paused: paused,
             pid: params.holderPid, resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
         persistLocks()
-        return LockResult(live: live.isEmpty ? nil : live, paused: paused)
+        return LockResult(
+            live: live.isEmpty ? nil : live, paused: paused, statePath: statePath)
     }
 
     /** Who holds a resource right now, if anyone. A dead holder is released
@@ -1220,7 +1226,8 @@ public actor Router {
         declared resources: restarting mid-harness-run is exactly the contention
         the lock exists to prevent. */
     private func lockGate(project: String, spec: ServerSpec) async throws {
-        for resource in spec.locks ?? [] {
+        for declaration in spec.locks ?? [] {
+            let resource = declaration.name
             let key = Self.lockKey(project: project, resource: resource)
             await releaseOrphanedLock(key: key)
             if let holder = resourceLocks[key] {

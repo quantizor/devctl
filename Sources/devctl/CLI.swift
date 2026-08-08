@@ -79,7 +79,9 @@ enum CLIRunner {
         }
     }
 
-    static func fail(_ error: WireError, json: Bool) -> Never {
+    /** Render the failure without deciding the exit status, so a caller that has
+        its own status to honor (a guarded command's) can still report. */
+    static func emitFailure(_ error: WireError, json: Bool) {
         if json {
             struct Envelope: Codable {
                 var error: WireError
@@ -93,6 +95,10 @@ enum CLIRunner {
             if let hint = error.hint { text += "\n  \(hint)" }
             FileHandle.standardError.write(Data((text + "\n").utf8))
         }
+    }
+
+    static func fail(_ error: WireError, json: Bool) -> Never {
+        emitFailure(error, json: json)
         switch error.code {
         case .daemonUnreachable, .versionMismatch:
             Foundation.exit(3)
@@ -101,7 +107,7 @@ enum CLIRunner {
         case .usage:
             Foundation.exit(2)
         case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
-            .resourceLocked, .spawnFailed:
+            .resourceLocked, .resourceMutated, .spawnFailed:
             Foundation.exit(1)
         }
     }
@@ -1616,6 +1622,67 @@ enum LockNotice {
     }
 }
 
+/** What the identity check concluded about the locked state.
+
+    What it cannot catch, stated so nobody over-reads it: it flags the risk
+    window, not the damage, because the incident's corruption landed when the
+    still-running server flushed its cached pages after the command had already
+    finished. It cannot see state outside the declared path (a sibling `-wal`
+    file when `path` names only the `.sqlite`), divergence that never reaches
+    disk, or a change that reverts to byte-identical state inside the window.
+    Above the file cap it samples head and tail, so a middle-only rewrite that
+    preserves size and mtime is missed. It never names which process wrote. */
+enum LockIdentityVerdict: Equatable {
+    case fault(WireError)
+    case note(String)
+    case silent
+
+    /** Under `--no-pause` a live declarer holds the old file open, so any change
+        to the locked state during the hold is not durable whatever the command
+        reported. Under the default paused mode the same change is the entire
+        point, so it is a note. */
+    static func of(
+        after: ResourceIdentity, before: ResourceIdentity, live: [String], resource: String,
+        statePath: String
+    ) -> LockIdentityVerdict {
+        let change = ResourceFingerprint.compare(after: after, before: before)
+        guard change != .unchanged else { return .silent }
+        let described = describe(change)
+        guard !live.isEmpty else {
+            return .note(
+                "devctl lock: note: '\(resource)' state at \(statePath) changed during this hold (\(described)). Nothing was running against it."
+            )
+        }
+        let servers = live.sorted()
+        return .fault(
+            WireError(
+                code: .resourceMutated,
+                hint: "devctl stop \(servers.joined(separator: " && devctl stop ")) && devctl lock \(resource) -- <command> && devctl ensure \(servers.joined(separator: " && devctl ensure "))",
+                message:
+                    "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running under --no-pause. That server holds the old state open and can write its cached pages back over the change, so what is on disk is not what the command wrote."
+            ))
+    }
+
+    private static func describe(_ change: ResourceChange) -> String {
+        switch change {
+        case .appeared:
+            return "it was created"
+        case .changed(.content):
+            return "its contents differ"
+        case .changed(.inode):
+            return "it was replaced"
+        case .changed(.kind):
+            return "it changed kind"
+        case .changed(.size):
+            return "its size changed"
+        case .disappeared:
+            return "it was removed"
+        case .unchanged:
+            return "unchanged"
+        }
+    }
+}
+
 /** Compact human durations. Nothing else in the CLI formats one. */
 enum DurationText {
     static func brief(seconds: Double) -> String {
@@ -1745,6 +1812,9 @@ struct Lock: AsyncParsableCommand {
         for name in acquired.paused {
             Self.note("devctl lock: paused \(name) (holds \(resource))")
         }
+        /** Identity is taken before the command and again before release, so a
+            resumed server's first writes are never blamed on the command. */
+        let before = acquired.statePath.map(ResourceFingerprint.capture(path:))
         /** Run the guarded command with inherited stdio. */
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -1758,6 +1828,12 @@ struct Lock: AsyncParsableCommand {
         } catch {
             FileHandle.standardError.write(Data("devctl lock: cannot run command: \(error)\n".utf8))
         }
+        var verdict = LockIdentityVerdict.silent
+        if let statePath = acquired.statePath, let before {
+            verdict = LockIdentityVerdict.of(
+                after: ResourceFingerprint.capture(path: statePath), before: before,
+                live: acquired.live ?? [], resource: resource, statePath: statePath)
+        }
         /** Release resumes whoever was paused, even if the command failed. */
         let released = (try? await client.request(
             .lockRelease,
@@ -1767,6 +1843,17 @@ struct Lock: AsyncParsableCommand {
             expecting: LockResult.self)) ?? LockResult()
         for name in released.paused {
             Self.note("devctl lock: resuming \(name)…")
+        }
+        switch verdict {
+        case .fault(let error):
+            /** A failing command keeps its own status: never swallow that. A
+                clean command that silently lost its work exits 1. */
+            CLIRunner.emitFailure(error, json: global.json)
+            Foundation.exit(commandStatus == 0 ? 1 : commandStatus)
+        case .note(let text):
+            Self.note(text)
+        case .silent:
+            break
         }
         Foundation.exit(commandStatus)
     }

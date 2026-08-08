@@ -16,28 +16,5 @@ Open work only; entries are removed by the change that resolves them.
 - Split `CLI.swift`: every command struct lives in that one file, which is past the size where splitting is worth asking about. A structure decision, not drift; the codebase map describes the current layout.
 - Field-level config editing in the dashboard would preserve `devservers.json` formatting instead of normalizing writes. `devctl config init` writes indented JSON with sorted keys, so a recovered file and a dashboard-saved file now agree on shape, but a hand-authored one with its own ordering or comments still normalizes on save.
 
-## `lock --no-pause` is not enough when the command deletes the locked state
-
-A session wiped a project's local database directory to re-run migrations from
-scratch, under `devctl lock d1 --no-pause`. The lock serialized access, but the
-dev server kept the file open across the deletion and flushed its cached pages
-back over the freshly migrated file. The migration reported success, the ledger
-recorded every file as applied, and the seeded rows were gone. Three separate
-wrong diagnoses followed before reading the sqlite file's raw bytes settled it,
-and one of those wrong diagnoses got as far as a new guardrail before being
-disproved.
-
-`--no-pause` is documented as "the server tolerates staying up", which reads as a
-property of the *server*. The property that actually matters is a property of the
-*command*: whether it mutates the resource in place (fine) or removes and
-recreates it (not fine, the open handle wins).
-
-Worth considering:
-
-- Refuse `--no-pause` when the command line touches the locked resource's own
-  state path with a removing verb (`rm`, `mv`, `rmdir`), or at least warn.
-- Or make `lock` report, on completion, that the resource's backing file changed
-  identity (inode/hash) while a holder was up, which is the observable tell.
-
-Either turns a silent data loss into a loud refusal. Right now nothing in the
-output distinguishes "migrated and seeded" from "migrated, seeded, and clobbered".
+- Exact hashing above the file cap needs a streaming SHA-256. `SHA256Portable.digest` takes a whole `[UInt8]` with no incremental entry point, so a lock resource larger than 8 MiB is fingerprinted by head, tail, size, and mtime, and a middle-only rewrite that preserves all four escapes the identity check. The limit is asserted in `ResourceIdentityTests` and stated in the contract rather than left implicit.
+- The identity check flags the risk window, not the damage: the flush that corrupts can land after the guarded command exits and the second capture is taken. Catching that would need the daemon to watch the resource across the whole hold, or to compare again once the paused set has resumed.

@@ -77,13 +77,14 @@ public enum WireErrorCode: String, Codable, Sendable {
     case portDrift = "port-drift"
     case portHeld = "port-held"
     case resourceLocked = "resource-locked"
+    case resourceMutated = "resource-mutated"
     case spawnFailed = "spawn-failed"
     case usage
     case versionMismatch = "version-mismatch"
 }
 
 /** Wire and CLI error shape; `hint` is the literal remediation command when one exists. */
-public struct WireError: Codable, Error, Sendable {
+public struct WireError: Codable, Equatable, Error, Sendable {
     public var code: WireErrorCode
     public var hint: String?
     public var message: String
@@ -382,10 +383,15 @@ public struct LockResult: Codable, Equatable, Sendable {
     /** Declaring servers this hold left running, under `--no-pause`. */
     public var live: [String]?
     public var paused: [String]
+    /** Absolute path to the resource's declared state, when a declarer names
+        one. The daemon resolves it because it already holds the merged view;
+        a second resolution in the CLI could disagree with the pause loop's. */
+    public var statePath: String?
 
-    public init(live: [String]? = nil, paused: [String] = []) {
+    public init(live: [String]? = nil, paused: [String] = [], statePath: String? = nil) {
         self.live = live
         self.paused = paused
+        self.statePath = statePath
     }
 }
 

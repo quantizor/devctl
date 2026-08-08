@@ -69,12 +69,17 @@ public struct DevCtlPaths: Sendable {
         serverLogDir(project: project, server: server).appending(path: "current.log")
     }
 
-    /** First 8 hex chars of SHA-256 over the canonical project path. */
-    public static func hash8(_ string: String) -> String {
-        SHA256Portable.digest(Array(string.utf8))
-            .prefix(4)
+    /** Full hex SHA-256. `hash8` is its first 8 characters and stays so: log
+        directory names on disk derive from that prefix. */
+    public static func hashHex(_ bytes: [UInt8]) -> String {
+        SHA256Portable.digest(bytes)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    /** First 8 hex chars of SHA-256 over the canonical project path. */
+    public static func hash8(_ string: String) -> String {
+        String(hashHex(Array(string.utf8)).prefix(8))
     }
 }
 

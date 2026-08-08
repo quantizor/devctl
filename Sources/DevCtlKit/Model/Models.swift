@@ -61,6 +61,55 @@ public enum WaitTarget: String, Codable, Sendable {
     case started
 }
 
+/** A resource a server holds while running. Written either as a bare name
+    (`"d1"`) or as an object naming where the resource's state lives on disk
+    (`{"name": "d1", "path": ".wrangler/state/v3/d1"}`). Both forms decode and the
+    bare form re-encodes bare, so existing registry entries and committed configs
+    never churn. The path is what lets `devctl lock` notice that a command
+    changed the state while a declaring server still held the old file open. */
+public struct LockDeclaration: Codable, Equatable, Hashable, Sendable {
+    public var name: String
+    /** Project-relative path to the resource's state, a file or a directory.
+        Absent means devctl cannot check identity for this resource, and will not
+        pretend to. */
+    public var path: String?
+
+    public init(name: String, path: String? = nil) {
+        self.name = name
+        self.path = path
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case path
+    }
+
+    public init(from decoder: any Decoder) throws {
+        /** Probing the string form is the discriminator between the two shapes,
+            not a swallowed error: the object branch reports its own decode
+            failure with the real key path. */
+        if let name = try? decoder.singleValueContainer().decode(String.self) {
+            self.name = name
+            self.path = nil
+            return
+        }
+        let keyed = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try keyed.decode(String.self, forKey: .name)
+        self.path = try keyed.decodeIfPresent(String.self, forKey: .path)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        guard let path else {
+            var single = encoder.singleValueContainer()
+            try single.encode(name)
+            return
+        }
+        var keyed = encoder.container(keyedBy: CodingKeys.self)
+        try keyed.encode(name, forKey: .name)
+        try keyed.encode(path, forKey: .path)
+    }
+}
+
 /** What `devctl wait` blocks on. */
 public enum WaitCondition: String, Codable, Sendable {
     case healthy
@@ -108,7 +157,7 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         database, a fixture directory). `devctl lock <resource> -- cmd` stops
         holders for the command's duration, and starts are refused while a live
         external holder owns the resource. */
-    public var locks: [String]?
+    public var locks: [LockDeclaration]?
     public var name: String
     public var port: Int?
     /** Child env var that receives the effective port (default `PORT`). */
@@ -132,7 +181,7 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         healthcheck: HealthCheckSpec? = nil,
         host: String? = nil,
         icon: String? = nil,
-        locks: [String]? = nil,
+        locks: [LockDeclaration]? = nil,
         name: String,
         port: Int? = nil,
         portEnv: String? = nil,
