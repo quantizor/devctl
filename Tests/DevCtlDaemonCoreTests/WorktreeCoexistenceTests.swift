@@ -325,15 +325,6 @@ import Testing
     }
 
     private static func fixtureServerPath() -> String? {
-        let candidates = [
-            URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appending(path: ".build/debug/fixture-server"),
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appending(path: ".build/debug/fixture-server"),
-        ]
-        return candidates.map(\.path).first { FileManager.default.isExecutableFile(atPath: $0) }
+        fixtureServerExecutable()
     }
 }

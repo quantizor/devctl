@@ -462,15 +462,4 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     }
 }
 
-private func fixtureServerPath() -> String? {
-    let candidates = [
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appending(path: ".build/debug/fixture-server"),
-        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appending(path: ".build/debug/fixture-server"),
-    ]
-    return candidates.map(\.path).first { FileManager.default.isExecutableFile(atPath: $0) }
-}
+private func fixtureServerPath() -> String? { fixtureServerExecutable() }

@@ -238,12 +238,5 @@ import Testing
         await stop(router, env.project)
     }
 
-    private static func fixtureServerPath() -> String? {
-        let candidate = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appending(path: ".build/debug/fixture-server")
-        return FileManager.default.fileExists(atPath: candidate.path) ? candidate.path : nil
-    }
+    private static func fixtureServerPath() -> String? { fixtureServerExecutable() }
 }
