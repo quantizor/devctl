@@ -363,13 +363,42 @@ set +e
 NO_PAUSE_EXIT=$?
 set -e
 [[ "$NO_PAUSE_EXIT" -eq 0 ]] || fail "lock --no-pause failed ($NO_PAUSE_EXIT): $(head -c 400 "$NO_PAUSE_STATUS" 2>/dev/null) $(cat "$WORK/no-pause.err" 2>/dev/null)"
-# Drop any human pause lines lock might print; the status JSON is the last object.
-NO_PAUSE_PHASE="$(/usr/bin/python3 -c 'import json,sys; lines=open(sys.argv[1]).read().splitlines();
-objs=[json.loads(l) for l in lines if l.strip().startswith("{")];
-assert objs, open(sys.argv[1]).read();
-print(objs[-1]["servers"][0]["phase"])' "$NO_PAUSE_STATUS")"
+# stdout belongs to the guarded command: lock's own chatter is on stderr, so
+# this parses as plain JSON with nothing filtered out.
+NO_PAUSE_PHASE="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["servers"][0]["phase"])' "$NO_PAUSE_STATUS")"
 [[ "$NO_PAUSE_PHASE" == "running" ]] || fail "lock --no-pause paused db (phase $NO_PAUSE_PHASE; out=$(cat "$NO_PAUSE_STATUS"))"
 pass "lock --no-pause leaves declarer running"
+
+# The parse defect: lock's own options after the resource joined the guarded
+# command, so `env --timeout 20 -- sh` died with `env: illegal option -- t`.
+"$DEVCTL" lock data --timeout 20 -- sh -c 'exit 0' 2>/dev/null || fail "lock leaked its own options into the guarded command"
+pass "lock options before -- do not reach the guarded command"
+
+# A contended acquire has to name the holder rather than sit silent, and the
+# fail-fast form must return at once instead of waiting out the budget.
+"$DEVCTL" lock data -- sh -c 'sleep 4' >/dev/null 2>&1 &
+HOLDER_JOB=$!
+for _ in $(seq 1 60); do
+  if ! "$DEVCTL" lock data --acquire-timeout 0 -- true >/dev/null 2>&1; then break; fi
+done
+FAST_START=$SECONDS
+set +e
+"$DEVCTL" lock data --acquire-timeout 0 --json -- true > "$WORK/lockfast.json" 2>/dev/null
+FAST_EXIT=$?
+set -e
+FAST_ELAPSED=$((SECONDS - FAST_START))
+[[ "$FAST_EXIT" -ne 0 ]] || fail "--acquire-timeout 0 acquired a held lock"
+[[ "$FAST_ELAPSED" -lt 3 ]] || fail "--acquire-timeout 0 waited ${FAST_ELAPSED}s instead of failing fast"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/lockfast.json'));assert d['error']['code']=='resource-locked', d" || fail "fail-fast lock lost its error code"
+set +e
+"$DEVCTL" lock data --acquire-timeout 20 -- true 2>"$WORK/contended.err" >/dev/null
+CONTENDED_EXIT=$?
+set -e
+wait $HOLDER_JOB 2>/dev/null || true
+[[ "$CONTENDED_EXIT" -eq 0 ]] || fail "contended lock never acquired ($CONTENDED_EXIT): $(cat "$WORK/contended.err")"
+grep -qE "is held by pid [0-9]+" "$WORK/contended.err" || fail "contended lock waited silently: $(cat "$WORK/contended.err")"
+grep -q "waiting up to" "$WORK/contended.err" || fail "contended lock did not say the wait is bounded"
+pass "contended lock names the holder and bounds the wait"
 "$DEVCTL" down --json > /dev/null
 
 # Deep links: print URL + dispatch via x-url (no Launch Services).
