@@ -1560,6 +1560,73 @@ struct Switch: AsyncParsableCommand {
     }
 }
 
+/** The acquire wait as a decision rather than a loop condition, so a zero budget
+    still makes one attempt. `while Date() < deadline` never entered its body at
+    budget 0, which produced a generic failure naming no holder. */
+struct LockAcquireSchedule: Equatable, Sendable {
+    static let announceIntervalSeconds: Double = 15
+    static let retryIntervalSeconds: Double = 1
+    var budgetSeconds: Double
+
+    func shouldRetry(afterElapsed elapsed: Double) -> Bool {
+        elapsed < budgetSeconds
+    }
+
+    func shouldAnnounceStillWaiting(atElapsed elapsed: Double, lastAnnouncedElapsed: Double?)
+        -> Bool
+    {
+        guard let last = lastAnnouncedElapsed else { return false }
+        return elapsed - last >= Self.announceIntervalSeconds
+    }
+}
+
+/** Everything a contended acquire says, pure so the exact wording is asserted.
+    Silence here is what made a waiting run look hung, and the reflex that
+    invites is killing whichever run holds the lock, which is the one making
+    progress. Every line goes to stderr: stdout belongs to the guarded command. */
+enum LockNotice {
+    static func contended(
+        budgetSeconds: Double, holder: LockHolder, now: Date, resource: String
+    ) -> String {
+        let age = DurationText.brief(seconds: now.timeIntervalSince(holder.since))
+        var lines = [
+            "devctl lock: '\(resource)' is held by pid \(holder.pid), running for \(age)\(pauseClause(holder))."
+        ]
+        lines.append(
+            "devctl lock: waiting up to \(DurationText.brief(seconds: budgetSeconds)) for that run to finish. It is the one making progress, so check it with `ps -p \(holder.pid)` before killing anything."
+        )
+        return lines.joined(separator: "\n")
+    }
+
+    static func stillWaiting(
+        elapsedSeconds: Double, holder: LockHolder, remainingSeconds: Double, resource: String
+    ) -> String {
+        "devctl lock: still waiting on '\(resource)' (pid \(holder.pid)), \(DurationText.brief(seconds: elapsedSeconds)) elapsed, \(DurationText.brief(seconds: remainingSeconds)) left."
+    }
+
+    private static func pauseClause(_ holder: LockHolder) -> String {
+        if holder.pause == false {
+            guard let live = holder.live, !live.isEmpty else {
+                return " (it left declaring servers running, --no-pause)"
+            }
+            return " (it left \(live.joined(separator: ", ")) running, --no-pause)"
+        }
+        guard !holder.paused.isEmpty else { return " (nothing was running to pause)" }
+        return " (it paused \(holder.paused.joined(separator: ", ")))"
+    }
+}
+
+/** Compact human durations. Nothing else in the CLI formats one. */
+enum DurationText {
+    static func brief(seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        guard total >= 60 else { return "\(max(total, 0))s" }
+        let minutes = total / 60
+        guard minutes >= 60 else { return String(format: "%dm %02ds", minutes, total % 60) }
+        return String(format: "%dh %02dm", minutes / 60, minutes % 60)
+    }
+}
+
 /** Runs a command while holding a named resource exclusively. By default the
     daemon pauses managed servers that declare the resource; `--no-pause` takes
     the mutex without stopping them (for harnesses that reuse the live server). */
@@ -1569,50 +1636,64 @@ struct Lock: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    /** Positional order is load-bearing: the resource comes first, everything
-        after -- is the command, so declaration order deliberately breaks the
-        alphabet. Options and flags must appear before the passthrough argv so
-        `--no-pause` is not captured into the command. */
+    /** Declaration order is load-bearing for the help synopsis only: the
+        repeating positional has to come last, and the options render in
+        declaration order, which is what makes `--help` match the contract. It has
+        no bearing on parsing, since `.postTerminator` lifts everything after `--`
+        before any positional is filled. */
     @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
     var resource: String
 
     @Option(help: "Seconds to wait for the resource if another holder has it.")
     var acquireTimeout: Double = 300
 
-    /** Explicit long name: `@Flag(inversion: .prefixedNo)` on a default-true
-        `pause` was still pausing under `--no-pause` in the smoke gate (daemon
-        unit tests with `pause: false` were fine), so the wire bit is driven by
-        this opt-out flag instead. */
+    /** Spelled as an explicit opt-out rather than `@Flag(inversion: .prefixedNo)`
+        on a default-true `pause`: the contract documents this spelling, and the
+        inverted form would also mint a `--pause` that does nothing. The symptom
+        that first blamed inversion was the passthrough parse below swallowing the
+        flag into the command. */
     @Flag(name: .customLong("no-pause"), help: "Hold the mutex without stopping servers that declare the resource.")
     var noPause = false
 
     @Option(help: "Per-server seconds to wait for health when servers return.")
     var timeout: Double = 120
 
-    @Argument(parsing: .captureForPassthrough, help: "Command to run while holding the resource.")
-    var command: [String]
+    /** `.postTerminator`, not `.captureForPassthrough`: the latter ends option
+        parsing at the first positional value, so the resource itself stopped it
+        and `--timeout 300` joined the guarded command, which then ran as
+        `env --timeout 300 -- cmd`. This strategy lifts everything after `--`
+        verbatim (a nested `--`, a dash option, an empty string all survive) and
+        leaves the options to parse normally. The default makes a missing command
+        reach the typed usage error below rather than the parser's own printer. */
+    @Argument(parsing: .postTerminator, help: "Command to run while holding the resource; everything after `--`.")
+    var command: [String] = []
+
+    /** Pure so the exact message is asserted without spawning the CLI. */
+    static func usageError(command: [String], resource: String) -> WireError? {
+        guard command.isEmpty else { return nil }
+        return WireError(
+            code: .usage,
+            hint: "devctl lock \(resource) -- <command>",
+            message: "devctl lock needs a command after `--`; its own options go before it (devctl lock \(resource) [--no-pause] [--acquire-timeout <seconds>] [--timeout <seconds>] -- <command…>)")
+    }
 
     func run() async throws {
-        var noPause = noPause
-        var command = command
-        if !noPause, let flagIndex = command.firstIndex(of: "--no-pause") {
-            noPause = true
-            command.remove(at: flagIndex)
-        }
-        guard !command.isEmpty else {
-            CLIRunner.fail(
-                WireError(code: .usage, message: "usage: devctl lock <resource> [--no-pause] -- <command…>"),
-                json: global.json)
+        let command = command
+        let noPause = noPause
+        if let usage = Self.usageError(command: command, resource: resource) {
+            CLIRunner.fail(usage, json: global.json)
         }
         let project = global.resolvedProject()
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
         /** Acquire with patience: another harness may hold it. The daemon owns
             pause/resume of declaring servers; this CLI just runs the command. */
-        let deadline = Date().addingTimeInterval(acquireTimeout)
+        let schedule = LockAcquireSchedule(budgetSeconds: acquireTimeout)
+        let started = Date()
         var acquired: LockResult?
+        var announcedAt: Double?
         var lastError: WireError?
-        while Date() < deadline {
+        repeat {
             do {
                 acquired = try await client.request(
                     .lockAcquire,
@@ -1623,16 +1704,46 @@ struct Lock: AsyncParsableCommand {
                 break
             } catch let error as WireError where error.code == .resourceLocked {
                 lastError = error
-                try? await Task.sleep(for: .seconds(1))
+                let elapsed = Date().timeIntervalSince(started)
+                /** Ask who holds it once, then repeat on an interval so a long
+                    wait stays visibly bounded rather than silent. An older daemon
+                    without lock.status degrades to the bounded-wait line. */
+                let holder = try? await client.request(
+                    .lockStatus,
+                    params: LockStatusParams(project: project, resource: resource),
+                    expecting: LockStatusResult.self
+                ).holder
+                if let holder {
+                    if announcedAt == nil {
+                        Self.note(
+                            LockNotice.contended(
+                                budgetSeconds: acquireTimeout, holder: holder, now: Date(),
+                                resource: resource))
+                        announcedAt = elapsed
+                    } else if schedule.shouldAnnounceStillWaiting(
+                        atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
+                    {
+                        Self.note(
+                            LockNotice.stillWaiting(
+                                elapsedSeconds: elapsed, holder: holder,
+                                remainingSeconds: max(acquireTimeout - elapsed, 0),
+                                resource: resource))
+                        announcedAt = elapsed
+                    }
+                }
+                guard schedule.shouldRetry(afterElapsed: elapsed) else { break }
+                try? await Task.sleep(for: .seconds(LockAcquireSchedule.retryIntervalSeconds))
             }
-        }
+        } while schedule.shouldRetry(afterElapsed: Date().timeIntervalSince(started))
         guard let acquired else {
             CLIRunner.fail(
                 lastError ?? WireError(code: .resourceLocked, message: "could not acquire '\(resource)'"),
                 json: global.json)
         }
+        /** Progress chatter is stderr: stdout belongs to the guarded command, and
+            --json governs stdout schemas. */
         for name in acquired.paused {
-            print("paused \(name) (holds \(resource))")
+            Self.note("devctl lock: paused \(name) (holds \(resource))")
         }
         /** Run the guarded command with inherited stdio. */
         let process = Process()
@@ -1655,8 +1766,12 @@ struct Lock: AsyncParsableCommand {
                 resumeTimeoutSeconds: timeout),
             expecting: LockResult.self)) ?? LockResult()
         for name in released.paused {
-            print("resuming \(name)…")
+            Self.note("devctl lock: resuming \(name)…")
         }
         Foundation.exit(commandStatus)
+    }
+
+    static func note(_ text: String) {
+        FileHandle.standardError.write(Data((text + "\n").utf8))
     }
 }

@@ -115,6 +115,96 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
+    /** A waiting run has to be able to name the holder, or it looks hung and
+        someone kills the run that is making progress. */
+    @Test func lockStatusNamesTheLiveHolderAndForgetsADeadOne() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try await startDB(router: router, project: env.projectPath)
+
+        let empty = try await handle(
+            router: router, method: .lockStatus,
+            params: LockStatusParams(project: env.projectPath, resource: "data"),
+            expecting: LockStatusResult.self)
+        #expect(empty.holder == nil)
+
+        _ = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        let held = try await handle(
+            router: router, method: .lockStatus,
+            params: LockStatusParams(project: env.projectPath, resource: "data"),
+            expecting: LockStatusResult.self)
+        let holder = try #require(held.holder)
+        #expect(holder.pid == Int(getpid()))
+        #expect(holder.pause == true)
+        #expect(holder.paused == ["db"])
+        #expect(holder.live == nil)
+
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        let after = try await handle(
+            router: router, method: .lockStatus,
+            params: LockStatusParams(project: env.projectPath, resource: "data"),
+            expecting: LockStatusResult.self)
+        #expect(after.holder == nil)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
+    /** Under --no-pause the declarers stay up, and which ones is exactly what a
+        waiting run needs to be told. */
+    @Test func noPauseAcquireRecordsTheServersItLeftRunning() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try await startDB(router: router, project: env.projectPath)
+
+        let acquired = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(
+                holderPid: Int(getpid()), pause: false, project: env.projectPath,
+                resource: "data", resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        #expect(acquired.live == ["db"])
+        #expect(acquired.paused.isEmpty)
+        let held = try await handle(
+            router: router, method: .lockStatus,
+            params: LockStatusParams(project: env.projectPath, resource: "data"),
+            expecting: LockStatusResult.self)
+        #expect(held.holder?.live == ["db"])
+        #expect(held.holder?.pause == false)
+        /** The claim is that nothing was paused. startDB does not health-gate, so
+            the server is legitimately still starting; `stopped` is what a pause
+            would have left behind. */
+        #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") != .stopped)
+
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
     /** The reported failure: daemon dies mid-hold, holder is gone, recover must
         resume the paused set from locks.json. */
     @Test func recoverResumesWhenHolderIsDead() async throws {

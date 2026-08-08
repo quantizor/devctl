@@ -176,6 +176,7 @@ public enum WireMethod: String, Sendable {
     case groupUp = "group.up"
     case lockAcquire = "lock.acquire"
     case lockRelease = "lock.release"
+    case lockStatus = "lock.status"
     case logsMark = "logs.mark"
     case logsQuery = "logs.query"
     case projectCheck = "project.check"
@@ -331,14 +332,23 @@ public struct LockParams: Codable, Equatable, Sendable {
 /** In-memory and on-disk lock record. `paused` is who the daemon stopped for
     this hold so a crash mid-lock can resume them when the holder is gone. */
 public struct LockHolder: Codable, Equatable, Sendable {
+    /** Declaring servers this hold left running (`--no-pause`). Absent under the
+        default paused mode, and on files written before this field existed. */
+    public var live: [String]?
+    /** Whether this hold paused declarers. An empty `paused` is ambiguous on its
+        own: nothing was running, or nothing was asked to stop. */
+    public var pause: Bool?
     public var paused: [String]
     public var pid: Int
     public var resumeTimeoutSeconds: Double?
     public var since: Date
 
     public init(
-        paused: [String] = [], pid: Int, resumeTimeoutSeconds: Double? = nil, since: Date
+        live: [String]? = nil, pause: Bool? = nil, paused: [String] = [], pid: Int,
+        resumeTimeoutSeconds: Double? = nil, since: Date
     ) {
+        self.live = live
+        self.pause = pause
         self.paused = paused
         self.pid = pid
         self.resumeTimeoutSeconds = resumeTimeoutSeconds
@@ -346,11 +356,35 @@ public struct LockHolder: Codable, Equatable, Sendable {
     }
 }
 
+public struct LockStatusParams: Codable, Equatable, Sendable {
+    public var project: String
+    public var resource: String
+
+    public init(project: String, resource: String) {
+        self.project = project
+        self.resource = resource
+    }
+}
+
+/** Who, if anyone, holds a resource right now. Read-only: a contended acquire
+    asks once so the waiting run can name the holder instead of looking hung,
+    which is what stops someone killing the run that is making progress. */
+public struct LockStatusResult: Codable, Equatable, Sendable {
+    public var holder: LockHolder?
+
+    public init(holder: LockHolder? = nil) {
+        self.holder = holder
+    }
+}
+
 /** Result of lock.acquire / lock.release: which servers were paused or resumed. */
 public struct LockResult: Codable, Equatable, Sendable {
+    /** Declaring servers this hold left running, under `--no-pause`. */
+    public var live: [String]?
     public var paused: [String]
 
-    public init(paused: [String] = []) {
+    public init(live: [String]? = nil, paused: [String] = []) {
+        self.live = live
         self.paused = paused
     }
 }
