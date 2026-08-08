@@ -439,6 +439,22 @@ pass "--no-pause over changed state fails loudly with resource-mutated"
 "$DEVCTL" lock data --no-pause -- true 2>"$WORK/quiet.err" >/dev/null || fail "--no-pause over untouched state failed"
 [[ ! -s "$WORK/quiet.err" ]] || fail "--no-pause over untouched state was noisy: $(cat "$WORK/quiet.err")"
 pass "an untouched locked resource stays silent"
+
+# restart is one daemon-side transition: a client-side stop-then-ensure takes the
+# server down and only then discovers a refusal, leaving it down.
+"$DEVCTL" up --timeout 15 --json > /dev/null || fail "up before restart"
+RESTART_PID_BEFORE="$("$DEVCTL" status db --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
+"$DEVCTL" restart db --timeout 15 --json > "$WORK/restart.json" || fail "restart db"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/restart.json'));s=d['results'][0]['server'];assert s['phase']=='running', d; assert s['pid']!=$RESTART_PID_BEFORE, d" || fail "restart did not replace the process"
+pass "restart replaces the process and comes back healthy"
+
+set +e
+"$DEVCTL" lock data --no-pause -- "$DEVCTL" restart db --timeout 5 --json > "$WORK/restart-locked.json" 2>/dev/null
+set -e
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/restart-locked.json'));assert d['error']['code']=='resource-locked', d" || fail "restart under a live lock was not refused"
+"$DEVCTL" status db --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)["servers"][0]; assert d["phase"]=="running", d' || fail "a refused restart left the server down"
+pass "restart under a live lock is refused and the server stays up"
+
 "$DEVCTL" down --json > /dev/null
 "$DEVCTL" down --json > /dev/null
 

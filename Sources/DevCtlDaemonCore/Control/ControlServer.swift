@@ -213,6 +213,11 @@ public actor Router {
                 let stopped = await supervisor.stop()
                 DevCtlLog.daemon.info("stop \(target.name)@\(target.project)")
                 return try respond(id: head.id, result: ServerResult(server: stopped))
+            case .serverRestart:
+                let request = try decoder.decode(WireRequest<RestartParams>.self, from: line)
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                return try respond(id: head.id, result: try await restartServers(params))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(
@@ -1335,6 +1340,64 @@ public actor Router {
     /** Wave-parallel group start honoring the dependency graph: a wave holds
         servers whose dependencies all settled in earlier waves. waitFor .started
         launches without blocking on health; the default blocks until healthy. */
+    /** The one restart path. Every refusal happens before anything stops: a
+        client-side `stop && ensure` takes the server down and only then discovers
+        a held resource or a broken config, leaving it down. The stop is
+        non-retiring because the server is coming straight back, so resume-on-boot
+        survives what `stop` would otherwise clear. */
+    private func restartServers(_ params: RestartParams) async throws -> GroupResult {
+        let merged = try await mergedSpecs(project: params.project)
+        var wanted = merged.specs
+        if let names = params.names {
+            for name in names where !merged.specs.contains(where: { $0.name == name }) {
+                throw WireError(
+                    code: .notFound,
+                    hint: "run: devctl status --json",
+                    message: "no server named '\(name)' in \(params.project)")
+            }
+            wanted = merged.specs.filter { names.contains($0.name) }
+        }
+        var prepared: [(spec: ServerSpec, supervisor: ServerSupervisor)] = []
+        for spec in wanted {
+            await recordTrustIfNeeded(
+                project: params.project, name: spec.name, fileNames: merged.fileNames)
+            try await lockGate(project: params.project, spec: spec)
+            try await refuseIfPaused(project: params.project, spec: spec)
+            prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
+        }
+        var results: [EnsureResult] = []
+        for entry in prepared {
+            _ = await entry.supervisor.stop(deliberate: false)
+            let target = ServerTargetParams(
+                name: entry.spec.name, port: params.port, project: params.project)
+            try await prepareSpawn(
+                target: target, supervisor: entry.supervisor, portOverride: params.port)
+            results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
+            DevCtlLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
+        }
+        return GroupResult(results: results.sorted { $0.server.server < $1.server.server })
+    }
+
+    /** A server sitting in a live holder's paused set must not be resurrected
+        behind the lock's back. lockGate covers an external holder of a resource
+        this server declares; this covers the case where the hold already stopped
+        it. */
+    private func refuseIfPaused(project: String, spec: ServerSpec) async throws {
+        for declaration in spec.locks ?? [] {
+            let key = Self.lockKey(project: project, resource: declaration.name)
+            await releaseOrphanedLock(key: key)
+            guard let holder = resourceLocks[key], holder.paused.contains(spec.name) else {
+                continue
+            }
+            throw WireError(
+                code: .resourceLocked,
+                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
+                message:
+                    "'\(spec.name)' is paused by the hold on '\(declaration.name)' (pid \(holder.pid)); it comes back when that run releases"
+            )
+        }
+    }
+
     private func groupUp(_ params: GroupParams) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
