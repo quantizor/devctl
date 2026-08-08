@@ -70,6 +70,11 @@ public enum JSONCoding {
 public enum WireErrorCode: String, Codable, Sendable {
     case alreadyExists = "already-exists"
     case configInvalid = "config-invalid"
+    /** The daemon is up and accepting but has not finished bringing supervised
+        servers back, so it declines work rather than acting on half-restored
+        state. Distinct from `daemon-unreachable`, which means nothing answered:
+        a client must retry this one and must not start a second daemon. */
+    case daemonStarting = "daemon-starting"
     case daemonUnreachable = "daemon-unreachable"
     case internalError = "internal-error"
     case notFound = "not-found"
@@ -169,7 +174,7 @@ public struct WireEmpty: Codable, Equatable, Sendable {
 }
 
 /** Method names; string-typed on the wire, enum-checked in code. */
-public enum WireMethod: String, Sendable {
+public enum WireMethod: String, CaseIterable, Sendable {
     case daemonInfo = "daemon.info"
     case daemonShutdown = "daemon.shutdown"
     case eventsQuery = "events.query"

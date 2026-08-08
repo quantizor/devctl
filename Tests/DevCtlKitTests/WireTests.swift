@@ -85,6 +85,34 @@ import Testing
         )
     }
 
+    /** `daemon.info` is what every other command's hint points at, so its shape
+        is a contract like any other and had no golden until it grew a field. A
+        serving daemon encodes exactly what it always did: `restoring` is omitted
+        rather than false, which is the compatibility claim. */
+    @Test func daemonInfoSchemaGoldenOmitsRestoringWhenServing() throws {
+        let info = DaemonInfo(
+            dataDir: "/data", daemonVersion: "1.4.0", logsDir: "/logs", pid: 42, proto: 1,
+            socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
+    /** The one shape a client branches on to tell a daemon that is coming back
+        from one that is gone. */
+    @Test func daemonInfoSchemaGoldenWhileRestoring() throws {
+        let info = DaemonInfo(
+            dataDir: "/data", daemonVersion: "1.4.0", logsDir: "/logs", pid: 42, proto: 1,
+            restoring: true, socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"restoring":true,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
     /** A main checkout answers exactly as it did before the effective-host
         fields existed: they are omitted when nil, which is the compatibility
         claim, asserted rather than assumed. */

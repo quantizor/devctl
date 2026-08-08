@@ -101,7 +101,7 @@ enum CLIRunner {
     static func fail(_ error: WireError, json: Bool) -> Never {
         emitFailure(error, json: json)
         switch error.code {
-        case .daemonUnreachable, .versionMismatch:
+        case .daemonStarting, .daemonUnreachable, .versionMismatch:
             Foundation.exit(3)
         case .notFound:
             Foundation.exit(4)
@@ -119,11 +119,11 @@ enum CLIRunner {
         _ body: (DaemonClient) async throws -> R
     ) async -> R {
         do {
-            return try await body(client())
+            return try await awaitingRestore(body)
         } catch let error as WireError where error.code == .daemonUnreachable && bootstrap {
             if await attemptBootstrap() {
                 do {
-                    return try await body(client())
+                    return try await awaitingRestore(body)
                 } catch let retryError as WireError {
                     fail(retryError, json: json)
                 } catch {
@@ -143,6 +143,40 @@ enum CLIRunner {
             fail(error, json: json)
         } catch {
             fail(WireError(code: .internalError, message: String(describing: error)), json: json)
+        }
+    }
+
+    /** A daemon answering `daemon-starting` is busy, not gone, so the command
+        waits for it instead of failing or standing up a second one. Bounded, and
+        it names what it is waiting for on the first retry: a gate that blocks in
+        silence reads as a hang, and the reflex that invites is killing the
+        process that is making progress.
+
+        The wait belongs here rather than in `DaemonClient` so the session hook,
+        which talks to the socket directly to stay fast, keeps failing instantly
+        and silently. */
+    static let restoreWaitBudget = Duration.seconds(30)
+    static let restorePollInterval = Duration.milliseconds(250)
+
+    private static func awaitingRestore<R: Codable & Sendable>(
+        _ body: (DaemonClient) async throws -> R
+    ) async throws -> R {
+        let deadline = ContinuousClock.now.advanced(by: restoreWaitBudget)
+        var announced = false
+        while true {
+            do {
+                return try await body(client())
+            } catch let error as WireError where error.code == .daemonStarting {
+                guard ContinuousClock.now < deadline else { throw error }
+                if !announced {
+                    announced = true
+                    FileHandle.standardError.write(
+                        Data("devctl: devctld is restoring supervised servers; waiting…\n".utf8))
+                }
+                /** A cancelled sleep just re-checks the deadline on the next
+                    pass, so the loop still terminates and nothing is lost. */
+                try? await Task.sleep(for: restorePollInterval)
+            }
         }
     }
 
@@ -1481,7 +1515,12 @@ struct DaemonStatusCommand: AsyncParsableCommand {
                 json: true
             ) { _ in "" }
         } else if let info {
-            print("launchd: \(launchdLine)\ndaemon: v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)")
+            /** Called out rather than folded into the version line, because the
+                whole reason to ask is to tell a daemon that is coming back from
+                one that is gone, and the two used to be one answer. */
+            let phase = info.restoring == true ? " (restoring supervised servers)" : ""
+            print(
+                "launchd: \(launchdLine)\ndaemon: v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)\(phase)")
         } else {
             print("launchd: \(launchdLine)\ndaemon: not responding")
         }

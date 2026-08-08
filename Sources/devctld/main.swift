@@ -168,19 +168,35 @@ terminationSource.setEventHandler {
 }
 terminationSource.resume()
 
-/** Finish boot restore before accepting clients so install/restart re-ensure
-    cannot race a half-finished restore. */
+/** Accept before restore, but serve nothing but identity until restore is done.
+    Refusing with a reason and finishing restore before any real work are both
+    requirements: install/restart re-ensure must not race a half-finished
+    restore, and a client that connects during it must be able to tell a busy
+    daemon from a dead one. Closing the socket satisfied the first and defeated
+    the second, since ENOENT is what a daemon that never started looks like. */
 Task {
-    await router.recoverAtStartup()
-    /** Announced from the listener's ready state, so the line means a client can
-        connect now rather than that start was called. */
+    await router.setRestoring(true)
     let socketPath = paths.socketPath
-    server.start {
+    /** Awaited rather than assumed: `NWListener.start` is asynchronous and the
+        socket path does not exist until the listener reaches `.ready`, so
+        proceeding on the next statement would leave a window that still answers
+        ENOENT, which is the exact failure this ordering exists to remove. */
+    do {
+        try await server.startAccepting()
+    } catch {
         FileHandle.standardError.write(
-            Data(
-                "devctld \(DevCtlVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
-                    .utf8))
+            Data("devctld: control listener never accepted on \(socketPath): \(error)\n".utf8))
+        exit(1)
     }
+    await router.recoverAtStartup()
+    await router.setRestoring(false)
+    /** Announced after restore, so the line still means the daemon is ready for
+        work. Anything waiting on it (the smoke gate, `daemon install`) keeps the
+        guarantee it always had. */
+    FileHandle.standardError.write(
+        Data(
+            "devctld \(DevCtlVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
+                .utf8))
     /** The watch sweep starts only after restore, so a boot-time spawn is never
         mistaken for a config change. Polling rather than an fd-based watcher:
         nearly every editor and build tool saves by writing a temp file and

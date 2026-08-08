@@ -413,6 +413,11 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
     public var logsDir: String
     public var pid: Int
     public var proto: Int
+    /** Present and true only while boot restore is running, so a serving daemon
+        encodes exactly the payload it always did. A reader that does not know
+        the key sees a normal daemon, which is the right default: the flag marks
+        a window measured in seconds. */
+    public var restoring: Bool?
     public var searchPath: String?
     public var socketPath: String
 
@@ -422,6 +427,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         logsDir: String,
         pid: Int,
         proto: Int,
+        restoring: Bool? = nil,
         searchPath: String? = nil,
         socketPath: String
     ) {
@@ -430,6 +436,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         self.logsDir = logsDir
         self.pid = pid
         self.proto = proto
+        self.restoring = restoring
         self.searchPath = searchPath
         self.socketPath = socketPath
     }

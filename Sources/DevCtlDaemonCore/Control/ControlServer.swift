@@ -1,6 +1,7 @@
 import DevCtlKit
 import Foundation
 @preconcurrency import Network
+import os
 
 /** Routes decoded requests to the registry and supervisor pool. One instance per
     daemon; connection handling fans out but every method lands here. */
@@ -20,6 +21,10 @@ public actor Router {
         their server to stop bouncing right now. An init parameter so tests can
         set it without touching the environment. */
     private let watchEnabled: Bool
+    /** True from before the listener accepts until boot restore has finished.
+        Defaults to false so a directly constructed Router (every test, and any
+        embedder) serves immediately; only the daemon's boot sequence raises it. */
+    private var restoring = false
 
     public init(
         launcher: any ProcessLauncher, paths: DevCtlPaths, registry: Registry,
@@ -33,6 +38,28 @@ public actor Router {
         self.resourceLocks =
             Self.normalizedLocks(
                 AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
+    }
+
+    /** Raised before the listener accepts and lowered once `recoverAtStartup`
+        returns. Two explicit calls rather than a flag hidden inside recovery,
+        because the window has to open earlier than recovery starts: the whole
+        point is that a client connecting before then gets an answer. */
+    public func setRestoring(_ value: Bool) {
+        restoring = value
+    }
+
+    /** Everything that reads or changes supervised state is refused while boot
+        restore runs, since the state is half rebuilt and a caller acting on it
+        would draw the wrong conclusion. `daemon.info` is how a client learns
+        that is why, and `daemon.shutdown` is the way out of a restore that
+        never finishes. */
+    public static func isServableWhileRestoring(_ method: WireMethod) -> Bool {
+        switch method {
+        case .daemonInfo, .daemonShutdown:
+            return true
+        default:
+            return false
+        }
     }
 
     private static func lockKey(project: String, resource: String) -> String {
@@ -67,6 +94,12 @@ public actor Router {
         do {
             guard let method = WireMethod(rawValue: head.method) else {
                 throw WireError(code: .usage, message: "unknown method \(head.method)")
+            }
+            guard !restoring || Self.isServableWhileRestoring(method) else {
+                throw WireError(
+                    code: .daemonStarting,
+                    hint: "run: devctl daemon status",
+                    message: "devctld is still restoring supervised servers and is not serving requests yet")
             }
             switch method {
             case .daemonInfo:
@@ -631,6 +664,7 @@ public actor Router {
             logsDir: paths.logsDir.path,
             pid: Int(getpid()),
             proto: DevCtlVersion.proto,
+            restoring: restoring ? true : nil,
             searchPath: ProcessInfo.processInfo.environment["PATH"],
             socketPath: paths.socketPath
         )
@@ -1621,36 +1655,61 @@ public final class ControlServer: Sendable {
         }
     }
 
-    /** `onReady` fires when the listener is actually accepting, which is not
-        when this returns: `NWListener.start` is asynchronous, and the socket
-        path is unlinked during init and only recreated on the way to `.ready`.
-        Announcing readiness on the next statement therefore told clients the
-        daemon was up while a connect still got ENOENT, which is how a readiness
-        check comes to pass for the wrong reason. */
-    public func start(onReady: @escaping @Sendable () -> Void = {}) {
+    /** Returns when the listener is actually accepting, which is later than
+        `NWListener.start` returns: start is asynchronous, and the socket path is
+        unlinked during init and only recreated on the way to `.ready`. Treating
+        the call as the readiness point told clients the daemon was up while a
+        connect still got ENOENT, which is how a readiness check comes to pass
+        for the wrong reason.
+
+        Throws instead of waiting forever when the listener never gets there. A
+        caller suspended on a callback that will not fire is a daemon that is
+        running, holding the single-instance lock, and serving nothing, with no
+        line saying why. */
+    public func startAccepting() async throws {
         let socketPath = self.socketPath
-        listener.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                /** Owner-only, and it has to run here: the socket file does not
-                    exist until the listener is ready, so a chmod any earlier
-                    targets an empty path and silently does nothing. The
-                    containing directory is 0700, making this the second layer
-                    rather than the only one. */
-                if chmod(socketPath, 0o600) != 0 {
-                    DevCtlLog.daemon.error(
-                        "cannot restrict the control socket to owner-only: errno \(errno)")
+        /** `stateUpdateHandler` can fire more than once (a `.ready` listener can
+            still fail later), and resuming a continuation twice traps, so the
+            first terminal state wins and the rest are dropped. */
+        let settled = OSAllocatedUnfairLock(initialState: false)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let claim: @Sendable () -> Bool = {
+                settled.withLock { done in
+                    if done { return false }
+                    done = true
+                    return true
                 }
-                onReady()
-            case .failed(let error):
-                DevCtlLog.daemon.error("control listener failed: \(String(describing: error))")
-            case .cancelled:
-                DevCtlLog.daemon.debug("control listener cancelled")
-            default:
-                break
             }
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    /** Owner-only, and it has to run here: the socket file does
+                        not exist until the listener is ready, so a chmod any
+                        earlier targets an empty path and silently does nothing.
+                        The containing directory is 0700, making this the second
+                        layer rather than the only one. */
+                    if chmod(socketPath, 0o600) != 0 {
+                        DevCtlLog.daemon.error(
+                            "cannot restrict the control socket to owner-only: errno \(errno)")
+                    }
+                    if claim() { continuation.resume() }
+                case .failed(let error):
+                    DevCtlLog.daemon.error("control listener failed: \(String(describing: error))")
+                    if claim() { continuation.resume(throwing: error) }
+                case .cancelled:
+                    DevCtlLog.daemon.debug("control listener cancelled")
+                    if claim() {
+                        continuation.resume(
+                            throwing: WireError(
+                                code: .internalError,
+                                message: "control listener was cancelled before it accepted"))
+                    }
+                default:
+                    break
+                }
+            }
+            listener.start(queue: DispatchQueue(label: "devctl.control"))
         }
-        listener.start(queue: DispatchQueue(label: "devctl.control"))
     }
 
     /** A client that exits without a shutdown handshake (every one-shot `devctl`
