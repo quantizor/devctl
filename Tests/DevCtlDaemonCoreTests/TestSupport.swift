@@ -67,9 +67,21 @@ private let strayFixturesReaped: Bool = {
 private func reapStrayFixtureServers() {
     guard let binary = fixtureServerBinaryPath() else { return }
     let name = (binary as NSString).lastPathComponent
+    var killed: [pid_t] = []
     for candidate in runningProcesses()
     where shouldReapStray(command: candidate.command, parent: candidate.parent, binaryName: name) {
         kill(candidate.pid, SIGKILL)
+        killed.append(candidate.pid)
+    }
+    /** Waits for the kernel to actually tear them down. SIGKILL returns
+        immediately but the listening socket outlives the call by a moment, and a
+        suite that spawned straight afterwards raced it and failed with
+        `port-held` naming a pid this had just killed: a cleanup that does not
+        wait for its own effect is only half a cleanup. */
+    for _ in 0..<100 where !killed.isEmpty {
+        killed = killed.filter { kill($0, 0) == 0 }
+        if killed.isEmpty { break }
+        usleep(20_000)
     }
 }
 
