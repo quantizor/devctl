@@ -67,6 +67,41 @@ public enum ProcessTree {
         }
     }
 
+    /** Live processes belonging to `session`, excluding the session leader and
+        this process's own session.
+
+        This is the one handle on an escaped descendant that does not depend on
+        when a snapshot was taken. A child that setpgid's out of the group (every
+        Foundation `Process` child does) still inherits the session, and unlike
+        the parent-pid chain, session membership survives the root exiting and
+        the orphan reparenting to launchd. So a descendant missed by the snapshot
+        because it appeared moments before the crash is still reachable here.
+
+        The safety guard is the whole design. `sessionLeaderPid` must equal
+        `session`, which is true exactly when the spawn used createSession and
+        the root really is its own session leader. Without that check, a root
+        sharing the daemon's session would turn this into a sweep of the daemon
+        and everything the daemon owns, so the caller's session is refused
+        outright rather than trusted to differ. */
+    public static func sessionMembers(of session: pid_t, sessionLeaderPid: pid_t)
+        -> DescendantsResult
+    {
+        guard session == sessionLeaderPid, session != getsid(getpid()), session > 0 else {
+            return .ok([])
+        }
+        switch fetchProcessTable() {
+        case .failed(let errno):
+            return .failed(errno: errno)
+        case .ok(let table):
+            let mine = getpid()
+            return .ok(
+                table.map(\.process).filter { identity in
+                    identity.pid != session && identity.pid != mine
+                        && getsid(identity.pid) == session
+                })
+        }
+    }
+
     /** Whether a snapshotted identity still names the same process. A nil live
         identity means the pid is gone; a start-time mismatch means reuse. */
     public static func shouldSignal(snapshotted: ProcessIdentity, live: ProcessIdentity?) -> Bool {

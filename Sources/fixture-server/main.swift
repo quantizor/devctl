@@ -4,7 +4,13 @@ import Foundation
     --listen-tcp PORT      accept TCP connections (healthcheck target)
     --exit-after SECONDS   terminate itself after a delay
     --code N               exit code to use with --exit-after
-    --spawn-grandchild     spawn a `sleep 1000` child (group-kill verification)
+    --spawn-grandchild     spawn a `sleep 1000` child (group-kill verification).
+                           Foundation's Process puts it in its OWN process group,
+                           so a group-directed kill cannot reach it and only the
+                           daemon's descendant snapshot can
+    --grandchild-after S   delay that spawn, which is what puts it past the
+                           supervisor's early snapshot and makes the teardown
+                           race deterministic instead of load-dependent
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
@@ -19,6 +25,7 @@ var listenPort: UInt16?
 var exitAfter: Double?
 var exitCode: Int32 = 0
 var spawnGrandchild = false
+var grandchildAfter: Double?
 var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
@@ -37,6 +44,8 @@ while let arg = argIterator.next() {
         exitCode = argIterator.next().flatMap { Int32($0) } ?? 0
     case "--spawn-grandchild":
         spawnGrandchild = true
+    case "--grandchild-after":
+        grandchildAfter = argIterator.next().flatMap { Double($0) }
     case "--ignore-sigterm":
         ignoreSigterm = true
     case "--emit-binary":
@@ -61,12 +70,22 @@ if ignoreSigterm {
     signal(SIGTERM, SIG_IGN)
 }
 
-if spawnGrandchild {
+func launchGrandchild() {
     let child = Process()
     child.executableURL = URL(fileURLWithPath: "/bin/sleep")
     child.arguments = ["1000"]
     try? child.run()
     print("grandchild pid \(child.processIdentifier)")
+}
+
+if spawnGrandchild {
+    if let grandchildAfter {
+        /** On a background queue so the heartbeat loop below still runs and the
+            supervisor sees a normal, healthy-looking server for the whole delay. */
+        DispatchQueue.global().asyncAfter(deadline: .now() + grandchildAfter) { launchGrandchild() }
+    } else {
+        launchGrandchild()
+    }
 }
 
 if emitBinary {

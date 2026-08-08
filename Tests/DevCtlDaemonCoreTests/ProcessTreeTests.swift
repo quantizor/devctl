@@ -19,6 +19,71 @@ import Testing
         #expect(plan.byteCount == 0)
     }
 
+    /** The guard that keeps a session sweep from becoming a sweep of the daemon
+        itself. Refusing the caller's own session is the load-bearing assertion:
+        without it, a root spawned without createSession would share the daemon's
+        session and teardown would signal the daemon and every other server it
+        supervises. */
+    @Test func sessionSweepRefusesTheCallersOwnSession() {
+        let mine = getsid(getpid())
+        #expect(
+            ProcessTree.sessionMembers(of: mine, sessionLeaderPid: mine).identities.isEmpty)
+    }
+
+    /** A root that is not its own session leader cannot have had createSession
+        applied, so its session belongs to somebody else and is not ours to
+        sweep. */
+    @Test func sessionSweepRefusesARootThatIsNotTheSessionLeader() {
+        #expect(
+            ProcessTree.sessionMembers(of: 1, sessionLeaderPid: 4242).identities.isEmpty)
+        #expect(ProcessTree.sessionMembers(of: 0, sessionLeaderPid: 0).identities.isEmpty)
+    }
+
+    /** The positive control, and the reason it uses posix_spawn directly:
+        Foundation's `Process` starts a new process GROUP but not a new session,
+        so a shell launched through it is not a session leader and the guard
+        above refuses it. A control written that way passes in a millisecond
+        without ever reaching the code it claims to cover, which is
+        indistinguishable from a sweep that always returns nothing.
+
+        POSIX_SPAWN_SETSID reproduces what the daemon's launcher does with
+        createSession. The shell then backgrounds a sleep, giving the session a
+        second member that the sweep must find. */
+    @Test func sessionSweepFindsAMemberThatIsNotTheLeader() throws {
+        var attributes = posix_spawnattr_t(bitPattern: 0)
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        #expect(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID)) == 0)
+
+        var leader: pid_t = 0
+        let script = "/bin/sleep 5 & sleep 5"
+        let argv: [String] = ["/bin/sh", "-c", script]
+        var cArgs = argv.map { strdup($0) } + [nil]
+        defer { for arg in cArgs where arg != nil { free(arg) } }
+        let spawned = posix_spawn(&leader, "/bin/sh", nil, &attributes, &cArgs, environ)
+        try #require(spawned == 0, "posix_spawn failed: \(spawned)")
+        defer {
+            kill(-leader, SIGKILL)
+            kill(leader, SIGKILL)
+            var status: Int32 = 0
+            waitpid(leader, &status, 0)
+        }
+
+        /** The premise: without SETSID taking effect there is no session to
+            sweep and the rest of this test would prove nothing. */
+        #expect(getsid(leader) == leader)
+
+        var members: [pid_t] = []
+        for _ in 0..<50 {
+            members = ProcessTree.sessionMembers(of: leader, sessionLeaderPid: leader)
+                .identities.map(\.pid)
+            if !members.isEmpty { break }
+            usleep(50_000)
+        }
+        #expect(!members.isEmpty, "session sweep found no members of session \(leader)")
+        #expect(members.contains(leader) == false, "the leader itself must not be returned")
+    }
+
     @Test func shouldSignalRejectsMissingAndReusedPid() {
         let snap = ProcessIdentity(pid: 42, startSeconds: 100, startMicroseconds: 5)
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: nil) == false)
