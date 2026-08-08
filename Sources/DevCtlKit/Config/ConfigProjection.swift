@@ -12,10 +12,6 @@ import Foundation
     spec: a supervisor spec has been through PortMaterializer, so its argv holds
     substituted literals rather than the `{port}` the author wrote. */
 public enum ConfigProjection {
-    /** Config keys a projection cannot recover, because they exist only in the
-        file and have no runtime counterpart. Reported rather than silently lost. */
-    public static let unrecoverableKeys = ["lifecycle"]
-
     public static func file(
         host: String?, icon: String? = nil, lifecycle: [String: [[String]]]? = nil,
         project: String, specs: [ServerSpec]

@@ -691,11 +691,18 @@ public actor Router {
                 merged = next
             }
             config = merged
-        } else if config.lifecycle == nil {
+        } else if exists {
             /** lifecycle exists only in the file and has no runtime counterpart,
-                so a rewrite from daemon state cannot carry it. Say so instead of
-                dropping it quietly. */
-            notRecovered = exists ? ConfigProjection.unrecoverableKeys : []
+                so a rewrite from daemon state drops it. Report it only when the
+                file being replaced actually had one: naming a key the reader
+                never wrote sends them looking for something that was never
+                there. */
+            let previous = (try? Data(contentsOf: url)).flatMap {
+                try? JSONCoding.decoder().decode(ProjectFileConfig.self, from: $0)
+            }
+            if let lifecycle = previous?.lifecycle, !lifecycle.isEmpty, config.lifecycle == nil {
+                notRecovered = ["lifecycle"]
+            }
         }
         let view = ProjectConfigLoader.validate(config: config, project: project)
         guard view.errors.isEmpty else {

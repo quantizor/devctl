@@ -521,7 +521,7 @@ public actor ServerSupervisor {
             "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief.name)@\(thief.project)")
         await events?.post(
             kind: .failed, project: projectPath, server: spec.name,
-            detail: "port \(expected) owned by managed server \(thief)")
+            detail: "port \(expected) owned by managed server '\(thief.name)' in \(thief.project)")
         let id = serverID(project: projectPath, name: spec.name)
         let summary = errorSummary
         let err = spawnError

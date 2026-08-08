@@ -156,6 +156,36 @@ import Testing
         }
     }
 
+    /** Naming a key the reader never wrote sends them looking for something that
+        was never there, so `lifecycle` is reported only when the replaced file
+        actually had one. */
+    @Test func notRecoveredNamesLifecycleOnlyWhenTheReplacedFileHadOne() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project, spec: ServerSpec(command: ["bun", "dev"], name: "web", port: 3000))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let url = URL(fileURLWithPath: env.project).appending(path: "devservers.json")
+
+        try Data(#"{"servers":{"web":{"command":["bun","dev"],"port":3000}},"version":1}"#.utf8)
+            .write(to: url)
+        let plain = try await handle(
+            router, .projectInitConfig,
+            InitConfigParams(force: true, mode: .replace, project: env.project),
+            InitConfigResult.self)
+        #expect(plain.notRecovered == nil)
+
+        try Data(
+            #"{"lifecycle":{"switch":[["echo","hi"]]},"servers":{"web":{"command":["bun","dev"],"port":3000}},"version":1}"#
+                .utf8
+        ).write(to: url)
+        let withLifecycle = try await handle(
+            router, .projectInitConfig,
+            InitConfigParams(force: true, mode: .replace, project: env.project),
+            InitConfigResult.self)
+        #expect(withLifecycle.notRecovered == ["lifecycle"])
+    }
+
     @Test func initWithNoKnownServersIsNotFound() async throws {
         let env = try makeEnv()
         do {
