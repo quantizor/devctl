@@ -141,11 +141,16 @@ public actor Router {
                         return try respond(
                             id: head.id, result: CheckResult(errors: ["cannot read \(url.path)"]))
                     }
+                    let hosts = await effectiveHosts(project: project, view: view)
                     return try respond(
                         id: head.id,
                         result: CheckResult(
+                            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
+                            effectiveHostReason: hosts.project.differs
+                                ? hosts.project.reason : nil,
                             errors: view.errors,
                             host: view.host,
+                            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
                             servers: view.specs.map(\.name),
                             warnings: view.warnings))
                 } catch let error as WireError {
@@ -613,6 +618,30 @@ public actor Router {
     /** Resolve effective port, apply overlay/worktree host/materialization, and
         either auto-rebind a sibling conflict or refuse with port-held. Every
         start-shaped path routes through here. */
+    /** The hosts a spawn from this directory would use, answered before anything
+        starts. Same resolver the spawn path runs, so `config check` can report a
+        worktree's ephemeral origin rather than leaving it to be discovered as a
+        broken app. Only servers that differ from the project are returned. */
+    private func effectiveHosts(project: String, view: ProjectConfigView) async -> (
+        project: EffectiveHost, servers: [EffectiveHost]
+    ) {
+        let defaultSlugHost = "\(ProjectConfigLoader.defaultSlug(project: project)).localhost"
+        let preferred = CheckoutIdentity.preferredSubdomain(
+            project: project, committedHost: view.host)
+        let projectHost = EffectiveHostResolver.project(
+            declaredHost: view.host,
+            worktreeHost: CheckoutIdentity.worktreeHost(
+                project: project, preferred: preferred, takenHosts: await takenHosts()))
+        let overlay = LocalOverlay.load(project: project)
+        let servers = view.specs.compactMap { spec -> EffectiveHost? in
+            let resolved = EffectiveHostResolver.server(
+                defaultSlugHost: defaultSlugHost, overlayHost: overlay?.servers?[spec.name]?.host,
+                project: projectHost, server: spec.name, specHost: spec.host)
+            return resolved.effective == projectHost.effective ? nil : resolved
+        }
+        return (projectHost, servers)
+    }
+
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil
     ) async throws {
@@ -643,11 +672,18 @@ public actor Router {
             matches against this so preferred-host URLs rewrite to the ephemeral
             label even after `spec.host` already moved. */
         let matchHost = spec.host ?? committedHost ?? defaultSlugHost
-        if let worktreeHost = CheckoutIdentity.worktreeHost(
-            project: target.project, preferred: preferred, takenHosts: taken),
-            overlayServer?.host == nil,
-            spec.host == nil || spec.host == committedHost || spec.host == defaultSlugHost
-        {
+        let projectHost = EffectiveHostResolver.project(
+            declaredHost: committedHost ?? defaultSlugHost,
+            worktreeHost: CheckoutIdentity.worktreeHost(
+                project: target.project, preferred: preferred, takenHosts: taken))
+        let serverHost = EffectiveHostResolver.server(
+            defaultSlugHost: defaultSlugHost, overlayHost: overlayServer?.host,
+            project: projectHost, server: target.name, specHost: spec.host)
+        /** Only a worktree swap rewrites the spec here: an overlay host is
+            already applied above, and a per-server override keeps its own host.
+            `config check` reads the same resolver, so the two cannot drift. */
+        if serverHost.reason == .linkedWorktree {
+            let worktreeHost = serverHost.effective
             spec.host = worktreeHost
             if let port = spec.port {
                 let urlHost = URL(string: spec.url ?? "")?.host

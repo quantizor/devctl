@@ -995,6 +995,17 @@ struct ConfigCheck: AsyncParsableCommand {
         CLIRunner.emit(result, json: global.json) { r in
             var lines: [String] = []
             if let host = r.host { lines.append("host: \(host)") }
+            /** Printed as its own line rather than a warning: an ephemeral
+                worktree host is correct behavior, and warning would take every
+                worktree checkout out of "config ok". */
+            if let effective = r.effectiveHost, let declared = r.host {
+                lines.append(
+                    "effective host: \(effective) (\(Self.explain(r.effectiveHostReason)); the file declares \(declared))")
+            }
+            for server in r.serverHosts ?? [] where server.differs {
+                lines.append(
+                    "  \(server.server ?? "?"): \(server.effective) (\(Self.explain(server.reason)))")
+            }
             if !r.servers.isEmpty { lines.append("servers: \(r.servers.joined(separator: ", "))") }
             lines.append(contentsOf: r.errors.map { "error: \($0)" })
             lines.append(contentsOf: r.warnings.map { "warning: \($0)" })
@@ -1003,6 +1014,20 @@ struct ConfigCheck: AsyncParsableCommand {
         }
         if !result.errors.isEmpty {
             Foundation.exit(1)
+        }
+    }
+
+    /** Exhaustive so a new reason has to be given a sentence a reader can act
+        on, rather than printing a raw enum token. */
+    static func explain(_ reason: EffectiveHostReason?) -> String {
+        guard let reason else { return "differs from the declared host" }
+        switch reason {
+        case .linkedWorktree:
+            return "this checkout is a linked git worktree, so a start prepends the worktree label"
+        case .localOverlay:
+            return "devctl.local.json overrides the host for this checkout"
+        case .serverOverride:
+            return "this server declares its own host, so the worktree label does not apply"
         }
     }
 }

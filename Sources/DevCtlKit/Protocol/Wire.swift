@@ -377,14 +377,31 @@ public struct WriteConfigParams: Codable, Equatable, Sendable {
 }
 
 public struct CheckResult: Codable, Equatable, Sendable {
+    /** The host a spawn from this directory would actually use, when it differs
+        from `host`. A linked worktree gets an ephemeral label, so any config the
+        app itself pins to an origin (an auth callback, a CORS allow list, an API
+        key referrer) is wrong before anything starts; nothing said so until
+        `ensure`. Omitted when it matches. */
+    public var effectiveHost: String?
+    public var effectiveHostReason: EffectiveHostReason?
     public var errors: [String]
+    /** The host the file declares. */
     public var host: String?
+    /** One entry per server whose effective host differs from the project's. */
+    public var serverHosts: [EffectiveHost]?
     public var servers: [String]
     public var warnings: [String]
 
-    public init(errors: [String] = [], host: String? = nil, servers: [String] = [], warnings: [String] = []) {
+    public init(
+        effectiveHost: String? = nil, effectiveHostReason: EffectiveHostReason? = nil,
+        errors: [String] = [], host: String? = nil, serverHosts: [EffectiveHost]? = nil,
+        servers: [String] = [], warnings: [String] = []
+    ) {
+        self.effectiveHost = effectiveHost
+        self.effectiveHostReason = effectiveHostReason
         self.errors = errors
         self.host = host
+        self.serverHosts = serverHosts
         self.servers = servers
         self.warnings = warnings
     }

@@ -104,6 +104,9 @@ struct PortCollisionTests {
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: base) }
 
+        /** Fail at the callsite that broke. A git command that quietly exits
+            nonzero (no git, no worktree support, a permissions problem) otherwise
+            surfaces as a confusing assertion several lines later. */
         func run(_ args: [String], cwd: URL) throws {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
@@ -113,6 +116,9 @@ struct PortCollisionTests {
             process.standardError = FileHandle.nullDevice
             try process.run()
             process.waitUntilExit()
+            try #require(
+                process.terminationStatus == 0,
+                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
         }
         try run(["init", "-q"], cwd: main)
         try run(["config", "user.email", "t@example.com"], cwd: main)

@@ -84,6 +84,39 @@ import Testing
                 == #"{"declaredPort":3000,"errorSummary":{"count":3,"firstAt":"2025-07-18T19:46:40.000Z","lastAt":"2025-07-18T19:46:44.000Z"},"healthcheck":"none","logPath":"/logs/web/current.log","phase":"crashed","project":"/tmp/proj","server":"web"}"#
         )
     }
+
+    /** A main checkout answers exactly as it did before the effective-host
+        fields existed: they are omitted when nil, which is the compatibility
+        claim, asserted rather than assumed. */
+    @Test func checkResultSchemaGoldenIsUnchangedWithoutAnEffectiveHost() throws {
+        let result = CheckResult(
+            errors: [], host: "app.localhost", servers: ["api", "web"], warnings: [])
+        let json = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"errors":[],"host":"app.localhost","servers":["api","web"],"warnings":[]}"#
+        )
+    }
+
+    @Test func checkResultSchemaGoldenWithAWorktreeHost() throws {
+        let result = CheckResult(
+            effectiveHost: "worktree-review.app.localhost",
+            effectiveHostReason: .linkedWorktree,
+            errors: [],
+            host: "app.localhost",
+            serverHosts: [
+                EffectiveHost(
+                    declared: "api.app.localhost", effective: "api.app.localhost",
+                    reason: .serverOverride, server: "api")
+            ],
+            servers: ["api", "web"],
+            warnings: [])
+        let json = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"effectiveHost":"worktree-review.app.localhost","effectiveHostReason":"linked-worktree","errors":[],"host":"app.localhost","serverHosts":[{"declared":"api.app.localhost","effective":"api.app.localhost","reason":"server-override","server":"api"}],"servers":["api","web"],"warnings":[]}"#
+        )
+    }
 }
 
 @Suite struct PathTests {
