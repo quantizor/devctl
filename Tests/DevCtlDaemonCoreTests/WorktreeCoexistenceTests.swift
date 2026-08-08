@@ -99,6 +99,47 @@ import Testing
             ServerResult.self)
     }
 
+    /** `up` prepares the spawn and then runs its waves. Re-resolving the
+        supervisor inside a wave re-applied the committed spec to anything not yet
+        running, discarding the rebound port, the worktree host, and the
+        substituted argv, so the child bound the committed port while status
+        reported the rebind. Group and single-server starts must agree. */
+    @Test func siblingWorktreeGroupUpKeepsTheMaterializedSpawnSpec() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let mainResult = try await handle(
+            router, .groupUp, GroupParams(project: env.main, timeoutSeconds: 10),
+            GroupResult.self)
+        #expect(mainResult.results.first?.server.phase == .running)
+        #expect(mainResult.results.first?.server.effectivePort == 45111)
+
+        let wtResult = try await handle(
+            router, .groupUp, GroupParams(project: env.worktree, timeoutSeconds: 10),
+            GroupResult.self)
+        let web = try #require(wtResult.results.first?.server)
+        #expect(web.phase == .running)
+        let effective = try #require(web.effectivePort)
+        #expect(effective != 45111)
+        #expect(web.portConflict?.state == .rebound)
+        /** The url is the tell: it is built from the materialized spec, so the
+            committed port here means the spawn spec was clobbered. */
+        let url = try #require(web.url)
+        #expect(url == "http://worktree-review.app.localhost:\(effective)/")
+        /** The child was told `{port}`, so a clobbered spec listens on 45111. */
+        #expect(web.observedPort == nil || web.observedPort == effective)
+
+        _ = try await handle(
+            router, .groupDown, GroupParams(project: env.worktree, timeoutSeconds: 10),
+            GroupResult.self)
+        _ = try await handle(
+            router, .groupDown, GroupParams(project: env.main, timeoutSeconds: 10),
+            GroupResult.self)
+    }
+
     @Test func siblingWorktreePortSpanRebindsAsBlock() async throws {
         let base = FileManager.default.temporaryDirectory
             .appending(path: "devctl-span-\(UUID().uuidString)")

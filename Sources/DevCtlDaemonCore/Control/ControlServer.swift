@@ -1173,13 +1173,20 @@ public actor Router {
             a held port refuses the rollout instead of leaving half a project up
             next to a server that lost a race it never knew it entered. Servers
             already up skip the check against their own listeners. */
+        /** Hold the prepared supervisors rather than re-resolving them per wave.
+            `supervisor(project:spec:)` re-applies the committed spec to anything
+            not yet up, which would discard exactly what prepareSpawn just wrote:
+            the rebound port, the worktree host, the substituted argv, and the
+            injected env. A second lookup here spawned the child on the committed
+            port while status reported the rebind. */
+        var prepared: [String: ServerSupervisor] = [:]
         for spec in wanted {
             let target = ServerTargetParams(
                 name: spec.name, port: params.port, project: params.project)
+            let supervisor = await supervisor(project: params.project, spec: spec)
             try await prepareSpawn(
-                target: target,
-                supervisor: await supervisor(project: params.project, spec: spec),
-                portOverride: params.port)
+                target: target, supervisor: supervisor, portOverride: params.port)
+            prepared[spec.name] = supervisor
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
             throw WireError(
@@ -1194,14 +1201,10 @@ public actor Router {
             if failed { break }
             let waveResults = await withTaskGroup(of: EnsureResult.self) { group in
                 for name in wave {
-                    guard let spec = specsByName[name] else { continue }
-                    group.addTask { [weak self] in
-                        guard let self else {
-                            return EnsureResult(
-                                reason: .stopped,
-                                server: ServerStatus(logPath: "", phase: .stopped, project: params.project, server: name))
-                        }
-                        let supervisor = await self.supervisor(project: params.project, spec: spec)
+                    guard let spec = specsByName[name], let supervisor = prepared[name] else {
+                        continue
+                    }
+                    group.addTask {
                         if spec.waitFor == .started {
                             let status = await supervisor.start()
                             return EnsureResult(

@@ -151,7 +151,7 @@ cat > "$PROJECT3/devservers.json" <<CFG
   "host": "smoketest.localhost",
   "servers": {
     "db": { "command": ["$BIN/fixture-server", "--listen-tcp", "$P3_DB"], "port": $P3_DB },
-    "web": { "command": ["$BIN/fixture-server", "--listen-tcp", "$P3_WEB"], "dependsOn": ["db"], "port": $P3_WEB }
+    "web": { "command": ["$BIN/fixture-server", "--listen-tcp", "$P3_WEB"], "dependsOn": ["db"], "heads": { "admin": "/admin" }, "port": $P3_WEB }
   }
 }
 CFG
@@ -174,6 +174,26 @@ pass "up brings the project healthy in dependency order"
 
 "$DEVCTL" status web --json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['servers'][0]; assert d['url']=='http://smoketest.localhost:$P3_WEB/', d" || fail "derived url wrong"
 pass "host signature url derived"
+
+# A root-relative head must resolve against the server's own base, not serialize
+# as `//:port/admin`, which reads as a URL everywhere it lands and works nowhere.
+"$DEVCTL" status web --json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['servers'][0]; assert d['heads']['admin']=='http://smoketest.localhost:$P3_WEB/admin', d" || fail "relative head did not resolve against the server base"
+pass "relative head resolves against the server base"
+
+# The same mistake on a server with no base to resolve against is caught while it
+# is still cheap, rather than shipping a broken URL to every heads consumer.
+BADHEAD="$WORK/badhead"
+mkdir -p "$BADHEAD"
+cat > "$BADHEAD/devservers.json" <<'CFG'
+{ "version": 1, "servers": { "web": { "command": ["true"], "heads": { "admin": "/admin" } } } }
+CFG
+set +e
+"$DEVCTL" config check --project "$BADHEAD" --json > "$WORK/badhead.json" 2>/dev/null
+BADHEAD_EXIT=$?
+set -e
+[[ "$BADHEAD_EXIT" -ne 0 ]] || fail "config check accepted an unresolvable head"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/badhead.json'));assert any('head' in e and 'resolve it against' in e for e in d['errors']), d" || fail "config check did not explain the unresolvable head"
+pass "config check rejects an unresolvable head"
 
 "$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("trusted") is True, d' || fail "project not trusted after up"
 pass "trust recorded by explicit up"

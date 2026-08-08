@@ -93,6 +93,69 @@ import Testing
         #expect(next.url == "http://worktree-fix.myproj.localhost:3742/")
         #expect(next.healthcheck?.url == "http://worktree-fix.myproj.localhost:3742/api/health")
     }
+
+    @Test func relativeHeadResolvesAgainstTheServerBase() {
+        let spec = ServerSpec(
+            command: ["serve"],
+            heads: ["admin": "/admin"],
+            host: "app.localhost",
+            name: "web",
+            port: 33_334
+        )
+        let next = PortMaterializer.materialize(spec: spec, effectivePort: 33_334)
+        #expect(next.heads?["admin"] == "http://app.localhost:33334/admin")
+    }
+
+    @Test func relativeHeadFollowsAReboundPortAndAWorktreeHost() {
+        let spec = ServerSpec(
+            command: ["serve"],
+            heads: ["admin": "/admin", "docs": "/docs/index.html"],
+            host: "app.localhost",
+            name: "web",
+            port: 3000,
+            url: "http://app.localhost:3000/"
+        )
+        let next = PortMaterializer.materialize(
+            spec: spec, effectivePort: 3742, effectiveHost: "worktree-x.app.localhost",
+            matchHost: "app.localhost")
+        #expect(next.heads?["admin"] == "http://worktree-x.app.localhost:3742/admin")
+        #expect(next.heads?["docs"] == "http://worktree-x.app.localhost:3742/docs/index.html")
+    }
+
+    @Test func relativeHeadKeepsItsQueryAndFragment() {
+        let spec = ServerSpec(
+            command: ["serve"],
+            heads: ["admin": "/admin?tab=1#top"],
+            host: "app.localhost",
+            name: "web",
+            port: 3000
+        )
+        let next = PortMaterializer.materialize(spec: spec, effectivePort: 3000)
+        #expect(next.heads?["admin"] == "http://app.localhost:3000/admin?tab=1#top")
+    }
+
+    @Test func relativeHealthcheckURLResolvesAgainstTheBase() {
+        let health = HealthCheckSpec(type: .http, url: "/healthz")
+        let spec = ServerSpec(
+            command: ["serve"], healthcheck: health, host: "app.localhost", name: "web", port: 3000)
+        let next = PortMaterializer.materialize(spec: spec, effectivePort: 3000)
+        #expect(next.healthcheck?.url == "http://app.localhost:3000/healthz")
+    }
+
+    /** A path-only string parses as URLComponents with a nil host, and setting a
+        port on a hostless component set serializes an empty authority
+        (`//:3000/admin`). Returning nil is what hands the caller its
+        relative-resolution and token-substitution fallbacks. */
+    @Test func hostlessURLIsNeverStampedWithAPort() {
+        #expect(PortMaterializer.rewriteURL("/admin", port: 3000, host: "app.localhost") == nil)
+        #expect(PortMaterializer.rewriteURL("admin", port: 3000, host: nil) == nil)
+    }
+
+    @Test func relativeHeadWithNoBaseIsLeftAlone() {
+        let spec = ServerSpec(command: ["serve"], heads: ["admin": "/admin"], name: "web")
+        let next = PortMaterializer.materialize(spec: spec, effectivePort: nil)
+        #expect(next.heads?["admin"] == "/admin")
+    }
 }
 
 @Suite struct LocalOverlayTests {

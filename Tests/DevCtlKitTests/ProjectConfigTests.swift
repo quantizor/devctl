@@ -96,6 +96,82 @@ import Testing
         #expect(view.warnings.allSatisfy { !$0.contains("loopback") })
     }
 
+    @Test func relativeHeadWithABaseIsAccepted() {
+        let config = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], heads: ["admin": "/admin"], port: 3000)])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.errors.isEmpty)
+        #expect(view.warnings.allSatisfy { !$0.contains("head") })
+    }
+
+    @Test func relativeHeadWithNoPortOrURLIsAnError() {
+        let config = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], heads: ["admin": "/admin"])])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(
+            view.errors.contains {
+                $0 == "server 'web': head 'admin' is the path '/admin' but the server declares no port or url to resolve it against; give the server a port, or write the head as an absolute URL"
+            })
+    }
+
+    @Test func headThatIsNeitherAbsoluteNorRootedIsAnError() {
+        let config = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], heads: ["admin": "admin"], port: 3000)])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(
+            view.errors.contains {
+                $0 == "server 'web': head 'admin' is 'admin', which is neither an absolute URL nor a path starting with '/'; write 'http://host:port/admin' or '/admin'"
+            })
+    }
+
+    @Test func emptyHeadIsAnError() {
+        let config = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], heads: ["admin": ""], port: 3000)])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.errors.contains { $0 == "server 'web': head 'admin' is empty" })
+    }
+
+    @Test func bareLoopbackHeadWarns() {
+        let config = ProjectFileConfig(
+            host: "shop.localhost",
+            servers: [
+                "web": ProjectFileServer(
+                    command: ["x"], heads: ["admin": "http://localhost:3000/admin"], port: 3000)
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/Users/x/code/My Proj")
+        #expect(view.errors.isEmpty)
+        #expect(
+            view.warnings.contains {
+                $0 == "server 'web': head 'admin' points at a bare loopback host; prefer 'my-proj.localhost'"
+            })
+    }
+
+    /** `{host}` / `{port}` are legal input to materialization, so their shape
+        cannot be judged before the effective values are known. */
+    @Test func tokenHeadIsLeftToMaterialization() {
+        let config = ProjectFileConfig(
+            servers: [
+                "web": ProjectFileServer(
+                    command: ["x"], heads: ["admin": "http://{host}:{port}/admin"], port: 3000)
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.errors.isEmpty)
+        #expect(view.warnings.allSatisfy { !$0.contains("head") })
+    }
+
+    @Test func relativeHealthcheckURLWithNoBaseIsAnError() {
+        let config = ProjectFileConfig(
+            servers: [
+                "web": ProjectFileServer(
+                    command: ["x"], healthcheck: HealthCheckSpec(type: .http, url: "/healthz"))
+            ])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(
+            view.errors.contains {
+                $0.contains("healthcheck url") && $0.contains("no port or url to resolve it against")
+            })
+    }
+
     @Test func parseErrorIsActionable() throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "devctl-cfg-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
