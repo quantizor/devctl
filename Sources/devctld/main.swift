@@ -172,9 +172,15 @@ terminationSource.resume()
     cannot race a half-finished restore. */
 Task {
     await router.recoverAtStartup()
-    server.start()
-    FileHandle.standardError.write(
-        Data("devctld \(DevCtlVersion.version) listening on \(paths.socketPath) (pid \(getpid()))\n".utf8))
+    /** Announced from the listener's ready state, so the line means a client can
+        connect now rather than that start was called. */
+    let socketPath = paths.socketPath
+    server.start {
+        FileHandle.standardError.write(
+            Data(
+                "devctld \(DevCtlVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
+                    .utf8))
+    }
 }
 
 dispatchMain()

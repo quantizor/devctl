@@ -1,0 +1,9 @@
+---
+"devctl": minor
+---
+
+Port conflicts now announce themselves at the first surface that can see them. `why` names the server and project holding a stopped server's port instead of answering only "not running (stopped)", and the machine-wide status sweep carries the same annotation, so the menu bar app and `doctor` see it too. `doctor` gains a `port-collision` finding for two unrelated projects that declare one port, which the host-keyed signature table could never report because the hostnames differ while the bind does not; sibling worktrees stay excluded since they rebind by design. A server whose healthcheck is answered by another supervised server now fails with `portConflict.state: "foreign"` rather than reporting healthy while serving nothing, and a port held by this server and a stranger at once is reported as `"shared"`. A listener outside the process tree that cannot be attributed to a managed server is annotated but left running, because a container-backed or daemonizing server keeps its socket in a process devctl never parented. An unavailable `lsof` can never fail a healthy server, since an empty result is not treated as evidence.
+
+`config check` warns when a healthcheck declares `type: http` with no `url`, which silently falls back to a TCP probe: a mistyped key otherwise yields a server reporting healthy while its HTTP layer was never checked. `doctor` also stops calling a listener unmanaged when another supervised server is the one holding the port.
+
+`devctl daemon status --json` now reports `reachable`. Every other command's hint points at this one, and it previously answered `{"launchd": "state = running"}` with exit 0 when nothing was listening, so a script or agent following the hint was told things were fine. `launchd: running` only means a job is loaded, never that the socket accepts.

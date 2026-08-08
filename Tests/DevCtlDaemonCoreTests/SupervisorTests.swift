@@ -265,7 +265,8 @@ private func makeEnv() throws -> TestEnv {
     }
 }
 
-private func fixtureServerExecutable() -> String? {
+/** Shared with the port-ownership suite, which needs the same test double. */
+func fixtureServerExecutable() -> String? {
     let candidates = [
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

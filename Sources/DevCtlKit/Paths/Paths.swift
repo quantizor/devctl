@@ -48,11 +48,8 @@ public struct DevCtlPaths: Sendable {
         human-readable; the hash keeps distinct projects with one basename apart. */
     public func serverLogDir(project: String, server: String) -> URL {
         let project = canonicalProjectPath(project)
-        let slug = (project as NSString).lastPathComponent
-            .lowercased()
-            .replacing(/[^a-z0-9-]+/) { _ in "-" }
         return logsDir
-            .appending(path: "\(slug)-\(Self.hash8(project))")
+            .appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
             .appending(path: server)
     }
 
@@ -79,6 +76,20 @@ public struct DevCtlPaths: Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
     }
+}
+
+/** The human-readable half of a project's on-disk and host identity: the last
+    path component, lowercased, with anything outside `[a-z0-9-]` collapsed to a
+    dash. The single home for that algorithm; log directories and the default
+    `<slug>.localhost` host both derive from it.
+
+    Callers pass the path they mean: log directories slug the canonical path,
+    while the host slug uses the path as written, and those can differ when a
+    symlink renames the last component. */
+public func projectSlug(_ path: String) -> String {
+    (path as NSString).lastPathComponent
+        .lowercased()
+        .replacing(/[^a-z0-9-]+/) { _ in "-" }
 }
 
 /** Canonicalizes a project path: absolute, symlinks resolved, on-disk case.

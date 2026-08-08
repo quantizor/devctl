@@ -142,6 +142,225 @@ import Testing
         #expect(error.message.contains(env.projectA))
     }
 
+    /** `why` is the command a reader reaches for after a refusal, so it has to
+        name the holder itself rather than answering only "not running
+        (stopped)". That requires it to annotate latent conflicts the way the
+        status handler does. */
+    @Test func whyNamesTheHolderOfAStoppedServersPort() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45005))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45005))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
+
+        let answer = await handle(
+            router, .serverWhy, ServerTargetParams(name: "web", project: env.projectB), WhyResult.self)
+        guard case .success(let why) = answer else {
+            Issue.record("why should answer for a stopped server")
+            await teardown(router, env.projectA, "web")
+            return
+        }
+        let rootCause = try #require(why.rootCause)
+        #expect(rootCause.contains("45005"))
+        #expect(rootCause.contains(env.projectA))
+        /** The holder belongs in the root cause, not only buried in evidence. */
+        #expect(!rootCause.hasSuffix("not running (stopped)"))
+        await teardown(router, env.projectA, "web")
+    }
+
+    /** The machine-wide sweep feeds `doctor` and the menu bar app, and skipped
+        the annotation entirely. */
+    @Test func statusAcrossAllProjectsAnnotatesTheHeldPort() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45006))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45006))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
+
+        let listed = await handle(
+            router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
+        guard case .success(let all) = listed else {
+            Issue.record("machine-wide status should answer")
+            await teardown(router, env.projectA, "web")
+            return
+        }
+        /** The registry canonicalizes project paths, so compare in that form. */
+        let stopped = try #require(
+            all.servers.first { $0.project == canonicalProjectPath(env.projectB) })
+        let conflict = try #require(stopped.portConflict)
+        #expect(conflict.state == .held)
+        #expect(conflict.message.contains(env.projectA))
+        await teardown(router, env.projectA, "web")
+    }
+
+    /** Waits for a phase, polling rather than sleeping a fixed span. */
+    private func settle(
+        _ supervisor: ServerSupervisor, until predicate: @Sendable (ServerStatus) -> Bool
+    ) async -> ServerStatus {
+        var status = await supervisor.status()
+        for _ in 0..<60 where !predicate(status) {
+            try? await Task.sleep(for: .milliseconds(100))
+            status = await supervisor.status()
+        }
+        return status
+    }
+
+    /** The failure that motivated this check: another project's server holds the
+        port, answers the healthcheck, and every liveness signal reads green while
+        this server is not serving at all. */
+    @Test func aHealthcheckAnsweredByAForeignProcessFailsTheServer() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let port = 45007
+        let registry = Registry(paths: env.paths)
+        /** The thief is another server this daemon supervises, which is what the
+            real incident looked like: two projects, one port, whichever bound
+            first answers for both. */
+        let thiefSpec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(port)], name: "web", port: port)
+        try await registry.register(project: env.projectB, spec: thiefSpec)
+        let thief = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
+            registry: registry, spec: thiefSpec)
+        _ = await thief.start()
+        _ = await settle(thief) { $0.phase == .running }
+
+        /** The victim never binds anything, so the only listener on the port
+            belongs to the thief, yet its TCP healthcheck still passes. */
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port)
+        try await registry.register(project: env.projectA, spec: spec)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let settled = await settle(supervisor) { $0.phase == .failed }
+        #expect(settled.phase == .failed)
+        let conflict = try #require(settled.portConflict)
+        #expect(conflict.state == .foreign)
+        #expect(conflict.message.contains("\(port)"))
+        /** Names the managed server, not just a pid, so the reader can act. */
+        #expect(conflict.holder?.contains(env.projectB) == true)
+        #expect(settled.spawnError?.message.contains("\(port)") == true)
+        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await thief.stop(graceSeconds: 2)
+    }
+
+    /** The control. Same shape, except the supervised process owns the port, so
+        the check must stay silent. Without this a probe that always reported a
+        foreign owner would pass the test above and look like a working feature. */
+    @Test func aServerThatOwnsItsPortStaysHealthy() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let port = 45008
+        let registry = Registry(paths: env.paths)
+        let spec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(port)], name: "web", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        /** The listen scan runs in its own task after health promotion, so wait
+            for the scan's result rather than for `running` alone. */
+        let settled = await settle(supervisor) {
+            ($0.phase == .running && $0.observedPort != nil) || $0.phase == .failed
+        }
+        #expect(settled.phase == .running)
+        #expect(settled.portConflict == nil)
+        #expect(settled.observedPort == port)
+        _ = await supervisor.stop(graceSeconds: 2)
+    }
+
+    /** ATTACK: the server's own listener lives outside its process tree. A
+        container-backed server (docker compose) is the common shape: the
+        listening socket belongs to the runtime, never to our children. Modelled
+        here by a middle process that exits, reparenting the listener to launchd
+        and out of the ppid chain the descendant sweep walks. Nothing was stolen,
+        so failing this server would be wrong. */
+    @Test func aServerWhoseListenerLeftTheProcessTreeIsNotTheft() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let port = 45009
+        let registry = Registry(paths: env.paths)
+        /** The inner shell exits at once, so the listener reparents away. The
+            outer shell stays alive as the supervised root. */
+        let spec = ServerSpec(
+            command: [
+                "/bin/sh", "-c",
+                "/bin/sh -c '\(fixture) --listen-tcp \(port) >/dev/null 2>&1 &' ; sleep 30",
+            ],
+            name: "web", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let settled = await settle(supervisor) {
+            $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
+        }
+        _ = await supervisor.stop(graceSeconds: 2)
+        /** The reparented listener outlives the supervised tree by construction. */
+        for stray in PortGuard.listenerPids(port: port) { kill(pid_t(stray), SIGKILL) }
+        #expect(settled.phase != .failed)
+    }
+
+    /** ATTACK: a stale state row names a pid that macOS later handed to an
+        unrelated process. Matching on the number alone would accuse an innocent
+        managed server and fail this one for it. The row here claims a start time
+        an hour before the listener actually started, which is what a recycled
+        pid looks like. */
+    @Test func aRecycledPidIsNotMistakenForAManagedThief() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let port = 45010
+        let registry = Registry(paths: env.paths)
+        /** An unmanaged listener, started now. */
+        let stranger = Process()
+        stranger.executableURL = URL(fileURLWithPath: fixture)
+        stranger.arguments = ["--listen-tcp", String(port)]
+        stranger.standardOutput = FileHandle.nullDevice
+        stranger.standardError = FileHandle.nullDevice
+        try stranger.run()
+        defer { stranger.terminate() }
+        try await Task.sleep(for: .milliseconds(400))
+
+        /** A stale row for another project claiming that very pid, recorded an
+            hour ago: the pid matches, the identity cannot. */
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: port))
+        try await registry.updateState(serverID: serverID(project: env.projectB, name: "web")) {
+            entry in
+            entry.phase = .running
+            entry.pid = Int(stranger.processIdentifier)
+            entry.startedAt = Date().addingTimeInterval(-3600)
+        }
+
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port)
+        try await registry.register(project: env.projectA, spec: spec)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let settled = await settle(supervisor) {
+            $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
+        }
+        _ = await supervisor.stop(graceSeconds: 2)
+        /** Annotated, never failed: the accusation could not be substantiated. */
+        #expect(settled.phase != .failed)
+        #expect(settled.portConflict?.state == .foreign)
+    }
+
     private func teardown(_ router: Router, _ project: String, _ name: String) async {
         _ = await handle(router, .serverStop, ServerTargetParams(name: name, project: project), ServerResult.self)
     }

@@ -9,9 +9,10 @@ import Testing
     read as a free port; these prove both families are seen and a closed port is
     not. */
 @Suite struct LoopbackProbeTests {
+    /** Closed exactly once: the suite runs many tests in one process, so closing
+        an fd twice can shut one another thread was handed in between. */
     @Test func seesAnIPv4Listener() {
         let sock = socket(AF_INET, SOCK_STREAM, 0)
-        defer { close(sock) }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0
@@ -30,7 +31,34 @@ import Testing
         let port = Int(UInt16(bigEndian: bound.sin_port))
         #expect(LoopbackProbe.isListening(port: port))
         close(sock)
-        #expect(!LoopbackProbe.isListening(port: port))
+
+        /** The negative uses a port this test holds and never listens on, which
+            is race-free by construction. Asserting that the released port above
+            stays free would not be: `bind(0)` returns an ephemeral port, the
+            range the kernel hands to outbound connections, so another socket in
+            this process can take it between the close and the probe. Re-binding
+            it is no better, because a closed listener leaves the port in
+            TIME_WAIT and the bind then fails for a reason that says nothing
+            about the probe. */
+        let quiet = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(quiet) }
+        var quietAddr = sockaddr_in()
+        quietAddr.sin_family = sa_family_t(AF_INET)
+        quietAddr.sin_port = 0
+        quietAddr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        _ = withUnsafePointer(to: &quietAddr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(quiet, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        var quietBound = sockaddr_in()
+        var quietLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &quietBound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(quiet, $0, &quietLen)
+            }
+        }
+        #expect(!LoopbackProbe.isListening(port: Int(UInt16(bigEndian: quietBound.sin_port))))
     }
 
     @Test func seesAnIPv6OnlyListener() {

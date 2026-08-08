@@ -6,7 +6,7 @@ import Testing
 /** A daemon stand-in: fixed project list plus a per-server status, and canned
     ensure/stop/why results. Records nothing beyond what the runner returns. */
 private struct MockDaemon: DeepLinkDaemon {
-    var projectPaths: [String] = ["/Users/x/code/candor"]
+    var projectPaths: [String] = ["/Users/x/code/myproj"]
     var status: ServerStatus?
     var ensureResult: EnsureResult?
     var stopResult: ServerResult?
@@ -57,50 +57,50 @@ private actor RecordingEffects: DeepLinkEffects {
     @Test func ensureReportsPhase() async throws {
         let daemon = MockDaemon(
             ensureResult: EnsureResult(
-                server: ServerStatus(logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms")))
+                server: ServerStatus(logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms")))
         let effects = RecordingEffects()
         let result = try await runner(daemon, effects).run(
-            DeepLink(verb: .ensure, projectSlug: "candor", server: "cms"))
-        #expect(result == DeepLinkRunResult(verb: .ensure, projectPath: "/Users/x/code/candor", detail: "running"))
+            DeepLink(verb: .ensure, projectSlug: "myproj", server: "cms"))
+        #expect(result == DeepLinkRunResult(verb: .ensure, projectPath: "/Users/x/code/myproj", detail: "running"))
     }
 
     @Test func ensureReportsFellShort() async throws {
         let daemon = MockDaemon(
             ensureResult: EnsureResult(
                 reason: .timeout,
-                server: ServerStatus(logPath: "", phase: .starting, project: "/Users/x/code/candor", server: "cms")))
+                server: ServerStatus(logPath: "", phase: .starting, project: "/Users/x/code/myproj", server: "cms")))
         let result = try await runner(daemon, RecordingEffects()).run(
-            DeepLink(verb: .ensure, projectSlug: "candor", server: "cms"))
+            DeepLink(verb: .ensure, projectSlug: "myproj", server: "cms"))
         #expect(result.detail == "fell short: timeout")
     }
 
     @Test func stopReportsPhase() async throws {
         let result = try await runner(MockDaemon(), RecordingEffects()).run(
-            DeepLink(verb: .stop, projectSlug: "candor", server: "cms"))
-        #expect(result == DeepLinkRunResult(verb: .stop, projectPath: "/Users/x/code/candor", detail: "stopped"))
+            DeepLink(verb: .stop, projectSlug: "myproj", server: "cms"))
+        #expect(result == DeepLinkRunResult(verb: .stop, projectPath: "/Users/x/code/myproj", detail: "stopped"))
     }
 
     @Test func openOpensServerURL() async throws {
         let daemon = MockDaemon(
             status: ServerStatus(
-                logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms",
-                url: "http://candor.localhost:3000/"))
+                logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms",
+                url: "http://myproj.localhost:3000/"))
         let effects = RecordingEffects()
         let result = try await runner(daemon, effects).run(
-            DeepLink(verb: .open, projectSlug: "candor", server: "cms"))
-        #expect(await effects.opened == [URL(string: "http://candor.localhost:3000/")!])
-        #expect(result.detail == "http://candor.localhost:3000/")
+            DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
+        #expect(await effects.opened == [URL(string: "http://myproj.localhost:3000/")!])
+        #expect(result.detail == "http://myproj.localhost:3000/")
     }
 
     @Test func openOpensNamedHead() async throws {
         let daemon = MockDaemon(
             status: ServerStatus(
                 heads: ["wren-hollow": "http://wren-hollow.localhost:3000/"],
-                logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms",
-                url: "http://candor.localhost:3000/"))
+                logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms",
+                url: "http://myproj.localhost:3000/"))
         let effects = RecordingEffects()
         _ = try await runner(daemon, effects).run(
-            DeepLink(verb: .open, projectSlug: "candor", server: "cms", head: "wren-hollow"))
+            DeepLink(verb: .open, projectSlug: "myproj", server: "cms", head: "wren-hollow"))
         #expect(await effects.opened == [URL(string: "http://wren-hollow.localhost:3000/")!])
     }
 
@@ -108,10 +108,10 @@ private actor RecordingEffects: DeepLinkEffects {
         let daemon = MockDaemon(
             status: ServerStatus(
                 heads: ["wren-hollow": "http://wren-hollow.localhost:3000/"],
-                logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms"))
+                logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms"))
         do {
             _ = try await runner(daemon, RecordingEffects()).run(
-                DeepLink(verb: .open, projectSlug: "candor", server: "cms", head: "cold-brook"))
+                DeepLink(verb: .open, projectSlug: "myproj", server: "cms", head: "cold-brook"))
             Issue.record("expected WireError")
         } catch let error as WireError {
             #expect(error.code == .notFound)
@@ -124,10 +124,10 @@ private actor RecordingEffects: DeepLinkEffects {
 
     @Test func openWithoutURLThrows() async {
         let daemon = MockDaemon(
-            status: ServerStatus(logPath: "", phase: .running, project: "/Users/x/code/candor", server: "cms"))
+            status: ServerStatus(logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms"))
         await #expect(throws: WireError.self) {
             try await runner(daemon, RecordingEffects()).run(
-                DeepLink(verb: .open, projectSlug: "candor", server: "cms"))
+                DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
         }
     }
 
@@ -142,7 +142,7 @@ private actor RecordingEffects: DeepLinkEffects {
                 rootCause: "cms crashed on boot"))
         let effects = RecordingEffects()
         let result = try await runner(daemon, effects).run(
-            DeepLink(verb: .why, projectSlug: "candor", server: "cms"))
+            DeepLink(verb: .why, projectSlug: "myproj", server: "cms"))
         #expect(result.detail == "cms crashed on boot")
         let pasteboard = await effects.pasteboard
         #expect(pasteboard.count == 1)
@@ -154,7 +154,7 @@ private actor RecordingEffects: DeepLinkEffects {
     }
 
     @Test func unknownProjectSlugThrowsBeforeDispatch() async {
-        let daemon = MockDaemon(projectPaths: ["/Users/x/code/candor"])
+        let daemon = MockDaemon(projectPaths: ["/Users/x/code/myproj"])
         await #expect(throws: WireError.self) {
             try await runner(daemon, RecordingEffects()).run(
                 DeepLink(verb: .stop, projectSlug: "ghost", server: "cms"))

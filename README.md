@@ -28,7 +28,9 @@ devctl hook install --harness claude   # same for Claude Code (default harness)
 
 Name each server after the project (`myproj`, not a generic `web`) so it is easy to spot in Spotlight and search, and give it a `<project>.localhost` host rather than bare `localhost`: the per-project subdomain keeps browser cookies, storage, and service workers isolated between projects.
 
-Or commit a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. The full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).
+Or write a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. `devctl config check` validates the file against the daemon's own validator, the schema is in [docs/design.md](./docs/design.md), and the full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).
+
+Commit that file where the whole team runs the same servers. Keep it gitignored and per-machine where the repository would rather not carry it: a shared checkout, a repository whose own docs should name no personal tooling, or a project where each person's ports and heads differ. Runtime behavior is identical either way; the difference is whether a fresh clone arrives with one. Nothing regenerates a gitignored file today, so keep a copy of it off the machine.
 
 ## The parts
 

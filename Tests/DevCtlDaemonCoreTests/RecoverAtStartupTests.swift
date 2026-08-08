@@ -92,7 +92,7 @@ private func stopServer(router: Router, project: String, name: String) async {
             project: env.projectPath,
             serversJSON: """
             {
-              "candor": {
+              "myproj": {
                 "command": ["/bin/sh", "-c", "sleep 30"]
               }
             }

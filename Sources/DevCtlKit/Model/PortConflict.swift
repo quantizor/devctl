@@ -33,4 +33,12 @@ public enum PortConflictState: String, Codable, Sendable {
     case held
     /** Child listened on a different port than effectivePort (Vite silent bump). */
     case drift
+    /** The healthcheck passed but only processes outside this server's tree hold
+        the port, so something else answered. A green health signal that came
+        from a stranger is worse than a red one. */
+    case foreign
+    /** This server owns a listener on the port and so does a process outside its
+        tree. Both stacks are bound (a v4-only listener beside a v6 wildcard, for
+        instance), so which one answers a probe is not decided by devctl. */
+    case shared
 }

@@ -1053,6 +1053,16 @@ struct Doctor: AsyncParsableCommand {
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
             var signatureHolders: [String: String] = [:]
             var staleProjects: Set<String> = []
+            /** Host-keyed signatures miss a real collision: two projects on one
+                port under different *.localhost names are different signatures
+                and the same bind. Reported from declared ports, so it lands
+                before anyone tries to start either one. */
+            for collision in PortCollision.detect(
+                all.servers.filter { FileManager.default.fileExists(atPath: $0.project) })
+            {
+                findings.append(
+                    Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
+            }
             for server in all.servers {
                 if !FileManager.default.fileExists(atPath: server.project) {
                     staleProjects.insert(server.project)
@@ -1074,7 +1084,18 @@ struct Doctor: AsyncParsableCommand {
                                 detail: "\(signature) -> \(holder) [\(server.phase.rawValue)]",
                                 kind: "signature", severity: "info"))
                     }
+                    /** Only a listener no managed server accounts for is a
+                        squatter. When another supervised server is up on this
+                        port, calling it unmanaged is simply wrong, and the
+                        port-collision finding above already names both sides. */
+                    let managedOwner = all.servers.first { other in
+                        (other.effectivePort ?? other.declaredPort) == port
+                            && !(other.project == server.project && other.server == server.server)
+                            && (other.phase == .running || other.phase == .starting
+                                || other.phase == .unhealthy)
+                    }
                     if server.phase == .stopped || server.phase == .crashed,
+                        managedOwner == nil,
                         LoopbackProbe.isListening(port: port) {
                         findings.append(
                             Finding(
@@ -1269,8 +1290,18 @@ struct DaemonStatusCommand: AsyncParsableCommand {
             struct StatusPayload: Codable {
                 var daemon: DaemonInfo?
                 var launchd: String
+                /** Stated outright because every other command's hint sends the
+                    reader here, and the answer has to be readable by a machine.
+                    Without it the only signal is an absent `daemon` key next to
+                    a reassuring launchd line, which reads as healthy: launchd
+                    reporting `running` says a job is loaded, not that anything
+                    is accepting on the socket. */
+                var reachable: Bool
             }
-            CLIRunner.emit(StatusPayload(daemon: info, launchd: launchdLine), json: true) { _ in "" }
+            CLIRunner.emit(
+                StatusPayload(daemon: info, launchd: launchdLine, reachable: info != nil),
+                json: true
+            ) { _ in "" }
         } else if let info {
             print("launchd: \(launchdLine)\ndaemon: v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)")
         } else {

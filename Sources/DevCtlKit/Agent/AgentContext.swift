@@ -66,8 +66,20 @@ public enum AgentContext {
         case .crashed, .failed, .unhealthy:
             return true
         case .running, .starting, .stopped, .stopping:
-            return server.specStale == true || server.portConflict?.state == .held
-                || server.portConflict?.state == .drift
+            return server.specStale == true || conflictWarrantsAttention(server.portConflict?.state)
+        }
+    }
+
+    /** Exhaustive on purpose: a new conflict state has to be classified here
+        rather than defaulting to silence, which is how a conflict reaches an
+        agent's session context at all. */
+    private static func conflictWarrantsAttention(_ state: PortConflictState?) -> Bool {
+        switch state {
+        case .drift, .foreign, .held, .shared:
+            return true
+        case .rebound, .none:
+            /** Rebound is the sibling-worktree path working as designed. */
+            return false
         }
     }
 

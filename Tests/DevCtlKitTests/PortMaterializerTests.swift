@@ -78,20 +78,20 @@ import Testing
     /** Spawn path may already have swapped `spec.host` to the worktree label;
         matchHost keeps committed URL hosts eligible for rewrite. */
     @Test func matchHostRewritesAfterSpecHostAlreadySwapped() {
-        let health = HealthCheckSpec(type: .http, url: "http://candor.localhost:3000/api/health")
+        let health = HealthCheckSpec(type: .http, url: "http://myproj.localhost:3000/api/health")
         let spec = ServerSpec(
             command: ["serve"],
             healthcheck: health,
-            host: "worktree-fix.candor.localhost",
-            name: "candor",
+            host: "worktree-fix.myproj.localhost",
+            name: "myproj",
             port: 3000,
-            url: "http://candor.localhost:3000/"
+            url: "http://myproj.localhost:3000/"
         )
         let next = PortMaterializer.materialize(
             spec: spec, effectivePort: 3742, effectiveHost: spec.host,
-            matchHost: "candor.localhost")
-        #expect(next.url == "http://worktree-fix.candor.localhost:3742/")
-        #expect(next.healthcheck?.url == "http://worktree-fix.candor.localhost:3742/api/health")
+            matchHost: "myproj.localhost")
+        #expect(next.url == "http://worktree-fix.myproj.localhost:3742/")
+        #expect(next.healthcheck?.url == "http://worktree-fix.myproj.localhost:3742/api/health")
     }
 }
 
@@ -135,9 +135,9 @@ import Testing
     @Test func preferredSubdomainFromCommittedHost() {
         #expect(
             CheckoutIdentity.preferredSubdomain(
-                project: "/tmp/whatever", committedHost: "candor.localhost") == "candor")
+                project: "/tmp/whatever", committedHost: "myproj.localhost") == "myproj")
         #expect(
             CheckoutIdentity.preferredSubdomain(
-                project: "/tmp/whatever", committedHost: "api.candor.localhost") == "candor")
+                project: "/tmp/whatever", committedHost: "api.myproj.localhost") == "myproj")
     }
 }
