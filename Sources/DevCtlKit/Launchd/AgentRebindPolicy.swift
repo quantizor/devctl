@@ -17,6 +17,18 @@ public enum AgentRebindPolicy {
         fresh unregister+register (KeepAlive LWCR repair is a dead end). */
     public static let postReplaceHelloSeconds: TimeInterval = 1.5
 
+    /** How long to wait for the spawn that FOLLOWS a re-register.
+
+        An unregister+register restarts launchd's ThrottleInterval, which
+        defaults to 10s, so the new job cannot spawn before then no matter how
+        healthy it is. Waiting 10 put the deadline in a dead heat with the spawn
+        and lost: on a real DMG upgrade the poll expired at 11.8s, the launch
+        sequence gave up, and the daemon only arrived when a later escalation
+        re-registered it half a minute after the app opened. This is the throttle
+        plus room for the spawn itself, so the wait outlasts the thing it waits
+        for. */
+    public static let postReregisterHelloSeconds: TimeInterval = 16
+
     /** Whether launch should register the agent. A post-upgrade rebind marker
         outranks a leftover deliberate-stop file from the pre-replace unregister. */
     public static func shouldRegisterAtLaunch(

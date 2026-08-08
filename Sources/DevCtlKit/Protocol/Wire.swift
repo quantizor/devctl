@@ -101,6 +101,19 @@ public struct WireError: Codable, Equatable, Error, Sendable {
     }
 }
 
+/** Without this, `localizedDescription` renders a WireError as "The operation
+    couldn't be completed. (DevCtlKit.WireError error 1.)", which is what the
+    menu bar logged, and showed in the popover, for a failed agent register. It
+    names nothing wrong, nowhere it happened, and nothing to do about it, while
+    the message and the remediation hint sat unread on the value itself. Every
+    caller that reaches for `localizedDescription` now gets those instead. */
+extension WireError: LocalizedError {
+    public var errorDescription: String? {
+        guard let hint else { return message }
+        return "\(message) (\(hint))"
+    }
+}
+
 /** A typed request frame. `params` is method-specific; the daemon sniffs
     `{id, method}` first, then re-decodes the full typed frame. */
 public struct WireRequest<Params: Codable & Sendable>: Codable, Sendable {

@@ -157,6 +157,24 @@ import Testing
         #expect(serverID(project: "/a/b", name: "web") == "/a/b::web")
     }
 
+    /** The menu bar logs and displays failures through `localizedDescription`,
+        and a bare Error struct renders there as "The operation couldn't be
+        completed. (DevCtlKit.WireError error 1.)". That is what a real failed
+        agent register showed: nothing wrong, nowhere, nothing to do, while the
+        message and its remediation command sat unread on the value. */
+    @Test func wireErrorReadsAsItsOwnMessageAndHint() {
+        let withHint = WireError(
+            code: .daemonUnreachable, hint: "run: devctl daemon start",
+            message: "devctld is not listening")
+        #expect(withHint.localizedDescription == "devctld is not listening (run: devctl daemon start)")
+
+        let withoutHint = WireError(code: .internalError, message: "devctld never answered")
+        #expect(withoutHint.localizedDescription == "devctld never answered")
+
+        /** The regression guard: the Foundation default must not come back. */
+        #expect(withHint.localizedDescription.contains("couldn't be completed") == false)
+    }
+
     @Test func hash8Stable() {
         #expect(DevCtlPaths.hash8("/Users/x/code/proj") == DevCtlPaths.hash8("/Users/x/code/proj"))
         #expect(DevCtlPaths.hash8("/a") != DevCtlPaths.hash8("/b"))
