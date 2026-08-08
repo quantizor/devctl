@@ -24,7 +24,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Full history: `changeset status` diffs against the base branch, and the
+      # default shallow clone has no main to diverge from.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Same version the Release workflow installs with: a validator that
       # resolves a different dependency tree is not checking what ships.
