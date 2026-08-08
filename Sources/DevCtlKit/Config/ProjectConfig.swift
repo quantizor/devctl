@@ -41,7 +41,7 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
     public var healthcheck: HealthCheckSpec?
     public var host: String?
     public var icon: String?
-    public var locks: [String]?
+    public var locks: [LockDeclaration]?
     public var port: Int?
     public var portEnv: String?
     public var ports: [String: SecondaryPort]?
@@ -59,7 +59,7 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
         healthcheck: HealthCheckSpec? = nil,
         host: String? = nil,
         icon: String? = nil,
-        locks: [String]? = nil,
+        locks: [LockDeclaration]? = nil,
         port: Int? = nil,
         portEnv: String? = nil,
         ports: [String: SecondaryPort]? = nil,

@@ -172,6 +172,82 @@ import Testing
             })
     }
 
+    /** The compatibility gate for the locks schema: every config and registry
+        file written before a lock could name a path uses the bare string form,
+        and must keep parsing and re-encoding unchanged. */
+    @Test func aBareStringLockStillParsesAndReEncodesBare() throws {
+        let json = #"{"command":["x"],"locks":["d1","cache"],"name":"web"}"#
+        let spec = try JSONCoding.decoder().decode(ServerSpec.self, from: Data(json.utf8))
+        #expect(spec.locks == [LockDeclaration(name: "d1"), LockDeclaration(name: "cache")])
+        let encoded = String(
+            data: try JSONCoding.encoder().encode(spec), encoding: .utf8)
+        #expect(encoded == #"{"command":["x"],"locks":["d1","cache"],"name":"web"}"#)
+    }
+
+    @Test func aPathedLockRoundTripsAsAnObject() throws {
+        let json = #"{"command":["x"],"locks":[{"name":"d1","path":"state/v3"}],"name":"web"}"#
+        let spec = try JSONCoding.decoder().decode(ServerSpec.self, from: Data(json.utf8))
+        #expect(spec.locks == [LockDeclaration(name: "d1", path: "state/v3")])
+        let encoded = String(data: try JSONCoding.encoder().encode(spec), encoding: .utf8)
+        #expect(encoded == json)
+    }
+
+    @Test func bothLockFormsMayAppearInOneArray() throws {
+        let json = #"{"command":["x"],"locks":["cache",{"name":"d1","path":"state"}],"name":"web"}"#
+        let spec = try JSONCoding.decoder().decode(ServerSpec.self, from: Data(json.utf8))
+        #expect(
+            spec.locks == [LockDeclaration(name: "cache"), LockDeclaration(name: "d1", path: "state")])
+    }
+
+    @Test func statePathResolvesAgainstTheProjectRoot() throws {
+        let specs = [
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "d1", path: "state/v3")], name: "web"),
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "d1")], name: "api"),
+        ]
+        #expect(
+            try LockResource.statePath(project: "/Users/x/proj", resource: "d1", specs: specs)
+                == "/Users/x/proj/state/v3")
+        #expect(try LockResource.statePath(project: "/p", resource: "cache", specs: specs) == nil)
+        #expect(LockResource.declarers(resource: "d1", specs: specs) == ["api", "web"])
+    }
+
+    /** A lock's state path is documented as project-relative, so it is enforced
+        rather than trusted: a committed config must not be able to aim the
+        fingerprint at somewhere outside the project. */
+    @Test func aStatePathThatEscapesTheProjectIsAConfigError() throws {
+        for escape in ["../..", "../sibling/state", "sub/../../outside"] {
+            let specs = [
+                ServerSpec(
+                    command: ["x"], locks: [LockDeclaration(name: "d1", path: escape)], name: "web")
+            ]
+            #expect(throws: WireError.self) {
+                _ = try LockResource.statePath(
+                    project: "/Users/x/proj", resource: "d1", specs: specs)
+            }
+        }
+        /** A path that merely contains `..` but stays inside is fine. */
+        let inside = [
+            ServerSpec(
+                command: ["x"], locks: [LockDeclaration(name: "d1", path: "a/../state")],
+                name: "web")
+        ]
+        #expect(
+            try LockResource.statePath(project: "/Users/x/proj", resource: "d1", specs: inside)
+                == "/Users/x/proj/state")
+    }
+
+    /** Guessing which state a lock guards is how the incident behind the
+        identity check happened, so a disagreement refuses instead. */
+    @Test func conflictingStatePathsForOneResourceIsAConfigError() {
+        let specs = [
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "d1", path: "a")], name: "api"),
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "d1", path: "b")], name: "web"),
+        ]
+        #expect(throws: WireError.self) {
+            _ = try LockResource.statePath(project: "/p", resource: "d1", specs: specs)
+        }
+    }
+
     @Test func parseErrorIsActionable() throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "devctl-cfg-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

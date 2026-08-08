@@ -147,8 +147,18 @@ private func makeEnv() throws -> TestEnv {
         #expect(kill(child, 0) == 0)
         let crashed = try await waitForPhase(supervisor, .crashed, tries: 80)
         #expect(crashed.phase == .crashed)
-        try await Task.sleep(for: .milliseconds(200))
-        #expect(kill(child, 0) != 0)
+        /** The descendant sweep runs after the phase turns, so poll for the
+            outcome rather than sleeping a fixed slice: under load that fixed
+            wait expires before the sweep lands and fails a working teardown. */
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 {
+                reaped = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(reaped)
     }
 
     /** Poll the supervisor until it reaches `phase` or the budget runs out. */

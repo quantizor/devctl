@@ -229,6 +229,12 @@ public actor Router {
                 params.project = canonicalProjectPath(params.project)
                 let result = try await acquireLock(params)
                 return try respond(id: head.id, result: result)
+            case .lockStatus:
+                let request = try decoder.decode(WireRequest<LockStatusParams>.self, from: line)
+                let params = LockStatusParams(
+                    project: canonicalProjectPath(request.params.project),
+                    resource: request.params.resource)
+                return try respond(id: head.id, result: await lockStatus(params))
             case .lockRelease:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
                 var params = request.params
@@ -1062,36 +1068,64 @@ public actor Router {
             )
         }
         /** Same holder re-acquiring (retry after a blip) keeps the existing pause
-            set rather than double-stopping. */
+            set rather than double-stopping, and must answer with everything the
+            first acquire did: dropping `live` or `statePath` here would leave the
+            retrying client unable to judge the resource for the rest of the hold. */
         if let existing = resourceLocks[key], existing.pid == params.holderPid {
-            return LockResult(paused: existing.paused)
+            let specs = (try? await mergedSpecs(project: params.project))?.specs ?? []
+            return LockResult(
+                live: existing.live, paused: existing.paused,
+                statePath: try LockResource.statePath(
+                    project: params.project, resource: params.resource, specs: specs))
         }
+        var live: [String] = []
         var paused: [String] = []
         let shouldPause = params.pause ?? true
         let merged = try? await mergedSpecs(project: params.project)
-        if shouldPause {
-            for spec in merged?.specs ?? [] where (spec.locks ?? []).contains(params.resource) {
-                let supervisor = await supervisor(project: params.project, spec: spec)
-                let status = await supervisor.status()
-                switch status.phase {
-                case .running, .starting, .unhealthy, .stopping:
-                    /** Non-retiring stop: boot intent survives so a daemon crash
-                        mid-hold can still bring the server back if the holder is gone. */
-                    _ = await supervisor.stop(deliberate: false)
-                    paused.append(spec.name)
-                    DevCtlLog.daemon.info(
-                        "lock \(params.resource) paused \(spec.name)@\(params.project)")
-                case .stopped, .crashed, .failed:
-                    break
+        for spec in merged?.specs ?? []
+        where LockResource.declares(resource: params.resource, spec: spec) {
+            let supervisor = await supervisor(project: params.project, spec: spec)
+            let status = await supervisor.status()
+            switch status.phase {
+            case .running, .starting, .unhealthy, .stopping:
+                guard shouldPause else {
+                    /** Sound for the whole hold: lockGate refuses to start a
+                        declarer while a live holder owns the resource, so this
+                        set can only shrink. */
+                    live.append(spec.name)
+                    continue
                 }
+                /** Non-retiring stop: boot intent survives so a daemon crash
+                    mid-hold can still bring the server back if the holder is gone. */
+                _ = await supervisor.stop(deliberate: false)
+                paused.append(spec.name)
+                DevCtlLog.daemon.info(
+                    "lock \(params.resource) paused \(spec.name)@\(params.project)")
+            case .stopped, .crashed, .failed:
+                break
             }
-            paused.sort()
         }
+        live.sort()
+        paused.sort()
+        /** Refusing here is correct when devctl cannot tell which state the lock
+            guards: taking it anyway would report on the wrong file. */
+        let statePath = try LockResource.statePath(
+            project: params.project, resource: params.resource, specs: merged?.specs ?? [])
         resourceLocks[key] = LockHolder(
-            paused: paused, pid: params.holderPid,
-            resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
+            live: live.isEmpty ? nil : live, pause: shouldPause, paused: paused,
+            pid: params.holderPid, resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
         persistLocks()
-        return LockResult(paused: paused)
+        return LockResult(
+            live: live.isEmpty ? nil : live, paused: paused, statePath: statePath)
+    }
+
+    /** Who holds a resource right now, if anyone. A dead holder is released
+        first, so a stale row reads as no holder rather than as a phantom the
+        caller then waits on. */
+    private func lockStatus(_ params: LockStatusParams) async -> LockStatusResult {
+        let key = Self.lockKey(project: params.project, resource: params.resource)
+        await releaseOrphanedLock(key: key)
+        return LockStatusResult(holder: resourceLocks[key])
     }
 
     /** Release: only the matching holder clears the lock; then ensure everyone
@@ -1198,7 +1232,8 @@ public actor Router {
         declared resources: restarting mid-harness-run is exactly the contention
         the lock exists to prevent. */
     private func lockGate(project: String, spec: ServerSpec) async throws {
-        for resource in spec.locks ?? [] {
+        for declaration in spec.locks ?? [] {
+            let resource = declaration.name
             let key = Self.lockKey(project: project, resource: resource)
             await releaseOrphanedLock(key: key)
             if let holder = resourceLocks[key] {

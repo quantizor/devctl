@@ -78,6 +78,17 @@ let package = Package(
             name: "DevCtlDaemonCoreTests",
             dependencies: ["DevCtlDaemonCore", "DevCtlKit"]
         ),
+        /** The CLI's argument parsing is behavior with a contract (docs/cli-contract.md)
+            and no other way to exercise it: a parse defect there silently changes
+            what a guarded command receives. */
+        .testTarget(
+            name: "DevCtlCLITests",
+            dependencies: [
+                "DevCtlKit",
+                "devctl",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
+        ),
         .testTarget(
             name: "IntegrationTests",
             dependencies: ["DevCtlKit"]

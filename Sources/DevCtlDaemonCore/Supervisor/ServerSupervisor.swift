@@ -304,7 +304,7 @@ public actor ServerSupervisor {
             icon: spec.icon,
             lastExit: lastExit,
             lastHealthAt: lastHealthAt,
-            locks: spec.locks,
+            locks: spec.locks.map { $0.map(\.name) },
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
             observedPort: observedPort,
             phase: phase,

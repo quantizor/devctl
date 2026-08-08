@@ -1,0 +1,38 @@
+# Changesets are .md files, and the CI gate ignores markdown to keep macOS
+# minutes down, so nothing read them before they merged. One with malformed
+# frontmatter therefore passed every check and then failed the Release workflow
+# on main, silently blocking every publish until someone read that log.
+#
+# The check is a direct parse rather than `changeset status`, which compares
+# against a base branch and so needs full history and a local main that a
+# pull_request checkout does not have. Shape is the failure class; which
+# packages changed is not what this is guarding.
+name: Changesets
+
+on:
+  pull_request:
+    paths:
+      - '.changeset/**'
+      - 'package.json'
+      - 'scripts/validate-changesets.mjs'
+
+concurrency:
+  group: changesets-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Validate changeset frontmatter
+        run: node scripts/validate-changesets.mjs

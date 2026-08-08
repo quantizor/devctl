@@ -30,12 +30,12 @@ Name each server after the project (`myproj`, not a generic `web`) so it is easy
 
 Or write a `devservers.json` at the project root (multiple servers, dependencies, healthchecks, `*.localhost` host signatures, multi-headed proxies, lifecycle playbooks); `devctl up` brings the whole project up in dependency order. `devctl config check` validates the file against the daemon's own validator, the schema is in [docs/design.md](./docs/design.md), and the full CLI contract lives in [docs/cli-contract.md](./docs/cli-contract.md).
 
-Commit that file where the whole team runs the same servers. Keep it gitignored and per-machine where the repository would rather not carry it: a shared checkout, a repository whose own docs should name no personal tooling, or a project where each person's ports and heads differ. Runtime behavior is identical either way; the difference is whether a fresh clone arrives with one. Nothing regenerates a gitignored file today, so keep a copy of it off the machine.
+Commit that file where the whole team runs the same servers. Keep it gitignored and per-machine where the repository would rather not carry it: a shared checkout, a repository whose own docs should name no personal tooling, or a project where each person's ports and heads differ. Runtime behavior is identical either way; the difference is whether a fresh clone arrives with one. `devctl config init` writes the file back from what the daemon already knows, so a gitignored one that goes missing can be recovered.
 
 ## The parts
 
 - `devctld`: the daemon. Spool-file output capture (children survive daemon restarts without SIGPIPE), process-group plus descendant-sweep teardown, health-gated phases, crash forensics, structured logs with correlation marks, a unified event feed.
-- `devctl`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `why`, `open`, `switch`, `lock` (pause servers sharing a resource while a test harness runs), `doctor`, and launchd management. Agents are the first-class consumer.
+- `devctl`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `why`, `open`, `switch`, `lock` (pause servers sharing a resource while a test harness runs, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. Agents are the first-class consumer.
 - `devctl.app`: the menu bar. Presence dots with counts, per-project rows with click-to-open heads (pinnable), crash notifications, a dashboard with live logs, an event timeline, and a validating config editor. Every server and head is Spotlight-searchable.
 
 ## Building
