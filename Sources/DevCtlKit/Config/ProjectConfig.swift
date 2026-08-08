@@ -49,6 +49,10 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
     public var shell: Bool?
     public var url: String?
     public var waitFor: WaitTarget?
+    /** Project-relative files this server reads at boot but does not reload on
+        its own. A change to one restarts the server. A server whose framework
+        already reloads its own config declares nothing here. */
+    public var watch: [String]?
 
     public init(
         command: [String],
@@ -66,7 +70,8 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
         portSpan: Int? = nil,
         shell: Bool? = nil,
         url: String? = nil,
-        waitFor: WaitTarget? = nil
+        waitFor: WaitTarget? = nil,
+        watch: [String]? = nil
     ) {
         self.command = command
         self.cwd = cwd
@@ -84,6 +89,7 @@ public struct ProjectFileServer: Codable, Equatable, Sendable {
         self.shell = shell
         self.url = url
         self.waitFor = waitFor
+        self.watch = watch
     }
 }
 
@@ -192,6 +198,20 @@ public enum ProjectConfigLoader {
                     warnings.append("server '\(name)': icon '\(relative)' not found in the project")
                 }
             }
+            /** Warn rather than error: a stray watch entry should not block a
+                whole project's config, and the survivors still work. */
+            var watchEntries: [String]?
+            if let declared = entry.watch, !declared.isEmpty {
+                let resolved = WatchPaths.resolve(entries: declared, project: project)
+                warnings.append(contentsOf: resolved.warnings.map { "server '\(name)': \($0)" })
+                let kept = declared.filter { candidate in
+                    resolved.paths.contains {
+                        $0 == URL(fileURLWithPath: project).appending(path: candidate)
+                            .standardizedFileURL.path
+                    }
+                }
+                watchEntries = kept.isEmpty ? nil : kept
+            }
             let serverHost = entry.host ?? host
             var url = entry.url
             if url == nil, let port = entry.port {
@@ -224,7 +244,8 @@ public enum ProjectConfigLoader {
                 portSpan: entry.portSpan,
                 shell: entry.shell,
                 url: url,
-                waitFor: entry.waitFor
+                waitFor: entry.waitFor,
+                watch: watchEntries
             )
             view.errors.append(contentsOf: PortClaim.configErrors(spec: draft))
             specs.append(draft)

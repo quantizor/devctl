@@ -51,7 +51,7 @@ public enum AgentContext {
             }
         }
         lines.append(
-            "Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> \"text\" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.")
+            "Useful: devctl ensure <name> (idempotent start) · devctl restart <name> (stop and re-ensure in one step; use it after editing a config the server reads at boot) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> \"text\" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.")
         /** The invitation and its constraint stay on one line: render truncates
             from the end and re-appends only the closing fence, so a clause on its
             own line can be cut while the invitation above it survives. That

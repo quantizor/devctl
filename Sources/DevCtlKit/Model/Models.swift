@@ -171,6 +171,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
     public var shell: Bool?
     public var url: String?
     public var waitFor: WaitTarget?
+    /** Project-relative files this server reads at boot and does not reload on
+        its own; a change restarts it. Empty or absent means today's behavior
+        exactly, which is what a self-reloading framework wants. */
+    public var watch: [String]?
 
     public init(
         command: [String],
@@ -189,7 +193,8 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         portSpan: Int? = nil,
         shell: Bool? = nil,
         url: String? = nil,
-        waitFor: WaitTarget? = nil
+        waitFor: WaitTarget? = nil,
+        watch: [String]? = nil
     ) {
         self.command = command
         self.cwd = cwd
@@ -208,6 +213,7 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         self.shell = shell
         self.url = url
         self.waitFor = waitFor
+        self.watch = watch
     }
 }
 

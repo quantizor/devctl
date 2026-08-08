@@ -348,14 +348,14 @@ final class DaemonModel {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
             let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+            /** One request rather than a stop followed by an ensure: the pair
+                leaves the server down if the ensure is refused, and lets another
+                session's ensure land in between. */
             _ = try? await client.request(
-                .serverStop,
-                params: ServerTargetParams(name: server.server, project: server.project),
-                expecting: ServerResult.self)
-            _ = try? await client.request(
-                .serverEnsure,
-                params: EnsureParams(name: server.server, project: server.project, timeoutSeconds: 60),
-                expecting: EnsureResult.self)
+                .serverRestart,
+                params: RestartParams(
+                    names: [server.server], project: server.project, timeoutSeconds: 60),
+                expecting: GroupResult.self)
             await refresh()
         }
     }
