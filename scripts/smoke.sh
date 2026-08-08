@@ -195,6 +195,32 @@ set -e
 /usr/bin/python3 -c "import json;d=json.load(open('$WORK/badhead.json'));assert any('head' in e and 'resolve it against' in e for e in d['errors']), d" || fail "config check did not explain the unresolvable head"
 pass "config check rejects an unresolvable head"
 
+# devservers.json is routinely gitignored per machine, so the daemon has to be
+# able to write one back. What it writes must pass its own validator.
+RECOVER="$WORK/recover"
+mkdir -p "$RECOVER"
+R_PORT=$((42500 + (RANDOM % 300)))
+"$DEVCTL" register --project "$RECOVER" --name recovered --cmd "$BIN/fixture-server" --cmd --listen-tcp --cmd "$R_PORT" --port "$R_PORT" --json > /dev/null || fail "register for recovery"
+"$DEVCTL" config init --project "$RECOVER" --json > "$WORK/init.json" || fail "config init"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/init.json'));assert d['written'] is True, d; assert d['check']['servers']==['recovered'], d; assert '\n  ' in d['content'], 'file should be indented'" || fail "config init result"
+[[ -f "$RECOVER/devservers.json" ]] || fail "config init wrote no file"
+"$DEVCTL" config check --project "$RECOVER" --json | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin); assert d['errors']==[], d; assert d['servers']==['recovered'], d" || fail "recovered config does not validate"
+pass "config init writes a file its own validator accepts"
+
+set +e
+"$DEVCTL" config init --project "$RECOVER" --json > "$WORK/init2.json" 2>/dev/null
+INIT2_EXIT=$?
+set -e
+[[ "$INIT2_EXIT" -ne 0 ]] || fail "config init clobbered an existing file"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/init2.json'));assert d['error']['code']=='already-exists', d" || fail "config init did not refuse with already-exists"
+"$DEVCTL" config init --project "$RECOVER" --force --json > /dev/null || fail "config init --force"
+pass "config init refuses to clobber without --force"
+
+# register --write must add one entry and leave the rest of the file alone.
+"$DEVCTL" register --project "$RECOVER" --name second --cmd "$BIN/fixture-server" --port $((R_PORT + 1)) --write --json > /dev/null || fail "register --write"
+/usr/bin/python3 -c "import json;d=json.load(open('$RECOVER/devservers.json'));assert sorted(d['servers'])==['recovered','second'], d" || fail "register --write lost an entry"
+pass "register --write appends without disturbing the rest"
+
 "$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("trusted") is True, d' || fail "project not trusted after up"
 pass "trust recorded by explicit up"
 
@@ -255,6 +281,18 @@ LOCK_EXIT=$?
 PHASE_AFTER="$("$DEVCTL" wait db --healthy --timeout 15 --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["phase"])')"
 [[ "$PHASE_AFTER" == "running" ]] || fail "db did not resume after lock (phase $PHASE_AFTER)"
 pass "resource lock pauses holder, refuses ensure, resumes after"
+
+# Stopping a server to get exclusive access to something it holds is the heavy
+# way there. The hint says so in human mode and stays out of --json stdout,
+# which carries the machine-readable `locks` array instead.
+"$DEVCTL" stop db 2>"$WORK/stop.err" >/dev/null || fail "stop db"
+grep -q "devctl lock data --" "$WORK/stop.err" || fail "stop did not hint toward lock: $(cat "$WORK/stop.err")"
+"$DEVCTL" ensure db --timeout 15 --json > /dev/null || fail "re-ensure db"
+"$DEVCTL" stop db --json > "$WORK/stop.json" 2>/dev/null || fail "stop db --json"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/stop.json'));assert d['server']['locks']==['data'], d" || fail "stop --json lost the locks array"
+grep -q "hint:" "$WORK/stop.json" && fail "stop --json leaked the hint into stdout"
+pass "stop hints toward lock in human mode and keeps --json stdout clean"
+
 "$DEVCTL" down --json > /dev/null
 
 # Deep-link and lock --no-pause coverage stay below; worktree coexistence first.

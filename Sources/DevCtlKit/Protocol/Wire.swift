@@ -26,6 +26,16 @@ public enum JSONCoding {
         return encoder
     }
 
+    /** For on-disk config only, never a wire frame. The no-interior-newlines
+        rule protects NDJSON line framing, and devservers.json is a file a person
+        reads, edits, and diffs, so it gets the same deterministic sorted keys
+        with indentation. */
+    public static func fileEncoder() -> JSONEncoder {
+        let encoder = encoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }
+
     public static func formatISO8601(_ date: Date) -> String {
         /** The fractional digits come from the ms integer directly:
             ISO8601FormatStyle TRUNCATES fractional seconds, so formatting
@@ -58,6 +68,7 @@ public enum JSONCoding {
 
 /** Stable machine-readable failure codes agents branch on. Append-only. */
 public enum WireErrorCode: String, Codable, Sendable {
+    case alreadyExists = "already-exists"
     case configInvalid = "config-invalid"
     case daemonUnreachable = "daemon-unreachable"
     case internalError = "internal-error"
@@ -168,6 +179,7 @@ public enum WireMethod: String, Sendable {
     case logsMark = "logs.mark"
     case logsQuery = "logs.query"
     case projectCheck = "project.check"
+    case projectInitConfig = "project.initConfig"
     case projectTrust = "project.trust"
     case projectWriteConfig = "project.writeConfig"
     case serverEnsure = "server.ensure"
@@ -404,6 +416,66 @@ public struct CheckResult: Codable, Equatable, Sendable {
         self.serverHosts = serverHosts
         self.servers = servers
         self.warnings = warnings
+    }
+}
+
+/** How an init writes against whatever is already on disk. */
+public enum ConfigInitMode: String, Codable, Sendable {
+    /** Refuse when devservers.json already exists. */
+    case create
+    /** Add or replace only the named servers; every other entry survives. */
+    case merge
+    /** Rewrite the whole file from the projection. */
+    case replace
+}
+
+public struct InitConfigParams: Codable, Equatable, Sendable {
+    /** Compute the content and return it without touching disk. */
+    public var dryRun: Bool?
+    /** Overwrite an existing file (replace) or an existing entry (merge). */
+    public var force: Bool?
+    /** Include the servers the daemon already knows for this project. Default
+        true: recovering a lost file is why this method exists. */
+    public var fromDaemon: Bool?
+    public var host: String?
+    public var mode: ConfigInitMode
+    public var project: String
+    /** Extra declarations from the caller, projected alongside the daemon's and
+        winning on a name collision. */
+    public var servers: [ServerSpec]?
+
+    public init(
+        dryRun: Bool? = nil, force: Bool? = nil, fromDaemon: Bool? = nil, host: String? = nil,
+        mode: ConfigInitMode, project: String, servers: [ServerSpec]? = nil
+    ) {
+        self.dryRun = dryRun
+        self.force = force
+        self.fromDaemon = fromDaemon
+        self.host = host
+        self.mode = mode
+        self.project = project
+        self.servers = servers
+    }
+}
+
+public struct InitConfigResult: Codable, Equatable, Sendable {
+    public var check: CheckResult
+    /** The exact bytes written, so a dry run and the goldens can assert them. */
+    public var content: String
+    /** Declared config the projection cannot recover from runtime state. */
+    public var notRecovered: [String]?
+    public var path: String
+    public var written: Bool
+
+    public init(
+        check: CheckResult, content: String, notRecovered: [String]? = nil, path: String,
+        written: Bool
+    ) {
+        self.check = check
+        self.content = content
+        self.notRecovered = notRecovered
+        self.path = path
+        self.written = written
     }
 }
 

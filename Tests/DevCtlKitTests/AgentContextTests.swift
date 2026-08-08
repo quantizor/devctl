@@ -62,8 +62,8 @@ import Testing
                 <devctl-servers>
                 This project's dev servers are managed by devctl (daemon-supervised; they and their logs survive session compaction and restarts). Prefer devctl over launching servers directly.
                 - web: running · http://proj.localhost:3000/ · port 3000 · log /logs/web/current.log
-                Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> "text" · devctl events --since 10m · devctl lock <resource> --no-pause -- …. All support --json.
-                While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it.
+                Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> "text" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.
+                While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it. Report devctl's behavior and how to reproduce it generically, never this project's name, paths, hosts, ports, or log lines: that file lives outside this project.
                 </devctl-servers>
                 """)
     }
@@ -85,8 +85,8 @@ import Testing
                 - api: crashed · port 4000 · last exit exit 1 at 2025-07-18T19:46:40.000Z · log /logs/api/current.log
                   3 error lines since 2025-07-18T19:46:40.000Z, latest 2025-07-18T19:46:44.000Z
                   run: devctl why api --json
-                Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> "text" · devctl events --since 10m · devctl lock <resource> --no-pause -- …. All support --json.
-                While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it.
+                Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> "text" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.
+                While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it. Report devctl's behavior and how to reproduce it generically, never this project's name, paths, hosts, ports, or log lines: that file lives outside this project.
                 </devctl-servers>
                 """)
     }
@@ -206,6 +206,30 @@ import Testing
         #expect(text.contains("- aaa-bad-two: crashed"))
         #expect(text.contains("  run: devctl why aaa-bad-one --json"))
         #expect(text.hasSuffix("</devctl-servers>"))
+        /** Truncation cuts from the end and re-appends only the fence, so a
+            privacy clause on its own line could be cut while the invitation above
+            it survived. That is why they share one line, and this is the guard. */
+        #expect(!text.contains("BACKLOG.md") || text.contains("never this project's name"))
+    }
+
+    /** The invitation to file devctl friction reaches every session in every
+        registered project, and that file lives outside the project. One report
+        already named a private project, so the constraint travels with it. */
+    @Test func theBacklogInvitationCarriesItsPrivacyClauseOnTheSameLine() {
+        let list = ServerListResult(
+            servers: [status(phase: .running, port: 3000, server: "web")], trusted: true)
+        let text = AgentContext.render(list: list) ?? ""
+        let line = try? #require(text.split(separator: "\n").first { $0.contains("BACKLOG.md") })
+        #expect(line?.contains("never this project's name, paths, hosts, ports, or log lines") == true)
+    }
+
+    /** Eight sessions took a managed server down when a lock was what they
+        wanted, so the cheat sheet names the lighter mechanism. */
+    @Test func theCheatSheetPrefersLockOverStoppingAServer() {
+        let list = ServerListResult(
+            servers: [status(phase: .running, port: 3000, server: "web")], trusted: true)
+        let text = AgentContext.render(list: list) ?? ""
+        #expect(text.contains("prefer it over stopping the server"))
     }
 
     @Test func childOutputNeverReachesContextEvenWhenPresent() {

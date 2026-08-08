@@ -134,7 +134,10 @@ public actor Router {
                 guard FileManager.default.fileExists(atPath: url.path) else {
                     return try respond(
                         id: head.id,
-                        result: CheckResult(errors: ["no devservers.json at \(url.path)"]))
+                        result: CheckResult(
+                            errors: [
+                                "no devservers.json at \(url.path) (run: devctl config init)"
+                            ]))
                 }
                 do {
                     guard let view = try ProjectConfigLoader.load(project: project) else {
@@ -156,6 +159,9 @@ public actor Router {
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
+            case .projectInitConfig:
+                let request = try decoder.decode(WireRequest<InitConfigParams>.self, from: line)
+                return try respond(id: head.id, result: try await initConfig(request.params))
             case .projectWriteConfig:
                 let request = try decoder.decode(WireRequest<WriteConfigParams>.self, from: line)
                 let url = ProjectConfigLoader.configURL(project: request.params.project)
@@ -618,6 +624,110 @@ public actor Router {
     /** Resolve effective port, apply overlay/worktree host/materialization, and
         either auto-rebind a sibling conflict or refuse with port-held. Every
         start-shaped path routes through here. */
+    /** Writes a devservers.json from what the daemon already knows, which is the
+        only way back for a file that was gitignored and lost. The projection runs
+        over the merged view, never a supervisor's spec: a running spec has been
+        materialized, so its argv holds this machine's substituted port. */
+    private func initConfig(_ params: InitConfigParams) async throws -> InitConfigResult {
+        let project = canonicalProjectPath(params.project)
+        let url = ProjectConfigLoader.configURL(project: project)
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        if exists, params.mode == .create {
+            throw WireError(
+                code: .alreadyExists,
+                hint: "run: devctl config init --force",
+                message: "\(url.path) already exists; pass --force to replace it")
+        }
+        if exists, params.mode == .replace, params.force != true {
+            throw WireError(
+                code: .alreadyExists,
+                hint: "run: devctl config init --force",
+                message: "\(url.path) already exists; pass --force to replace it")
+        }
+        var specs: [ServerSpec] = []
+        var host: String?
+        if params.fromDaemon != false {
+            if let merged = try? await mergedSpecs(project: project) {
+                specs = merged.specs
+                host = merged.host
+            } else {
+                specs = await registry.specs(project: project)
+            }
+        }
+        for extra in params.servers ?? [] {
+            specs.removeAll { $0.name == extra.name }
+            specs.append(extra)
+        }
+        specs.sort { $0.name < $1.name }
+        guard !specs.isEmpty else {
+            throw WireError(
+                code: .notFound,
+                hint: "run: devctl register --name <name> --cmd <word>",
+                message: "the daemon knows no servers for \(project), so there is nothing to write")
+        }
+        var config = ConfigProjection.file(
+            host: params.host ?? host, project: project, specs: specs)
+        var notRecovered: [String] = []
+        if params.mode == .merge, exists {
+            guard let existingData = try? Data(contentsOf: url),
+                let existing = try? JSONCoding.decoder().decode(
+                    ProjectFileConfig.self, from: existingData)
+            else {
+                throw WireError(
+                    code: .configInvalid,
+                    hint: "run: devctl config check",
+                    message: "cannot parse \(url.path), so merging into it would lose it")
+            }
+            var merged = existing
+            for (name, entry) in config.servers {
+                guard let next = ConfigProjection.merge(
+                    entry: entry, force: params.force == true, into: merged, name: name)
+                else {
+                    throw WireError(
+                        code: .alreadyExists,
+                        hint: "run: devctl register --name \(name) --write --force",
+                        message: "\(url.path) already declares '\(name)'; pass --force to replace that entry")
+                }
+                merged = next
+            }
+            config = merged
+        } else if config.lifecycle == nil {
+            /** lifecycle exists only in the file and has no runtime counterpart,
+                so a rewrite from daemon state cannot carry it. Say so instead of
+                dropping it quietly. */
+            notRecovered = exists ? ConfigProjection.unrecoverableKeys : []
+        }
+        let view = ProjectConfigLoader.validate(config: config, project: project)
+        guard view.errors.isEmpty else {
+            throw WireError(
+                code: .configInvalid,
+                hint: "run: devctl config check",
+                message: "the projected config does not validate: \(view.errors.joined(separator: "; "))")
+        }
+        let data = try JSONCoding.fileEncoder().encode(config)
+        let content = String(decoding: data, as: UTF8.self) + "\n"
+        let hosts = await effectiveHosts(project: project, view: view)
+        let check = CheckResult(
+            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
+            effectiveHostReason: hosts.project.differs ? hosts.project.reason : nil,
+            errors: view.errors,
+            host: view.host,
+            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
+            servers: view.specs.map(\.name),
+            warnings: view.warnings)
+        guard params.dryRun != true else {
+            return InitConfigResult(
+                check: check, content: content,
+                notRecovered: notRecovered.isEmpty ? nil : notRecovered, path: url.path,
+                written: false)
+        }
+        try AtomicFile.write(Data(content.utf8), to: url)
+        configCache[project] = nil
+        return InitConfigResult(
+            check: check, content: content,
+            notRecovered: notRecovered.isEmpty ? nil : notRecovered, path: url.path, written: true)
+    }
+
     /** The hosts a spawn from this directory would use, answered before anything
         starts. Same resolver the spawn path runs, so `config check` can report a
         worktree's ephemeral origin rather than leaving it to be discovered as a

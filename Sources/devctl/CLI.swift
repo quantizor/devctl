@@ -100,8 +100,8 @@ enum CLIRunner {
             Foundation.exit(4)
         case .usage:
             Foundation.exit(2)
-        case .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld, .resourceLocked,
-            .spawnFailed:
+        case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
+            .resourceLocked, .spawnFailed:
             Foundation.exit(1)
         }
     }
@@ -250,8 +250,14 @@ struct Register: AsyncParsableCommand {
     @Option(help: "Server name.")
     var name: String
 
+    @Flag(help: "Replace an existing entry of the same name under --write.")
+    var force = false
+
     @Option(help: "Declared port.")
     var port: Int?
+
+    @Flag(help: "Also append this server to devservers.json.")
+    var write = false
 
     func run() async throws {
         guard !cmd.isEmpty else {
@@ -260,9 +266,21 @@ struct Register: AsyncParsableCommand {
                 json: global.json)
         }
         let spec = ServerSpec(command: cmd, cwd: cwd, name: name, port: port)
-        let params = RegisterParams(project: global.resolvedProject(), spec: spec)
+        let project = global.resolvedProject()
+        let params = RegisterParams(project: project, spec: spec)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.serverRegister, params: params, expecting: ServerResult.self)
+            let registered = try await client.request(
+                .serverRegister, params: params, expecting: ServerResult.self)
+            guard write else { return registered }
+            /** Merge mode so the rest of the file survives: the registry is not
+                the file, and a register must never rewrite entries it never saw. */
+            _ = try await client.request(
+                .projectInitConfig,
+                params: InitConfigParams(
+                    force: force, fromDaemon: false, mode: .merge, project: project,
+                    servers: [spec]),
+                expecting: InitConfigResult.self)
+            return registered
         }
         CLIRunner.emit(result, json: global.json) { "registered \(CLIRunner.describe($0.server))" }
     }
@@ -344,6 +362,15 @@ struct Stop: AsyncParsableCommand {
             try await client.request(.serverStop, params: params, expecting: ServerResult.self)
         }
         CLIRunner.emit(result, json: global.json) { CLIRunner.describe($0.server) }
+        /** Human mode only: stopping a server to get exclusive access to
+            something it holds is the heavy way there, and `lock` does it without
+            a bounce. `--json` carries `locks` instead, so stdout keeps its schema. */
+        if !global.json, let resource = result.server.locks?.sorted().first {
+            FileHandle.standardError.write(
+                Data(
+                    "hint: \(name) holds '\(resource)'; devctl lock \(resource) -- <command> gets exclusive access without stopping it\n"
+                        .utf8))
+        }
     }
 }
 
@@ -977,8 +1004,78 @@ struct ConfigCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "config",
         abstract: "Project configuration helpers.",
-        subcommands: [ConfigCheck.self]
+        subcommands: [ConfigCheck.self, ConfigInit.self]
     )
+}
+
+/** Writes a devservers.json from what the daemon already knows. The file is
+    routinely gitignored per machine, so without this there is no way back from
+    losing it, and a `git rm --cached` plus a branch switch deletes it outright. */
+struct ConfigInit: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "init",
+        abstract: "Write devservers.json from the servers the daemon already knows.")
+
+    @Option(
+        parsing: .unconditionalSingleValue,
+        help: "Argv word for an extra server to declare (repeat); requires --name.")
+    var cmd: [String] = []
+
+    @Flag(help: "Print what would be written without touching the file.")
+    var dryRun = false
+
+    @Flag(help: "Replace an existing devservers.json.")
+    var force = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Option(help: "Project host signature (default: <project-slug>.localhost).")
+    var host: String?
+
+    @Option(help: "Name for an extra server to declare alongside the known ones.")
+    var name: String?
+
+    @Option(help: "Port for the extra server.")
+    var port: Int?
+
+    func run() async throws {
+        if name == nil, !cmd.isEmpty {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage, hint: "run: devctl config init --name <name> --cmd <word>",
+                    message: "--cmd needs a --name to attach the command to"),
+                json: global.json)
+        }
+        var extras: [ServerSpec]?
+        if let name {
+            guard !cmd.isEmpty else {
+                CLIRunner.fail(
+                    WireError(
+                        code: .usage, hint: "run: devctl config init --name \(name) --cmd <word>",
+                        message: "--name needs a --cmd to run"),
+                    json: global.json)
+            }
+            extras = [ServerSpec(command: cmd, name: name, port: port)]
+        }
+        let params = InitConfigParams(
+            dryRun: dryRun, force: force, fromDaemon: true, host: host,
+            mode: force ? .replace : .create, project: global.resolvedProject(), servers: extras)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(
+                .projectInitConfig, params: params, expecting: InitConfigResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            guard r.written else { return r.content }
+            var lines = ["wrote \(r.path) (servers: \(r.check.servers.joined(separator: ", ")))"]
+            if let host = r.check.host { lines.append("host: \(host)") }
+            lines.append(contentsOf: r.check.warnings.map { "warning: \($0)" })
+            if let missing = r.notRecovered, !missing.isEmpty {
+                lines.append(
+                    "note: \(missing.joined(separator: ", ")) cannot be recovered from daemon state; re-add by hand")
+            }
+            return lines.joined(separator: "\n")
+        }
+    }
 }
 
 struct ConfigCheck: AsyncParsableCommand {
