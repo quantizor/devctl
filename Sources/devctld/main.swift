@@ -188,10 +188,19 @@ Task {
         inode and goes deaf to the path it was watching. */
     Task {
         DevCtlLog.daemon.info("watch sweep started")
-        while true {
+        /** Exits on cancellation rather than looping on `while true`. Nothing
+            cancels this today, but `try?` over a sleep turns a cancelled task
+            into a tight spin that sweeps the process table as fast as the CPU
+            allows, and the guard costs one comparison per half second. */
+        while !Task.isCancelled {
             _ = await router.sweepWatches()
-            try? await Task.sleep(for: .milliseconds(500))
+            do {
+                try await Task.sleep(for: .milliseconds(500))
+            } catch {
+                break
+            }
         }
+        DevCtlLog.daemon.info("watch sweep stopped")
     }
 }
 
