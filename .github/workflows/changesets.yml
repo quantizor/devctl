@@ -1,0 +1,39 @@
+# Changesets are .md files, and the CI gate ignores markdown to keep macOS
+# minutes down, so nothing read them before they merged. One with malformed
+# frontmatter therefore passed every check and then failed the Release workflow
+# on main, silently blocking every publish until someone read that log. This
+# runs on Linux in seconds and fails on the pull request instead.
+name: Changesets
+
+on:
+  pull_request:
+    paths:
+      - '.changeset/**'
+      - 'package.json'
+      - 'package-lock.json'
+
+concurrency:
+  group: changesets-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Reads and parses every changeset, so malformed frontmatter (a bare
+      # "minor" with no package name) fails here rather than on main.
+      - name: Validate changesets
+        run: npx changeset status
