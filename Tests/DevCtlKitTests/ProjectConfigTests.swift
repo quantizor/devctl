@@ -211,6 +211,31 @@ import Testing
         #expect(LockResource.declarers(resource: "d1", specs: specs) == ["api", "web"])
     }
 
+    /** A lock's state path is documented as project-relative, so it is enforced
+        rather than trusted: a committed config must not be able to aim the
+        fingerprint at somewhere outside the project. */
+    @Test func aStatePathThatEscapesTheProjectIsAConfigError() throws {
+        for escape in ["../..", "../sibling/state", "sub/../../outside"] {
+            let specs = [
+                ServerSpec(
+                    command: ["x"], locks: [LockDeclaration(name: "d1", path: escape)], name: "web")
+            ]
+            #expect(throws: WireError.self) {
+                _ = try LockResource.statePath(
+                    project: "/Users/x/proj", resource: "d1", specs: specs)
+            }
+        }
+        /** A path that merely contains `..` but stays inside is fine. */
+        let inside = [
+            ServerSpec(
+                command: ["x"], locks: [LockDeclaration(name: "d1", path: "a/../state")],
+                name: "web")
+        ]
+        #expect(
+            try LockResource.statePath(project: "/Users/x/proj", resource: "d1", specs: inside)
+                == "/Users/x/proj/state")
+    }
+
     /** Guessing which state a lock guards is how the incident behind the
         identity check happened, so a disagreement refuses instead. */
     @Test func conflictingStatePathsForOneResourceIsAConfigError() {
