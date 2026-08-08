@@ -361,8 +361,14 @@ public enum DependencyGraph {
             var next: Set<String> = []
             for name in frontier {
                 for dependent in dependents[name] ?? [] {
-                    inDegree[dependent]! -= 1
-                    if inDegree[dependent] == 0 { next.insert(dependent) }
+                    /** Every dependent was seeded into `inDegree`, so the key is
+                        present by construction. Written as a defaulted read
+                        rather than a force unwrap so a future edit to the
+                        seeding loop degrades into a wrong wave rather than a
+                        crash in the daemon's start path. */
+                    let remaining = (inDegree[dependent] ?? 0) - 1
+                    inDegree[dependent] = remaining
+                    if remaining == 0 { next.insert(dependent) }
                 }
             }
             frontier = next.sorted()

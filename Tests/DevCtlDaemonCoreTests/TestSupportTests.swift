@@ -58,10 +58,18 @@ import Testing
                 binaryName: binary) == false)
     }
 
-    @Test func theSuitePortRangeCoversTheBlockTheTestsUse() {
-        #expect(TestPorts.owns(45001))
-        #expect(TestPorts.owns(45426))
-        #expect(TestPorts.owns(39421) == false)
-        #expect(TestPorts.owns(41000) == false)
+    /** The literals, and the randomized ports `ResourceLockTests` draws, must
+        all fall inside the block; smoke.sh's two ranges must all fall outside
+        it. An earlier version of this test asserted 41000 was outside and
+        called that correct, which pinned a real gap as deliberate: the lock
+        suite was drawing from 41_000 at the time, so its fixtures were never
+        reaped. Both directions are asserted here so neither can drift alone. */
+    @Test func theSuitePortRangeCoversEverySuiteAndAvoidsSmoke() {
+        for port in [45001, 45426, 45471, 45500, 45749, 45750, 45999] {
+            #expect(TestPorts.owns(port), "\(port) is used by a suite but not reserved")
+        }
+        for port in [39000, 39499, 41000, 41501] {
+            #expect(TestPorts.owns(port) == false, "\(port) belongs to smoke.sh")
+        }
     }
 }

@@ -11,7 +11,15 @@ import Foundation
     machine, and so a new test picks its port from a documented range instead of
     guessing at a free number. */
 enum TestPorts {
-    static let range = 45000..<45500
+    /** Wide enough to cover the suites that draw a random port as well as the
+        hand-assigned literals. It first stopped at 45500, which left
+        `ResourceLockTests` outside it at 41_000 and 42_000: those fixtures went
+        unreaped, and worse, they shared a range with `scripts/smoke.sh`, which
+        draws its project-phase ports from 41000 too. Widening to reach them
+        would have pointed the reaper at smoke's fixtures, so the suites moved
+        in here instead. Anything added below must stay clear of smoke's 39000
+        and 41000 ranges. */
+    static let range = 45000..<46000
 
     static func owns(_ port: Int) -> Bool { range.contains(port) }
 }

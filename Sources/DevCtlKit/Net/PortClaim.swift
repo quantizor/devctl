@@ -142,8 +142,19 @@ public struct PortClaim: Equatable, Sendable {
     /** Config-time checks that do not need an effective (rebound) primary. */
     public static func configErrors(spec: ServerSpec) -> [String] {
         var errors: [String] = []
+        /** The primary was unchecked while named secondaries were, so a value a
+            TCP port cannot hold reached the socket layer, where narrowing it
+            traps and takes the daemon down on every relaunch. Caught here, where
+            `config check` reads it, rather than at the syscall. */
+        if let port = spec.port, port < 1 || port > 65_535 {
+            errors.append("server '\(spec.name)': port must be 1...65535")
+        }
         if let span = spec.portSpan, span < 1 {
             errors.append("server '\(spec.name)': portSpan must be >= 1")
+        }
+        if let port = spec.port, let span = spec.portSpan, span > 1, port + span - 1 > 65_535 {
+            errors.append(
+                "server '\(spec.name)': port \(port) with portSpan \(span) runs past 65535")
         }
         var spanOffsets: Set<Int> = []
         if let span = spec.portSpan, span > 1 {

@@ -175,7 +175,7 @@ Project hygiene at bootstrap: CLAUDE.md (symlinked AGENTS.md) with codebase map 
 
 - `swift test` (<30s): config validation/topo sort/trust, protocol codec round-trips + golden schemas incl. error envelopes, log parse + clamp + since binary-search + rotation, health state machine, ensure state matrix + single-flight (mocked ProcessLauncher), spool tailer against synthetic files (binary junk, NULs, ANSI, torn lines).
 - Component tests against fixture-server: group-kill of grandchildren, SIGKILL escalation, crash forensics, spawn-failure (bogus command → `failed` + spawnError), flood + slow-subscriber drop behavior.
-- Integration suite (serialized): real `devctld --foreground` on a temp socket: register→trust→ensure→wait→mark→logs since-mark→external kill→crash status→concurrent double-ensure→port-conflict from a second project→daemon kill + relaunch recovery→down.
+- End-to-end coverage lives in `scripts/smoke.sh` (real `devctld --foreground` on a temp socket: register→trust→ensure→wait→mark→logs since-mark→external kill→crash status→port-conflict from a second project→daemon kill + relaunch recovery→down) and, for the in-process half, `ConcurrentEnsureTests` against a real Router.
 - launchd smoke script (manual): install/kickstart/bootout, upgrade-in-place, shutdown intent honored by auto-bootstrap.
 - UI: `make app`, launch, drive against the live daemon, click-to-open verified, screenshot review of dropdown + dashboard (design judged by render, not tests).
 - Hook end-to-end: `devctl hook install` in a test project, fresh session + forced compaction, confirm injected context; confirm silence in an untrusted project and with the daemon stopped.

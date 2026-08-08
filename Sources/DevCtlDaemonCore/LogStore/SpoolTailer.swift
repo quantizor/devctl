@@ -49,7 +49,13 @@ actor SpoolTailer {
         guard size > offset else { return }
         try? handle.seek(toOffset: offset)
         guard let data = try? handle.readToEnd(), !data.isEmpty else { return }
-        offset = size
+        /** Advanced by what was actually read, never by the size measured before
+            the read. `readToEnd` reads to the end as it stands when it runs, so a
+            child that appends between the two calls hands back more bytes than
+            `size` accounted for, and recording `size` would leave the cursor
+            behind the data already ingested and re-ingest that tail on the next
+            drain: duplicate lines in the log and a doubled error tally. */
+        offset += UInt64(data.count)
         partial.append(data)
         while let newline = partial.firstIndex(of: 0x0A) {
             let lineData = partial.subdata(in: partial.startIndex..<newline)

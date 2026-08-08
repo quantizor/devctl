@@ -1719,9 +1719,10 @@ enum LockNotice {
     still-running server flushed its cached pages after the command had already
     finished. It cannot see state outside the declared path (a sibling `-wal`
     file when `path` names only the `.sqlite`), divergence that never reaches
-    disk, or a change that reverts to byte-identical state inside the window.
-    Above the file cap it samples head and tail, so a middle-only rewrite that
-    preserves size and mtime is missed. It never names which process wrote. */
+    disk, or a change that reverts to byte-identical state inside the window. A
+    directory stops hashing contents past a byte budget, so a change confined to
+    a file beyond it is missed; a single file is hashed whole at any size. It
+    never names which process wrote. */
 enum LockIdentityVerdict: Equatable {
     case fault(WireError)
     case note(String)
@@ -1736,7 +1737,20 @@ enum LockIdentityVerdict: Equatable {
         statePath: String
     ) -> LockIdentityVerdict {
         let change = ResourceFingerprint.compare(after: after, before: before)
-        guard change != .unchanged else { return .silent }
+        guard change != .unchanged else {
+            /** "Unchanged" from a partial fingerprint is "nothing I could see
+                changed", which is a different answer and the one worth saying.
+                An unreadable file digests to the same empty string on both
+                captures, and a directory past its byte budget hashes only names
+                and sizes, so silence here would report a clean bill of health
+                the check never actually established. */
+            guard after.exact, before.exact else {
+                return .note(
+                    "devctl lock: note: '\(resource)' state at \(statePath) could not be fingerprinted in full, so a change confined to the unread part would not have been reported."
+                )
+            }
+            return .silent
+        }
         let described = describe(change)
         guard !live.isEmpty else {
             return .note(

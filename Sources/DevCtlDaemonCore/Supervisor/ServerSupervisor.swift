@@ -184,11 +184,20 @@ public actor ServerSupervisor {
     }
 
     /** An explicit restart re-arms a tripped breaker: the feature must not be
-        dead for the rest of the daemon's life after one bad afternoon. */
+        dead for the rest of the daemon's life after one bad afternoon.
+
+        The restart history goes with it, or the re-arm lasts exactly one
+        evaluation: `WatchPolicy.decide` weighs the burst before anything else,
+        so leaving three in-window restarts behind means the next observed change
+        suspends again with no restart in between. Only an explicit restart
+        clears it, which is why the watch sweep asks for `rearm: false`: an auto
+        restart wiping its own breaker's evidence is the one thing the breaker
+        exists to prevent. */
     public func rearmWatch() {
         watchSuspended = false
         watchPending = nil
         watchBaseline = nil
+        watchRestarts.removeAll()
     }
 
     /** Port metadata for status/agents. Call after materializing the spawn spec. */

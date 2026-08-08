@@ -45,13 +45,30 @@ public struct DevCtlPaths: Sendable {
         path.utf8.count < 104
     }
 
+    /** One path component for a server name, safe to append.
+
+        A server name comes from a repo's committed devservers.json, so it is not
+        devctl's own string. `URL.appending(path:)` keeps `..` and `/` verbatim
+        and the kernel resolves them at `createDirectory` and `open`, so a name
+        of `../../../x` made the daemon create directories outside the logs tree
+        and write raw child stdout into them. Separators and dot-only components
+        are replaced rather than rejected so an odd name still gets a home, and
+        the hash keeps two names that flatten to the same text apart. */
+    public static func serverPathComponent(_ server: String) -> String {
+        let flattened = String(
+            server.map { $0 == "/" || $0 == ":" || $0 == "\0" ? "_" : $0 })
+        let resolvesToADirectoryOtherThanItself =
+            flattened == "." || flattened == ".." || flattened.isEmpty
+        return resolvesToADirectoryOtherThanItself ? "server-\(hash8(server))" : flattened
+    }
+
     /** Per-server log directory: `<slug>-<hash8>/<server>`. The slug keeps paths
         human-readable; the hash keeps distinct projects with one basename apart. */
     public func serverLogDir(project: String, server: String) -> URL {
         let project = canonicalProjectPath(project)
         return logsDir
             .appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
-            .appending(path: server)
+            .appending(path: Self.serverPathComponent(server))
     }
 
     public var eventsFile: URL { dataDir.appending(path: "events.log") }

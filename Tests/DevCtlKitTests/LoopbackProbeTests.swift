@@ -84,4 +84,13 @@ import Testing
         let port = Int(UInt16(bigEndian: bound.sin6_port))
         #expect(LoopbackProbe.isListening(port: port))
     }
+
+    /** A port outside a TCP port's range used to trap inside the probe, which
+        under launchd KeepAlive is a crash loop: boot restore re-reads the config
+        that caused it and dies again on every relaunch. Nothing can listen on a
+        port that cannot exist, so the probe answers false. */
+    @Test(arguments: [-1, 0, 65_536, 70_000, Int(Int32.max)])
+    func anImpossiblePortIsNotListeningRatherThanATrap(port: Int) {
+        #expect(!LoopbackProbe.isListening(port: port))
+    }
 }

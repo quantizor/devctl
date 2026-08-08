@@ -20,6 +20,13 @@ public enum LoopbackProbe {
     /** Non-blocking connect with a poll deadline, so an unreachable port cannot
         stall a status call for the kernel's full connect timeout. */
     private static func connects(port: Int, timeoutMs: Int, family: Int32) -> Bool {
+        /** A port arrives from a repo's devservers.json, from `--port`, and from
+            portSpan arithmetic that can run off the end of the range, and
+            `UInt16(port)` traps on anything outside 0...65535. Under launchd
+            KeepAlive that trap is a crash loop: boot restore re-reads the same
+            config and dies again on every relaunch. Nothing can be listening on
+            a port that does not exist, so answer that instead of trapping. */
+        guard let narrowed = UInt16(exactly: port), narrowed > 0 else { return false }
         let sock = socket(family, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { close(sock) }
@@ -30,7 +37,7 @@ public enum LoopbackProbe {
         if family == AF_INET6 {
             var addr = sockaddr_in6()
             addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_port = UInt16(port).bigEndian
+            addr.sin6_port = narrowed.bigEndian
             addr.sin6_addr = in6addr_loopback
             sockLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
             withUnsafeMutablePointer(to: &storage) { ptr in
@@ -39,7 +46,7 @@ public enum LoopbackProbe {
         } else {
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = UInt16(port).bigEndian
+            addr.sin_port = narrowed.bigEndian
             addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
             sockLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             withUnsafeMutablePointer(to: &storage) { ptr in

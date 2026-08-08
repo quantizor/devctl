@@ -383,10 +383,15 @@ public actor Router {
                 return try respond(id: head.id, result: result)
             case .serverUnregister:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
-                try await registry.unregister(project: request.params.project, name: request.params.name)
-                supervisors[serverID(project: request.params.project, name: request.params.name)] = nil
+                /** Canonicalized like every other project-scoped method: the
+                    supervisor pool is keyed on canonical paths, so a symlinked
+                    or trailing-slash spelling from the app or a deep link
+                    dropped the registry row and left the supervisor resident. */
+                let project = canonicalProjectPath(request.params.project)
+                try await registry.unregister(project: project, name: request.params.name)
+                supervisors[serverID(project: project, name: request.params.name)] = nil
                 await events.post(
-                    kind: .unregistered, project: request.params.project, server: request.params.name)
+                    kind: .unregistered, project: project, server: request.params.name)
                 return try respond(id: head.id, result: WireEmpty())
             }
         } catch let error as WireError {
@@ -812,15 +817,22 @@ public actor Router {
         return (projectHost, servers)
     }
 
+    /** `force` resolves and validates even for a server that is currently up,
+        which is what lets `restart` raise every refusal before it stops
+        anything. The port pre-check treats a listener the target itself owns as
+        free, so a running server does not report its own port as held. */
     private func prepareSpawn(
-        target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil
+        target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
+        force: Bool = false
     ) async throws {
-        let current = await supervisor.status()
-        switch current.phase {
-        case .running, .starting, .stopping, .unhealthy:
-            return
-        case .crashed, .failed, .stopped:
-            break
+        if !force {
+            let current = await supervisor.status()
+            switch current.phase {
+            case .running, .starting, .stopping, .unhealthy:
+                return
+            case .crashed, .failed, .stopped:
+                break
+            }
         }
         let merged = try await mergedSpecs(project: target.project)
         guard var spec = merged.specs.first(where: { $0.name == target.name }) else {
@@ -946,11 +958,31 @@ public actor Router {
             if await managedHolder(port: port, excluding: targetID) != nil {
                 return (port: port, managed: true)
             }
+            /** A listener the target itself owns is not a conflict for the
+                target: it is the run about to be replaced, or a sibling ensure
+                that just won the single flight. `managedHolder` excludes the
+                target by id, so without this the target's own socket falls
+                through to the unmanaged-squatter branch and one server reports
+                its own port as held. */
+            if await targetOwnsPort(port, id: targetID) { continue }
             if PortGuard.isListening(port: port) {
                 return (port: port, managed: false)
             }
         }
         return nil
+    }
+
+    private func targetOwnsPort(_ port: Int, id: String) async -> Bool {
+        guard let supervisor = supervisors[id] else { return false }
+        let status = await supervisor.status()
+        switch status.phase {
+        case .running, .starting, .unhealthy:
+            break
+        case .crashed, .failed, .stopped, .stopping:
+            return false
+        }
+        return status.declaredPort == port || status.effectivePort == port
+            || status.observedPort == port || (status.ports?.values.contains(port) ?? false)
     }
 
     private func allocateSiblingPort(
@@ -1387,7 +1419,9 @@ public actor Router {
         a held resource or a broken config, leaving it down. The stop is
         non-retiring because the server is coming straight back, so resume-on-boot
         survives what `stop` would otherwise clear. */
-    private func restartServers(_ params: RestartParams) async throws -> GroupResult {
+    private func restartServers(_ params: RestartParams, rearm: Bool = true) async throws
+        -> GroupResult
+    {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
         if let names = params.names {
@@ -1407,14 +1441,28 @@ public actor Router {
             try await refuseIfPaused(project: params.project, spec: spec)
             prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
         }
+        /** The whole resolution pass runs before any server stops, the way
+            groupUp resolves the set before it spawns any of it. `prepareSpawn`
+            is where the port pre-check, the sibling rebind and the second config
+            parse live, so running it after the stop meant `port-held` and
+            `config-invalid` arrived with the server already down: exactly the
+            failure a client-side stop-then-ensure has and this command exists to
+            remove. `force` is needed because the servers are still up here, and
+            prepareSpawn otherwise returns early for a running server. */
+        for entry in prepared {
+            try await prepareSpawn(
+                target: ServerTargetParams(
+                    name: entry.spec.name, port: params.port, project: params.project),
+                supervisor: entry.supervisor, portOverride: params.port, force: true)
+        }
         var results: [EnsureResult] = []
         for entry in prepared {
-            await entry.supervisor.rearmWatch()
+            /** Only an explicit restart re-arms the watch. Under the sweep the
+                pending stamp has to survive as far as `deferWatchRestart`, which
+                reads it, and clearing it here made that a no-op for every
+                refusal raised after this point. */
+            if rearm { await entry.supervisor.rearmWatch() }
             _ = await entry.supervisor.stop(deliberate: false)
-            let target = ServerTargetParams(
-                name: entry.spec.name, port: params.port, project: params.project)
-            try await prepareSpawn(
-                target: target, supervisor: entry.supervisor, portOverride: params.port)
             results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
             DevCtlLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
         }
@@ -1442,7 +1490,8 @@ public actor Router {
             do {
                 _ = try await restartServers(
                     RestartParams(
-                        names: [split.name], project: split.project, timeoutSeconds: 60))
+                        names: [split.name], project: split.project, timeoutSeconds: 60),
+                    rearm: false)
                 await supervisor.recordWatchRestart(now)
                 restarted.append(id)
                 DevCtlLog.daemon.info(

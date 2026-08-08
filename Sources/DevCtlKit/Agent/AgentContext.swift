@@ -13,9 +13,24 @@ import Foundation
     an agent's context unattributed. Surfacing that an error stream is piling up
     is safe (the count and timestamps are arithmetic); surfacing the lines
     themselves is not, so the block points the agent at `devctl why`, which it
-    runs itself and can attribute. */
+    runs itself and can attribute.
+
+    The values that are unavoidably the project's own (a server name, a url, a
+    head) go through `quoted` first. A repo's devservers.json is attacker-supplied
+    text and JSON keys legally hold newlines, so an unescaped name could close the
+    fence and continue as if it were the harness talking. */
 public enum AgentContext {
     public static let maxLength = 2400
+
+    /** One line, fence-safe, bounded. Newlines and carriage returns become
+        spaces so nothing can start a new line inside the block, and the closing
+        tag is defanged so nothing can end the block early. The cap keeps one
+        pathological value from crowding out every server below it. */
+    private static func quoted(_ value: String) -> String {
+        let flattened = String(value.map { $0 == "\n" || $0 == "\r" ? " " : $0 })
+            .replacingOccurrences(of: "</devctl-servers>", with: "<\u{200B}/devctl-servers>")
+        return flattened.count > 200 ? String(flattened.prefix(200)) + "…" : flattened
+    }
 
     /** Nil when there is nothing to say: an untrusted project (the hook advertises
         only trusted ones) or no registered servers. Otherwise the fenced block,
@@ -41,13 +56,18 @@ public enum AgentContext {
         for server in ordered {
             lines.append(bullet(for: server))
             if let conflict = server.portConflict {
-                lines.append("  warning: \(conflict.message)")
+                /** Composed here from the structured fields rather than echoing
+                    `conflict.message`, which embeds the squatter's own `ps`
+                    command line. That string is chosen by whatever process is
+                    holding the port, and a command string must not reach an
+                    agent's context. The port and the state are devctl's own. */
+                lines.append("  warning: \(conflictLine(conflict))")
             }
             if isBadState(server) {
                 if let summary = server.errorSummary {
                     lines.append("  \(errorLine(summary))")
                 }
-                lines.append("  run: devctl why \(server.server) --json")
+                lines.append("  run: devctl why \(quoted(server.server)) --json")
             }
         }
         lines.append(
@@ -87,12 +107,31 @@ public enum AgentContext {
         }
     }
 
+    /** devctl's own words for a port conflict. Deliberately drops the holder's
+        command line that `conflict.message` carries for `status` and `doctor`,
+        where a human reads it and can attribute it. */
+    private static func conflictLine(_ conflict: PortConflict) -> String {
+        let port = conflict.effectivePort ?? conflict.declaredPort
+        switch conflict.state {
+        case .drift:
+            return "port \(port) drifted from the claim; run: devctl why"
+        case .foreign:
+            return "port \(port) answers from a process devctl does not manage"
+        case .held:
+            return "port \(port) is held by another process; run: devctl why"
+        case .rebound:
+            return "rebound to port \(port) for this worktree"
+        case .shared:
+            return "port \(port) is claimed by more than one server"
+        }
+    }
+
     private static func bullet(for server: ServerStatus) -> String {
-        var parts = ["- \(server.server): \(server.phase.rawValue)"]
-        if let url = server.url { parts.append(url) }
+        var parts = ["- \(quoted(server.server)): \(server.phase.rawValue)"]
+        if let url = server.url { parts.append(quoted(url)) }
         if let heads = server.heads, !heads.isEmpty {
             let rendered = heads.sorted { $0.key < $1.key }
-                .map { "\($0.key) \($0.value)" }
+                .map { "\(quoted($0.key)) \(quoted($0.value))" }
                 .joined(separator: ", ")
             parts.append("heads: \(rendered)")
         }
@@ -125,7 +164,7 @@ public enum AgentContext {
             break
         }
         if server.specStale == true { parts.append("config changed since start") }
-        parts.append("log \(server.logPath)")
+        parts.append("log \(quoted(server.logPath))")
         return parts.joined(separator: " · ")
     }
 
