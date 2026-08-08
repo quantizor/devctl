@@ -99,6 +99,82 @@ import Testing
             ServerResult.self)
     }
 
+    /** The worktree host was invisible until a server started, so any config the
+        app itself pins to an origin was already wrong with nothing saying so.
+        `config check` answers it from the same resolver the spawn path uses. */
+    @Test func configCheckReportsTheWorktreeEffectiveHost() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let mainCheck = try await handle(
+            router, .projectCheck, ProjectOnlyParams(project: env.main), CheckResult.self)
+        #expect(mainCheck.errors.isEmpty)
+        #expect(mainCheck.host == "app.localhost")
+        #expect(mainCheck.effectiveHost == nil)
+        #expect(mainCheck.effectiveHostReason == nil)
+
+        let wtCheck = try await handle(
+            router, .projectCheck, ProjectOnlyParams(project: env.worktree), CheckResult.self)
+        #expect(wtCheck.errors.isEmpty)
+        #expect(wtCheck.host == "app.localhost")
+        #expect(wtCheck.effectiveHost == "worktree-review.app.localhost")
+        #expect(wtCheck.effectiveHostReason == .linkedWorktree)
+
+        /** The reported host must be the one a start actually uses, which is the
+            whole point of answering before the start. */
+        try await registry.setTrusted(project: env.worktree)
+        let started = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let url = try #require(started.server.url)
+        #expect(url.contains(try #require(wtCheck.effectiveHost)))
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
+            ServerResult.self)
+    }
+
+    /** `up` prepares the spawn and then runs its waves. Re-resolving the
+        supervisor inside a wave re-applied the committed spec to anything not yet
+        running, discarding the rebound port, the worktree host, and the
+        substituted argv, so the child bound the committed port while status
+        reported the rebind. Group and single-server starts must agree. */
+    @Test func siblingWorktreeGroupUpKeepsTheMaterializedSpawnSpec() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let mainResult = try await handle(
+            router, .groupUp, GroupParams(project: env.main, timeoutSeconds: 10),
+            GroupResult.self)
+        #expect(mainResult.results.first?.server.phase == .running)
+        #expect(mainResult.results.first?.server.effectivePort == 45111)
+
+        let wtResult = try await handle(
+            router, .groupUp, GroupParams(project: env.worktree, timeoutSeconds: 10),
+            GroupResult.self)
+        let web = try #require(wtResult.results.first?.server)
+        #expect(web.phase == .running)
+        let effective = try #require(web.effectivePort)
+        #expect(effective != 45111)
+        #expect(web.portConflict?.state == .rebound)
+        /** The url is the tell: it is built from the materialized spec, so the
+            committed port here means the spawn spec was clobbered. */
+        let url = try #require(web.url)
+        #expect(url == "http://worktree-review.app.localhost:\(effective)/")
+        /** The child was told `{port}`, so a clobbered spec listens on 45111. */
+        #expect(web.observedPort == nil || web.observedPort == effective)
+
+        _ = try await handle(
+            router, .groupDown, GroupParams(project: env.worktree, timeoutSeconds: 10),
+            GroupResult.self)
+        _ = try await handle(
+            router, .groupDown, GroupParams(project: env.main, timeoutSeconds: 10),
+            GroupResult.self)
+    }
+
     @Test func siblingWorktreePortSpanRebindsAsBlock() async throws {
         let base = FileManager.default.temporaryDirectory
             .appending(path: "devctl-span-\(UUID().uuidString)")

@@ -304,6 +304,7 @@ public actor ServerSupervisor {
             icon: spec.icon,
             lastExit: lastExit,
             lastHealthAt: lastHealthAt,
+            locks: spec.locks,
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
             observedPort: observedPort,
             phase: phase,
@@ -415,8 +416,9 @@ public actor ServerSupervisor {
     /** The managed server whose recorded pid holds one of these listeners, if
         any. This is what separates "another devctl server took the port" from
         "the listener is simply not my child", which look identical from lsof
-        alone. Returns the `server@project` id so the message can name it. */
-    private func managedOwner(among foreign: [Int]) async -> String? {
+        alone. Returns the server name and its project separately: the internal
+        id is `<project>::<name>`, which is not a string to show a reader. */
+    private func managedOwner(among foreign: [Int]) async -> (name: String, project: String)? {
         let myID = serverID(project: projectPath, name: spec.name)
         let candidates = Set(foreign)
         for (id, entry) in await registry.allPersistedState() where id != myID {
@@ -433,7 +435,13 @@ public actor ServerSupervisor {
             else { continue }
             let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
             guard processStart <= startedAt.addingTimeInterval(1) else { continue }
-            return id
+            /** Split from the back: the project is an absolute path and the name
+                never contains the separator. */
+            guard let separator = id.range(of: "::", options: .backwards) else { continue }
+            return (
+                name: String(id[separator.upperBound...]),
+                project: String(id[id.startIndex..<separator.lowerBound])
+            )
         }
         return nil
     }
@@ -498,22 +506,22 @@ public actor ServerSupervisor {
         portConflict = PortConflict(
             declaredPort: declaredPort ?? expected,
             effectivePort: expected,
-            holder: thief,
+            holder: "\(thief.name)@\(thief.project)",
             message:
-                "healthcheck passed but managed server '\(thief)' owns port \(expected), not this server; run: devctl stop for that server or give this one its own port",
+                "healthcheck passed but managed server '\(thief.name)' in \(thief.project) owns port \(expected), not this server; run: devctl stop \(thief.name) --project \(thief.project)",
             state: .foreign)
         phase = .failed
         spawnError = SpawnError(
-            message: "port \(expected) is owned by managed server '\(thief)', so the healthcheck was answered by another devctl server")
+            message: "port \(expected) is owned by managed server '\(thief.name)' in \(thief.project), so the healthcheck was answered by another devctl server")
         errorSummary = captureErrorSummary(since: startedAt)
         recentLogTail = spoolTail()
         terminalEvidence = recentLogTail
         healthTask?.cancel()
         DevCtlLog.supervisor.error(
-            "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief)")
+            "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief.name)@\(thief.project)")
         await events?.post(
             kind: .failed, project: projectPath, server: spec.name,
-            detail: "port \(expected) owned by managed server \(thief)")
+            detail: "port \(expected) owned by managed server '\(thief.name)' in \(thief.project)")
         let id = serverID(project: projectPath, name: spec.name)
         let summary = errorSummary
         let err = spawnError

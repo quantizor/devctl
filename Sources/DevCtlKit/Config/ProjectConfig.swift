@@ -163,6 +163,26 @@ public enum ProjectConfigLoader {
                 warnings.append(
                     "server '\(name)': url '\(explicitURL)' points at a bare loopback host; prefer '\(recommendedHost)'")
             }
+            /** A head or healthcheck url resolves against the server's own base
+                only when there is a base to resolve against. Without one the value
+                materializes to `//:port/path`, which reads as a URL everywhere it
+                lands (the menu bar, Spotlight, `devctl open`, agent context) and
+                works nowhere. */
+            let hasBase = entry.port != nil || entry.url != nil
+            for (headName, headValue) in (entry.heads ?? [:]).sorted(by: { $0.key < $1.key }) {
+                let checked = checkURLValue(
+                    hasBase: hasBase, label: "head '\(headName)'", recommendedHost: recommendedHost,
+                    server: name, value: headValue)
+                view.errors.append(contentsOf: checked.errors)
+                warnings.append(contentsOf: checked.warnings)
+            }
+            if let healthURL = entry.healthcheck?.url {
+                let checked = checkURLValue(
+                    hasBase: hasBase, label: "healthcheck url", recommendedHost: recommendedHost,
+                    server: name, value: healthURL)
+                view.errors.append(contentsOf: checked.errors)
+                warnings.append(contentsOf: checked.warnings)
+            }
             var iconPath: String?
             if let relative = entry.icon ?? config.icon {
                 let absolute = (project as NSString).appendingPathComponent(relative)
@@ -218,6 +238,42 @@ public enum ProjectConfigLoader {
         view.specs = specs
         view.warnings = warnings
         return view
+    }
+
+    /** Judge one head or healthcheck url from the config file. Two shapes are
+        legal: an absolute URL, or a root-relative path resolved against the
+        server's own base at materialization. `{host}` / `{port}` values are legal
+        input to substitution and cannot be judged before the effective values are
+        known, so they are left alone. */
+    static func checkURLValue(
+        hasBase: Bool, label: String, recommendedHost: String, server: String, value: String
+    ) -> (errors: [String], warnings: [String]) {
+        if value.contains("{host}") || value.contains("{port}") { return ([], []) }
+        if value.isEmpty { return (["server '\(server)': \(label) is empty"], []) }
+        if value.hasPrefix("/") {
+            guard hasBase else {
+                return (
+                    [
+                        "server '\(server)': \(label) is the path '\(value)' but the server declares no port or url to resolve it against; give the server a port, or write the \(label.hasPrefix("head") ? "head" : "url") as an absolute URL"
+                    ], []
+                )
+            }
+            return ([], [])
+        }
+        guard let host = URLComponents(string: value)?.host else {
+            return (
+                [
+                    "server '\(server)': \(label) is '\(value)', which is neither an absolute URL nor a path starting with '/'; write 'http://host:port/\(value)' or '/\(value)'"
+                ], []
+            )
+        }
+        guard isBareLoopback(host) else { return ([], []) }
+        return (
+            [],
+            [
+                "server '\(server)': \(label) points at a bare loopback host; prefer '\(recommendedHost)'"
+            ]
+        )
     }
 
     /** A host that resolves to loopback with no per-project subdomain, so it

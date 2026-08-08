@@ -51,9 +51,13 @@ public enum AgentContext {
             }
         }
         lines.append(
-            "Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> \"text\" · devctl events --since 10m · devctl lock <resource> --no-pause -- …. All support --json.")
+            "Useful: devctl ensure <name> (idempotent start) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> \"text\" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.")
+        /** The invitation and its constraint stay on one line: render truncates
+            from the end and re-appends only the closing fence, so a clause on its
+            own line can be cut while the invitation above it survives. That
+            already produced one report naming a private project. */
         lines.append(
-            "While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it.")
+            "While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it. Report devctl's behavior and how to reproduce it generically, never this project's name, paths, hosts, ports, or log lines: that file lives outside this project.")
         lines.append("</devctl-servers>")
         let text = lines.joined(separator: "\n")
         return text.count > maxLength ? String(text.prefix(maxLength)) + "\n</devctl-servers>" : text

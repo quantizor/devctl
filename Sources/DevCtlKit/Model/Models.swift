@@ -212,6 +212,11 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var icon: String?
     public var lastExit: LastExit?
     public var lastHealthAt: Date?
+    /** Resources this server holds while running, from its `locks` declaration.
+        The machine-readable half of the hint `stop` prints: getting exclusive
+        access to one of these is what `devctl lock` is for, and stopping the
+        server is the heavier way to the same place. */
+    public var locks: [String]?
     public var logPath: String
     public var observedPort: Int?
     public var phase: ServerPhase
@@ -238,6 +243,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         icon: String? = nil,
         lastExit: LastExit? = nil,
         lastHealthAt: Date? = nil,
+        locks: [String]? = nil,
         logPath: String,
         observedPort: Int? = nil,
         phase: ServerPhase,
@@ -261,6 +267,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.icon = icon
         self.lastExit = lastExit
         self.lastHealthAt = lastHealthAt
+        self.locks = locks
         self.logPath = logPath
         self.observedPort = observedPort
         self.phase = phase

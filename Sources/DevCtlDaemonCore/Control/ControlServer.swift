@@ -134,23 +134,34 @@ public actor Router {
                 guard FileManager.default.fileExists(atPath: url.path) else {
                     return try respond(
                         id: head.id,
-                        result: CheckResult(errors: ["no devservers.json at \(url.path)"]))
+                        result: CheckResult(
+                            errors: [
+                                "no devservers.json at \(url.path) (run: devctl config init)"
+                            ]))
                 }
                 do {
                     guard let view = try ProjectConfigLoader.load(project: project) else {
                         return try respond(
                             id: head.id, result: CheckResult(errors: ["cannot read \(url.path)"]))
                     }
+                    let hosts = await effectiveHosts(project: project, view: view)
                     return try respond(
                         id: head.id,
                         result: CheckResult(
+                            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
+                            effectiveHostReason: hosts.project.differs
+                                ? hosts.project.reason : nil,
                             errors: view.errors,
                             host: view.host,
+                            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
                             servers: view.specs.map(\.name),
                             warnings: view.warnings))
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
+            case .projectInitConfig:
+                let request = try decoder.decode(WireRequest<InitConfigParams>.self, from: line)
+                return try respond(id: head.id, result: try await initConfig(request.params))
             case .projectWriteConfig:
                 let request = try decoder.decode(WireRequest<WriteConfigParams>.self, from: line)
                 let url = ProjectConfigLoader.configURL(project: request.params.project)
@@ -613,6 +624,141 @@ public actor Router {
     /** Resolve effective port, apply overlay/worktree host/materialization, and
         either auto-rebind a sibling conflict or refuse with port-held. Every
         start-shaped path routes through here. */
+    /** Writes a devservers.json from what the daemon already knows, which is the
+        only way back for a file that was gitignored and lost. The projection runs
+        over the merged view, never a supervisor's spec: a running spec has been
+        materialized, so its argv holds this machine's substituted port. */
+    private func initConfig(_ params: InitConfigParams) async throws -> InitConfigResult {
+        let project = canonicalProjectPath(params.project)
+        let url = ProjectConfigLoader.configURL(project: project)
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        if exists, params.mode == .create {
+            throw WireError(
+                code: .alreadyExists,
+                hint: "run: devctl config init --force",
+                message: "\(url.path) already exists; pass --force to replace it")
+        }
+        if exists, params.mode == .replace, params.force != true {
+            throw WireError(
+                code: .alreadyExists,
+                hint: "run: devctl config init --force",
+                message: "\(url.path) already exists; pass --force to replace it")
+        }
+        var specs: [ServerSpec] = []
+        var host: String?
+        if params.fromDaemon != false {
+            if let merged = try? await mergedSpecs(project: project) {
+                specs = merged.specs
+                host = merged.host
+            } else {
+                specs = await registry.specs(project: project)
+            }
+        }
+        for extra in params.servers ?? [] {
+            specs.removeAll { $0.name == extra.name }
+            specs.append(extra)
+        }
+        specs.sort { $0.name < $1.name }
+        guard !specs.isEmpty else {
+            throw WireError(
+                code: .notFound,
+                hint: "run: devctl register --name <name> --cmd <word>",
+                message: "the daemon knows no servers for \(project), so there is nothing to write")
+        }
+        var config = ConfigProjection.file(
+            host: params.host ?? host, project: project, specs: specs)
+        var notRecovered: [String] = []
+        if params.mode == .merge, exists {
+            guard let existingData = try? Data(contentsOf: url),
+                let existing = try? JSONCoding.decoder().decode(
+                    ProjectFileConfig.self, from: existingData)
+            else {
+                throw WireError(
+                    code: .configInvalid,
+                    hint: "run: devctl config check",
+                    message: "cannot parse \(url.path), so merging into it would lose it")
+            }
+            var merged = existing
+            for (name, entry) in config.servers {
+                guard let next = ConfigProjection.merge(
+                    entry: entry, force: params.force == true, into: merged, name: name)
+                else {
+                    throw WireError(
+                        code: .alreadyExists,
+                        hint: "run: devctl register --name \(name) --write --force",
+                        message: "\(url.path) already declares '\(name)'; pass --force to replace that entry")
+                }
+                merged = next
+            }
+            config = merged
+        } else if exists {
+            /** lifecycle exists only in the file and has no runtime counterpart,
+                so a rewrite from daemon state drops it. Report it only when the
+                file being replaced actually had one: naming a key the reader
+                never wrote sends them looking for something that was never
+                there. */
+            let previous = (try? Data(contentsOf: url)).flatMap {
+                try? JSONCoding.decoder().decode(ProjectFileConfig.self, from: $0)
+            }
+            if let lifecycle = previous?.lifecycle, !lifecycle.isEmpty, config.lifecycle == nil {
+                notRecovered = ["lifecycle"]
+            }
+        }
+        let view = ProjectConfigLoader.validate(config: config, project: project)
+        guard view.errors.isEmpty else {
+            throw WireError(
+                code: .configInvalid,
+                hint: "run: devctl config check",
+                message: "the projected config does not validate: \(view.errors.joined(separator: "; "))")
+        }
+        let data = try JSONCoding.fileEncoder().encode(config)
+        let content = String(decoding: data, as: UTF8.self) + "\n"
+        let hosts = await effectiveHosts(project: project, view: view)
+        let check = CheckResult(
+            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
+            effectiveHostReason: hosts.project.differs ? hosts.project.reason : nil,
+            errors: view.errors,
+            host: view.host,
+            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
+            servers: view.specs.map(\.name),
+            warnings: view.warnings)
+        guard params.dryRun != true else {
+            return InitConfigResult(
+                check: check, content: content,
+                notRecovered: notRecovered.isEmpty ? nil : notRecovered, path: url.path,
+                written: false)
+        }
+        try AtomicFile.write(Data(content.utf8), to: url)
+        configCache[project] = nil
+        return InitConfigResult(
+            check: check, content: content,
+            notRecovered: notRecovered.isEmpty ? nil : notRecovered, path: url.path, written: true)
+    }
+
+    /** The hosts a spawn from this directory would use, answered before anything
+        starts. Same resolver the spawn path runs, so `config check` can report a
+        worktree's ephemeral origin rather than leaving it to be discovered as a
+        broken app. Only servers that differ from the project are returned. */
+    private func effectiveHosts(project: String, view: ProjectConfigView) async -> (
+        project: EffectiveHost, servers: [EffectiveHost]
+    ) {
+        let defaultSlugHost = "\(ProjectConfigLoader.defaultSlug(project: project)).localhost"
+        let preferred = CheckoutIdentity.preferredSubdomain(
+            project: project, committedHost: view.host)
+        let projectHost = EffectiveHostResolver.project(
+            declaredHost: view.host,
+            worktreeHost: CheckoutIdentity.worktreeHost(
+                project: project, preferred: preferred, takenHosts: await takenHosts()))
+        let overlay = LocalOverlay.load(project: project)
+        let servers = view.specs.compactMap { spec -> EffectiveHost? in
+            let resolved = EffectiveHostResolver.server(
+                defaultSlugHost: defaultSlugHost, overlayHost: overlay?.servers?[spec.name]?.host,
+                project: projectHost, server: spec.name, specHost: spec.host)
+            return resolved.effective == projectHost.effective ? nil : resolved
+        }
+        return (projectHost, servers)
+    }
+
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil
     ) async throws {
@@ -643,11 +789,18 @@ public actor Router {
             matches against this so preferred-host URLs rewrite to the ephemeral
             label even after `spec.host` already moved. */
         let matchHost = spec.host ?? committedHost ?? defaultSlugHost
-        if let worktreeHost = CheckoutIdentity.worktreeHost(
-            project: target.project, preferred: preferred, takenHosts: taken),
-            overlayServer?.host == nil,
-            spec.host == nil || spec.host == committedHost || spec.host == defaultSlugHost
-        {
+        let projectHost = EffectiveHostResolver.project(
+            declaredHost: committedHost ?? defaultSlugHost,
+            worktreeHost: CheckoutIdentity.worktreeHost(
+                project: target.project, preferred: preferred, takenHosts: taken))
+        let serverHost = EffectiveHostResolver.server(
+            defaultSlugHost: defaultSlugHost, overlayHost: overlayServer?.host,
+            project: projectHost, server: target.name, specHost: spec.host)
+        /** Only a worktree swap rewrites the spec here: an overlay host is
+            already applied above, and a per-server override keeps its own host.
+            `config check` reads the same resolver, so the two cannot drift. */
+        if serverHost.reason == .linkedWorktree {
+            let worktreeHost = serverHost.effective
             spec.host = worktreeHost
             if let port = spec.port {
                 let urlHost = URL(string: spec.url ?? "")?.host
@@ -1173,13 +1326,20 @@ public actor Router {
             a held port refuses the rollout instead of leaving half a project up
             next to a server that lost a race it never knew it entered. Servers
             already up skip the check against their own listeners. */
+        /** Hold the prepared supervisors rather than re-resolving them per wave.
+            `supervisor(project:spec:)` re-applies the committed spec to anything
+            not yet up, which would discard exactly what prepareSpawn just wrote:
+            the rebound port, the worktree host, the substituted argv, and the
+            injected env. A second lookup here spawned the child on the committed
+            port while status reported the rebind. */
+        var prepared: [String: ServerSupervisor] = [:]
         for spec in wanted {
             let target = ServerTargetParams(
                 name: spec.name, port: params.port, project: params.project)
+            let supervisor = await supervisor(project: params.project, spec: spec)
             try await prepareSpawn(
-                target: target,
-                supervisor: await supervisor(project: params.project, spec: spec),
-                portOverride: params.port)
+                target: target, supervisor: supervisor, portOverride: params.port)
+            prepared[spec.name] = supervisor
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
             throw WireError(
@@ -1194,14 +1354,10 @@ public actor Router {
             if failed { break }
             let waveResults = await withTaskGroup(of: EnsureResult.self) { group in
                 for name in wave {
-                    guard let spec = specsByName[name] else { continue }
-                    group.addTask { [weak self] in
-                        guard let self else {
-                            return EnsureResult(
-                                reason: .stopped,
-                                server: ServerStatus(logPath: "", phase: .stopped, project: params.project, server: name))
-                        }
-                        let supervisor = await self.supervisor(project: params.project, spec: spec)
+                    guard let spec = specsByName[name], let supervisor = prepared[name] else {
+                        continue
+                    }
+                    group.addTask {
                         if spec.waitFor == .started {
                             let status = await supervisor.start()
                             return EnsureResult(

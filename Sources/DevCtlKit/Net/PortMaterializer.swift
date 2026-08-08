@@ -56,6 +56,8 @@ public enum PortMaterializer {
             for (name, url) in heads {
                 rewritten[name] =
                     rewriteURL(url, port: effectivePort, host: host, matchHost: previousHost)
+                    ?? resolveRelative(
+                        substitute(url, port: portText, host: hostText), base: next.url)
                     ?? substitute(url, port: portText, host: hostText)
             }
             next.heads = rewritten
@@ -64,6 +66,8 @@ public enum PortMaterializer {
             if let healthURL = health.url {
                 health.url =
                     rewriteURL(healthURL, port: effectivePort, host: host, matchHost: previousHost)
+                    ?? resolveRelative(
+                        substitute(healthURL, port: portText, host: hostText), base: next.url)
                     ?? substitute(healthURL, port: portText, host: hostText)
             }
             if let effectivePort, health.port != nil {
@@ -86,6 +90,17 @@ public enum PortMaterializer {
         return out
     }
 
+    /** Resolve a root-relative value (`/admin`) against the server's own base URL,
+        which is the only reading that survives a rebind or a worktree host swap.
+        Nil when the value is not root-relative or there is no base to resolve
+        against, so the caller falls through to token substitution. */
+    public static func resolveRelative(_ raw: String, base: String?) -> String? {
+        guard raw.hasPrefix("/"), let base, let baseURL = URL(string: base),
+            let resolved = URL(string: raw, relativeTo: baseURL)
+        else { return nil }
+        return resolved.absoluteString
+    }
+
     /** Prefer structured URL rewrite so an explicit committed URL follows the
         effective port/host without requiring `{port}` tokens. Host is only
         replaced when the URL's host exactly matches `matchHost` (so a head like
@@ -93,7 +108,14 @@ public enum PortMaterializer {
     public static func rewriteURL(
         _ raw: String, port: Int?, host: String?, matchHost: String? = nil
     ) -> String? {
-        guard var components = URLComponents(string: raw) else { return nil }
+        /** A hostless component set (a bare path like `/admin`) must not be
+            rewritten: stamping a port onto it forces an empty authority and
+            serializes as `//:3000/admin`, a non-nil value that reads as success
+            and reaches every heads consumer. Declining here hands the caller its
+            relative-resolution and substitution fallbacks. */
+        guard var components = URLComponents(string: raw), components.host != nil else {
+            return nil
+        }
         if let host {
             if let matchHost {
                 if components.host == matchHost {
