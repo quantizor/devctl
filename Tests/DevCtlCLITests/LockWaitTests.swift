@@ -30,6 +30,16 @@ import Testing
         #expect(text.contains("(it left db running, --no-pause)"))
     }
 
+    /** --no-pause with nothing running left no servers up, so saying it did
+        would mislead whoever is debugging the contention. */
+    @Test func contendedNoticeDoesNotClaimServersWereLeftRunningWhenNoneWere() {
+        let holder = LockHolder(pause: false, paused: [], pid: 77, since: since)
+        let text = LockNotice.contended(
+            budgetSeconds: 300, holder: holder, now: now, resource: "d1")
+        #expect(text.contains("(nothing was running, so --no-pause stopped nothing)"))
+        #expect(!text.contains("left declaring servers running"))
+    }
+
     /** An empty paused set is ambiguous without the pause bit, so it gets its
         own sentence rather than reading as "it paused nothing you care about". */
     @Test func contendedNoticeDistinguishesNothingRunningFromNoPause() {

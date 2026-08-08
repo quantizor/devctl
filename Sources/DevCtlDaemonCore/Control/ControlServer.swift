@@ -1068,9 +1068,15 @@ public actor Router {
             )
         }
         /** Same holder re-acquiring (retry after a blip) keeps the existing pause
-            set rather than double-stopping. */
+            set rather than double-stopping, and must answer with everything the
+            first acquire did: dropping `live` or `statePath` here would leave the
+            retrying client unable to judge the resource for the rest of the hold. */
         if let existing = resourceLocks[key], existing.pid == params.holderPid {
-            return LockResult(paused: existing.paused)
+            let specs = (try? await mergedSpecs(project: params.project))?.specs ?? []
+            return LockResult(
+                live: existing.live, paused: existing.paused,
+                statePath: try LockResource.statePath(
+                    project: params.project, resource: params.resource, specs: specs))
         }
         var live: [String] = []
         var paused: [String] = []

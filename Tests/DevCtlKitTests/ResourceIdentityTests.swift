@@ -89,6 +89,24 @@ import Testing
         #expect(ResourceFingerprint.compare(after: after, before: before) == .changed(.inode))
     }
 
+    /** Over the entry cap the manifest is clipped, and the clip has to fall in
+        the same place every time. Sorting before clipping is what guarantees
+        that; stopping the walk early would pick a different subset run to run,
+        because the enumerator's order is unspecified. */
+    @Test func anOverCapDirectoryIsClippedDeterministically() throws {
+        let dir = try scratch()
+        for index in 0..<(ResourceFingerprint.maxEntries + 50) {
+            try Data("x".utf8)
+                .write(to: dir.appending(path: String(format: "f%05d", index)))
+        }
+        let first = ResourceFingerprint.capture(path: dir.path)
+        let second = ResourceFingerprint.capture(path: dir.path)
+        #expect(first.truncated)
+        #expect(first.exact == false)
+        #expect(first.entryCount == ResourceFingerprint.maxEntries)
+        #expect(first == second)
+    }
+
     @Test func missingThenPresentIsAppearedAndTheReverseIsDisappeared() throws {
         let dir = try scratch()
         let file = dir.appending(path: "later.sqlite")

@@ -26,7 +26,7 @@ import Testing
         #expect(error.code == .resourceMutated)
         #expect(
             error.message
-                == "resource 'd1' state at /p/state changed (it was replaced) while db stayed running under --no-pause. That server holds the old state open and can write its cached pages back over the change, so what is on disk is not what the command wrote."
+                == "resource 'd1' state at /p/state changed (it was replaced) while db stayed running under --no-pause. That server holds the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
         )
         #expect(
             error.hint == "devctl stop db && devctl lock d1 -- <command> && devctl ensure db")
@@ -44,6 +44,8 @@ import Testing
         #expect(
             error.hint
                 == "devctl stop db && devctl stop web && devctl lock d1 -- <command> && devctl ensure db && devctl ensure web")
+        /** Plural subject when more than one server stayed up. */
+        #expect(error.message.contains("Those servers hold the old state open"))
     }
 
     /** Under the default paused mode a change is the entire point, so it is

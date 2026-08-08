@@ -1613,7 +1613,8 @@ enum LockNotice {
     private static func pauseClause(_ holder: LockHolder) -> String {
         if holder.pause == false {
             guard let live = holder.live, !live.isEmpty else {
-                return " (it left declaring servers running, --no-pause)"
+                /** --no-pause with nothing running is not "it left servers up". */
+                return " (nothing was running, so --no-pause stopped nothing)"
             }
             return " (it left \(live.joined(separator: ", ")) running, --no-pause)"
         }
@@ -1659,7 +1660,7 @@ enum LockIdentityVerdict: Equatable {
                 code: .resourceMutated,
                 hint: "devctl stop \(servers.joined(separator: " && devctl stop ")) && devctl lock \(resource) -- <command> && devctl ensure \(servers.joined(separator: " && devctl ensure "))",
                 message:
-                    "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running under --no-pause. That server holds the old state open and can write its cached pages back over the change, so what is on disk is not what the command wrote."
+                    "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running under --no-pause. \(servers.count == 1 ? "That server holds" : "Those servers hold") the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
             ))
     }
 
@@ -1772,29 +1773,33 @@ struct Lock: AsyncParsableCommand {
             } catch let error as WireError where error.code == .resourceLocked {
                 lastError = error
                 let elapsed = Date().timeIntervalSince(started)
-                /** Ask who holds it once, then repeat on an interval so a long
-                    wait stays visibly bounded rather than silent. An older daemon
-                    without lock.status degrades to the bounded-wait line. */
-                let holder = try? await client.request(
-                    .lockStatus,
-                    params: LockStatusParams(project: project, resource: resource),
-                    expecting: LockStatusResult.self
-                ).holder
-                if let holder {
-                    if announcedAt == nil {
-                        Self.note(
-                            LockNotice.contended(
-                                budgetSeconds: acquireTimeout, holder: holder, now: Date(),
-                                resource: resource))
-                        announcedAt = elapsed
-                    } else if schedule.shouldAnnounceStillWaiting(
+                /** Only look the holder up when there is something to say. The
+                    notice fires once on first contention and then on an interval,
+                    so querying every retry would spend hundreds of round trips
+                    over a long wait to print nothing. */
+                let first = announcedAt == nil
+                let due =
+                    first
+                    || schedule.shouldAnnounceStillWaiting(
                         atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
-                    {
+                if due {
+                    /** An older daemon without lock.status degrades to silence
+                        here rather than failing the acquire. */
+                    let holder = try? await client.request(
+                        .lockStatus,
+                        params: LockStatusParams(project: project, resource: resource),
+                        expecting: LockStatusResult.self
+                    ).holder
+                    if let holder {
                         Self.note(
-                            LockNotice.stillWaiting(
-                                elapsedSeconds: elapsed, holder: holder,
-                                remainingSeconds: max(acquireTimeout - elapsed, 0),
-                                resource: resource))
+                            first
+                                ? LockNotice.contended(
+                                    budgetSeconds: acquireTimeout, holder: holder, now: Date(),
+                                    resource: resource)
+                                : LockNotice.stillWaiting(
+                                    elapsedSeconds: elapsed, holder: holder,
+                                    remainingSeconds: max(acquireTimeout - elapsed, 0),
+                                    resource: resource))
                         announcedAt = elapsed
                     }
                 }

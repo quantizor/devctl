@@ -111,7 +111,6 @@ public enum ResourceFingerprint {
         let root = URL(fileURLWithPath: path).resolvingSymlinksInPath()
         let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
         var entries: [(absolute: String, relative: String)] = []
-        var clipped = false
         if let walker = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles, .skipsPackageDescendants])
@@ -126,20 +125,17 @@ public enum ResourceFingerprint {
                     absolute.hasPrefix(prefix)
                     ? String(absolute.dropFirst(prefix.count)) : item.lastPathComponent
                 entries.append((absolute: absolute, relative: relative))
-                if entries.count > maxEntries * 4 {
-                    clipped = true
-                    break
-                }
             }
         }
-        /** Sort before clipping so a truncated manifest is still deterministic:
-            the enumerator's own order is unspecified, and clipping during the
-            walk would make two captures of one tree disagree. */
+        /** Sort before clipping so a truncated manifest is still deterministic.
+            The walk deliberately does not stop early: the enumerator's order is
+            unspecified, so breaking part way would pick a different subset run to
+            run and make the fingerprint of an unchanged tree differ from itself.
+            Collecting paths is cheap next to hashing them, and `maxDepth` already
+            bounds how far the walk goes. */
         entries.sort { $0.relative.utf8.lexicographicallyPrecedes($1.relative.utf8) }
-        if entries.count > maxEntries {
-            entries = Array(entries.prefix(maxEntries))
-            clipped = true
-        }
+        let clipped = entries.count > maxEntries
+        if clipped { entries = Array(entries.prefix(maxEntries)) }
         var budget = directoryContentBudget
         var exact = !clipped
         var bytes: Int64 = 0
