@@ -62,6 +62,37 @@ import Testing
         #expect(view.warnings.contains { $0.contains("both declare port 3000") })
     }
 
+    @Test func validationCatchesBadLifecycleCommands() {
+        /** `devctl switch` runs lifecycle argv locally, so a config the validator
+            would reject must not slip an empty command through to `/usr/bin/env`. */
+        let config = ProjectFileConfig(
+            lifecycle: ["switch": [["pnpm", "install"], [], [""]]],
+            servers: ["a": ProjectFileServer(command: ["x"])])
+        let view = ProjectConfigLoader.validate(config: config, project: "/p")
+        #expect(view.errors.contains { $0.contains("lifecycle 'switch' command 2 is empty") })
+        #expect(
+            view.errors.contains { $0.contains("lifecycle 'switch' command 3 has an empty executable") })
+        let ok = ProjectFileConfig(
+            lifecycle: ["switch": [["pnpm", "install"]]],
+            servers: ["a": ProjectFileServer(command: ["x"])])
+        #expect(ProjectConfigLoader.validate(config: ok, project: "/p").errors.isEmpty)
+    }
+
+    @Test func serverSpecValidationMirrorsFileChecks() {
+        /** The register path validates through ServerSpec.validationErrors; it must
+            catch the same per-spec problems the file validator does, plus a name
+            carrying the persisted-key separator. */
+        let bad = ServerSpec(
+            command: [],
+            healthcheck: HealthCheckSpec(port: 70000, type: .tcp),
+            name: "a::b")
+        let errors = bad.validationErrors()
+        #expect(errors.contains { $0.contains("must not contain '::'") })
+        #expect(errors.contains { $0.contains("command is empty") })
+        #expect(errors.contains { $0.contains("healthcheck.port") })
+        #expect(ServerSpec(command: ["x"], name: "web").validationErrors().isEmpty)
+    }
+
     @Test func bareLoopbackHostsWarnButDoNotFail() {
         let config = ProjectFileConfig(
             host: "localhost",

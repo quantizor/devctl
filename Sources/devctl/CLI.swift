@@ -223,7 +223,9 @@ struct Ensure: AsyncParsableCommand {
         let params = EnsureParams(
             name: name, port: port, project: global.resolvedProject(), timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.serverEnsure, params: params, expecting: EnsureResult.self)
+            try await client.request(
+                .serverEnsure, params: params, expecting: EnsureResult.self,
+                operationTimeoutSeconds: timeout)
         }
         CLIRunner.emit(result, json: global.json) { r in
             var text = CLIRunner.describe(r.server)
@@ -259,7 +261,9 @@ struct Wait: AsyncParsableCommand {
         let params = WaitParams(
             condition: condition, name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.serverWait, params: params, expecting: EnsureResult.self)
+            try await client.request(
+                .serverWait, params: params, expecting: EnsureResult.self,
+                operationTimeoutSeconds: timeout)
         }
         CLIRunner.emit(result, json: global.json) { r in
             if let reason = r.reason {
@@ -428,7 +432,9 @@ struct Restart: AsyncParsableCommand {
             names: name.map { [$0] }, port: port, project: global.resolvedProject(),
             timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.serverRestart, params: params, expecting: GroupResult.self)
+            try await client.request(
+                .serverRestart, params: params, expecting: GroupResult.self,
+                operationTimeoutSeconds: timeout)
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")
@@ -954,7 +960,9 @@ struct Up: AsyncParsableCommand {
             project: global.resolvedProject(),
             timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.groupUp, params: params, expecting: GroupResult.self)
+            try await client.request(
+                .groupUp, params: params, expecting: GroupResult.self,
+                operationTimeoutSeconds: timeout)
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.map { entry in
@@ -977,7 +985,11 @@ struct Down: AsyncParsableCommand {
     func run() async throws {
         let params = GroupParams(project: global.resolvedProject())
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.groupDown, params: params, expecting: GroupResult.self)
+            /** A deep dependency chain drains one wave at a time, each with its own
+                stop grace, so the client waits well past a single stop. */
+            try await client.request(
+                .groupDown, params: params, expecting: GroupResult.self,
+                operationTimeoutSeconds: 120)
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty
@@ -1750,7 +1762,8 @@ struct Switch: AsyncParsableCommand {
         }
         print("stopping servers…")
         _ = try? await CLIRunner.client().request(
-            .groupDown, params: GroupParams(project: project), expecting: GroupResult.self)
+            .groupDown, params: GroupParams(project: project), expecting: GroupResult.self,
+            operationTimeoutSeconds: 120)
         var switched = Self.git(["switch", branch], in: project)
         if switched.status != 0 {
             /** A remote-only branch needs a tracking checkout. */
@@ -1765,11 +1778,33 @@ struct Switch: AsyncParsableCommand {
                 json: global.json)
         }
         print("on \(branch)")
-        let playbook = (try? ProjectConfigLoader.load(project: project))
-            .flatMap { _ in try? JSONCoding.decoder().decode(
+        /** The lifecycle commands about to run come from the NEW branch's
+            devservers.json, so validate that file after the checkout, not before.
+            A config the daemon would refuse to load must not have its committed
+            argv executed: the previous shape discarded the validated view and
+            re-decoded the raw file, running lifecycle from a config `config
+            check` would reject. */
+        let validated: ProjectConfigView?
+        do {
+            validated = try ProjectConfigLoader.load(project: project)
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        }
+        if let view = validated, !view.errors.isEmpty {
+            CLIRunner.fail(
+                WireError(
+                    code: .configInvalid,
+                    hint: "run: devctl config check",
+                    message: "the branch's devservers.json is invalid, so its lifecycle was not run: \(view.errors.joined(separator: "; "))"),
+                json: global.json)
+        }
+        let playbook =
+            validated == nil
+            ? []
+            : (try? JSONCoding.decoder().decode(
                 ProjectFileConfig.self,
-                from: Data(contentsOf: ProjectConfigLoader.configURL(project: project))) }?
-            .lifecycle?["switch"] ?? []
+                from: Data(contentsOf: ProjectConfigLoader.configURL(project: project))))?
+                .lifecycle?["switch"] ?? []
         for argv in playbook {
             guard let executable = argv.first else { continue }
             print("lifecycle: \(argv.joined(separator: " "))")
@@ -1801,7 +1836,8 @@ struct Switch: AsyncParsableCommand {
             try await client.request(
                 .groupUp,
                 params: GroupParams(project: project, timeoutSeconds: timeout),
-                expecting: GroupResult.self)
+                expecting: GroupResult.self,
+                operationTimeoutSeconds: timeout)
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty

@@ -84,6 +84,42 @@ private func stopServer(router: Router, project: String, name: String) async {
         await stopServer(router: router, project: env.projectPath, name: "web")
     }
 
+    /** The trust gate. A malicious repo's devservers.json must never be
+        auto-started: boot restore resolves the committed spec but `prepareSpawn`
+        refuses it while the project's config has never been approved (no trust
+        flag), so the server stays down. The mirror of
+        `restoresConfigDefinedServerWithResumeIntent`, which sets trust and does
+        spawn; the only difference here is the missing approval. */
+    @Test func untrustedConfigDefinedServerIsNotRestored() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        /** Deliberately not trusted: no start-shaped command ever approved it. */
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .stopped
+            entry.resumeOnBoot = true
+            entry.pid = nil
+        }
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid == nil)
+        #expect(web?.phase != .running)
+        #expect(web?.phase != .starting)
+        /** Recover is autonomous, so it must not silently grant trust either. */
+        #expect(await registry.isTrusted(project: env.projectPath) == false)
+    }
+
     /** A rename leaves resume intent under the old name. Recover must drop the
         orphan row, not resurrect a ghost. */
     @Test func dropsOrphanStateWhenSpecMissing() async throws {
