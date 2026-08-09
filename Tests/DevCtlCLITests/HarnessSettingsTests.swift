@@ -17,6 +17,8 @@ import Testing
         let name = "stub"
         let settingsURL: URL
         func install(devctlPath: String) throws -> String { "" }
+        func uninstall() throws -> String { "" }
+        func hookState() -> HarnessHookState { .harnessAbsent }
     }
 
     private func inScratch(_ body: (StubAdapter) throws -> Void) throws {
@@ -92,5 +94,103 @@ import Testing
             let loaded = try adapter.loadSettings()
             #expect(loaded["keep"] as? String == "me")
         }
+    }
+
+    private func inScratchDir(_ body: (URL) throws -> Void) throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-harness-real-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try body(dir)
+    }
+
+    /** Install then uninstall leaves the file byte-for-byte as it started, and
+        preserves an unrelated setting throughout: the round trip must not clobber
+        what the user owns. */
+    @Test func claudeInstallThenUninstallRestoresAndKeepsOtherSettings() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "settings.json")
+            try Data(#"{"model":"opus"}"#.utf8).write(to: settings)
+            let adapter = ClaudeCodeAdapter(settingsURLOverride: settings)
+
+            _ = try adapter.install(devctlPath: "/opt/homebrew/bin/devctl")
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == "/opt/homebrew/bin/devctl")
+                #expect(!exists)  // that path is not on this machine
+            } else {
+                Issue.record("expected the hook to read as installed")
+            }
+            let afterInstall = try adapter.loadSettings()
+            #expect(afterInstall["model"] as? String == "opus")
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("removed"))
+            #expect(adapter.hookState() == .notInstalled)
+            let afterUninstall = try adapter.loadSettings()
+            #expect(afterUninstall["model"] as? String == "opus")
+            /** The whole `hooks` key is gone once it held only devctl's hook, so
+                the file is back to just what the user had. */
+            #expect(afterUninstall["hooks"] == nil)
+        }
+    }
+
+    @Test func claudeUninstallWithoutAHookIsANoOp() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "settings.json")
+            try Data(#"{"model":"opus"}"#.utf8).write(to: settings)
+            let adapter = ClaudeCodeAdapter(settingsURLOverride: settings)
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("not present"))
+            #expect(try adapter.loadSettings()["model"] as? String == "opus")
+        }
+    }
+
+    @Test func claudeUninstallKeepsAForeignHookInTheSameEntry() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "settings.json")
+            let adapter = ClaudeCodeAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "hooks": [
+                    "SessionStart": [
+                        [
+                            "hooks": [
+                                ["command": "/x/devctl hook claude-session-start", "type": "command"],
+                                ["command": "/other/tool run", "type": "command"],
+                            ],
+                            "matcher": "startup",
+                        ]
+                    ]
+                ]
+            ])
+            _ = try adapter.uninstall()
+            let loaded = try adapter.loadSettings()
+            let entries = (loaded["hooks"] as? [String: Any])?["SessionStart"] as? [[String: Any]]
+            let commands =
+                (entries?.first?["hooks"] as? [[String: Any]])?.compactMap { $0["command"] as? String }
+                ?? []
+            #expect(commands == ["/other/tool run"])
+        }
+    }
+
+    @Test func cursorInstallThenUninstallRoundTrips() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks.json")
+            let adapter = CursorAdapter(settingsURLOverride: settings)
+            _ = try adapter.install(devctlPath: "/opt/homebrew/bin/devctl")
+            if case .installed(let path, _) = adapter.hookState() {
+                #expect(path == "/opt/homebrew/bin/devctl")
+            } else {
+                Issue.record("expected the cursor hook to read as installed")
+            }
+            _ = try adapter.uninstall()
+            #expect(adapter.hookState() == .notInstalled)
+        }
+    }
+
+    @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
+        let missing = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-absent-\(UUID().uuidString)/settings.json")
+        let adapter = ClaudeCodeAdapter(settingsURLOverride: missing)
+        #expect(adapter.hookState() == .harnessAbsent)
     }
 }

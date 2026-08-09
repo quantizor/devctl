@@ -69,11 +69,29 @@ enum HookContext {
 /** A harness adapter owns one agent harness's settings format and injection
     mechanism. Adding a harness = one new conformer + a registry entry (see
     CONTRIBUTING.md). The context payload itself is harness-agnostic. */
+/** What `devctl doctor` found about one harness's hook. Reporting only: doctor
+    names the fix but never edits a file the user owns. */
+enum HarnessHookState: Equatable, Sendable {
+    /** The harness itself is not installed on this machine; nothing to say. */
+    case harnessAbsent
+    /** A devctl hook is present, recording this command path; `pathExists` is
+        whether that path still resolves to an executable on disk. */
+    case installed(path: String, pathExists: Bool)
+    /** The harness is present but carries no devctl hook. */
+    case notInstalled
+}
+
 protocol HarnessAdapter: Sendable {
     /** Idempotently wires the session hook into the harness's settings. Returns
         a human summary of what changed. */
     func install(devctlPath: String) throws -> String
+    /** What doctor should report about this harness's hook, read-only. */
+    func hookState() -> HarnessHookState
     var name: String { get }
+    /** Idempotently removes devctl's session hook from the harness's settings,
+        leaving everything else the file holds untouched. Returns a human summary,
+        including the no-op case where no devctl hook was present. */
+    func uninstall() throws -> String
     /** The harness's own settings file. devctl edits it in place and never owns
         it, so everything devctl does not recognize has to survive the write. */
     var settingsURL: URL { get }
@@ -120,6 +138,19 @@ extension HarnessAdapter {
         try data.write(to: settingsURL)
     }
 
+    /** The harness is "present" when its settings directory exists, which is how
+        `SetupPlanner.harnessOffers` decides a harness is worth offering. */
+    var harnessPresent: Bool {
+        FileManager.default.fileExists(atPath: settingsURL.deletingLastPathComponent().path)
+    }
+
+    /** Extract the recorded command path from a hook command of the form
+        `<path> hook <name>-session-start`, robust to spaces in the path. */
+    func recordedPath(from command: String, suffix: String) -> String? {
+        guard command.hasSuffix(suffix) else { return nil }
+        return String(command.dropLast(suffix.count))
+    }
+
     private func refusal(because reason: String) -> WireError {
         WireError(
             code: .configInvalid,
@@ -159,9 +190,14 @@ enum HookSessionCwd {
     clobbering existing hooks. */
 struct ClaudeCodeAdapter: HarnessAdapter {
     let name = "claude"
+    /** Overridable so tests can point at a scratch file; nil means the real
+        `~/.claude/settings.json`. */
+    var settingsURLOverride: URL?
 
     var settingsURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appending(path: ".claude/settings.json")
+        settingsURLOverride
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(
+                path: ".claude/settings.json")
     }
 
     func install(devctlPath: String) throws -> String {
@@ -193,6 +229,65 @@ struct ClaudeCodeAdapter: HarnessAdapter {
         return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
     }
 
+    func uninstall() throws -> String {
+        var settings = try loadSettings()
+        guard var hooks = settings["hooks"] as? [String: Any],
+            var sessionStart = hooks["SessionStart"] as? [[String: Any]]
+        else {
+            return "Claude Code SessionStart hook not present (\(settingsURL.path))"
+        }
+        var removed = false
+        sessionStart = sessionStart.compactMap { entry in
+            guard var entryHooks = entry["hooks"] as? [[String: Any]] else { return entry }
+            let before = entryHooks.count
+            entryHooks.removeAll { hook in
+                ((hook["command"] as? String) ?? "").contains("devctl hook claude-session-start")
+            }
+            if entryHooks.count != before { removed = true }
+            /** An entry left with no hooks held only devctl's, so drop it whole
+                rather than leaving a matcher pointing at nothing. */
+            if entryHooks.isEmpty { return nil }
+            var updated = entry
+            updated["hooks"] = entryHooks
+            return updated
+        }
+        guard removed else {
+            return "Claude Code SessionStart hook not present (\(settingsURL.path))"
+        }
+        if sessionStart.isEmpty {
+            hooks.removeValue(forKey: "SessionStart")
+        } else {
+            hooks["SessionStart"] = sessionStart
+        }
+        if hooks.isEmpty {
+            settings.removeValue(forKey: "hooks")
+        } else {
+            settings["hooks"] = hooks
+        }
+        try writeSettings(settings)
+        return "Claude Code SessionStart hook removed from \(settingsURL.path)"
+    }
+
+    func hookState() -> HarnessHookState {
+        guard harnessPresent else { return .harnessAbsent }
+        let suffix = " hook claude-session-start"
+        guard let settings = try? loadSettings(),
+            let hooks = settings["hooks"] as? [String: Any],
+            let sessionStart = hooks["SessionStart"] as? [[String: Any]]
+        else { return .notInstalled }
+        for entry in sessionStart {
+            for hook in (entry["hooks"] as? [[String: Any]]) ?? [] {
+                if let command = hook["command"] as? String,
+                    let path = recordedPath(from: command, suffix: suffix)
+                {
+                    return .installed(
+                        path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+                }
+            }
+        }
+        return .notInstalled
+    }
+
     /** Rewrite a prior install whose command path no longer resolves (e.g. a
         bare `devctl` that was resolved relative to cwd at install time). */
     private func repairClaudeSessionStart(sessionStart: inout [[String: Any]], command: String)
@@ -220,9 +315,13 @@ struct ClaudeCodeAdapter: HarnessAdapter {
     existing entries. Emits {additional_context} (snake_case; Cursor's schema). */
 struct CursorAdapter: HarnessAdapter {
     let name = "cursor"
+    /** Overridable so tests can point at a scratch file; nil means the real
+        `~/.cursor/hooks.json`. */
+    var settingsURLOverride: URL?
 
     var settingsURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appending(path: ".cursor/hooks.json")
+        settingsURLOverride
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".cursor/hooks.json")
     }
 
     func install(devctlPath: String) throws -> String {
@@ -248,6 +347,53 @@ struct CursorAdapter: HarnessAdapter {
         settings["hooks"] = hooks
         try writeSettings(settings)
         return "Cursor sessionStart hook installed in \(settingsURL.path)"
+    }
+
+    func uninstall() throws -> String {
+        var settings = try loadSettings()
+        guard var hooks = settings["hooks"] as? [String: Any],
+            var sessionStart = hooks["sessionStart"] as? [[String: Any]]
+        else {
+            return "Cursor sessionStart hook not present (\(settingsURL.path))"
+        }
+        let before = sessionStart.count
+        sessionStart.removeAll { entry in
+            ((entry["command"] as? String) ?? "").contains("devctl hook cursor-session-start")
+        }
+        guard sessionStart.count != before else {
+            return "Cursor sessionStart hook not present (\(settingsURL.path))"
+        }
+        if sessionStart.isEmpty {
+            hooks.removeValue(forKey: "sessionStart")
+        } else {
+            hooks["sessionStart"] = sessionStart
+        }
+        if hooks.isEmpty {
+            settings.removeValue(forKey: "hooks")
+        } else {
+            settings["hooks"] = hooks
+        }
+        /** `version` is Cursor's own schema field, not devctl's, so it stays. */
+        try writeSettings(settings)
+        return "Cursor sessionStart hook removed from \(settingsURL.path)"
+    }
+
+    func hookState() -> HarnessHookState {
+        guard harnessPresent else { return .harnessAbsent }
+        let suffix = " hook cursor-session-start"
+        guard let settings = try? loadSettings(),
+            let hooks = settings["hooks"] as? [String: Any],
+            let sessionStart = hooks["sessionStart"] as? [[String: Any]]
+        else { return .notInstalled }
+        for entry in sessionStart {
+            if let command = entry["command"] as? String,
+                let path = recordedPath(from: command, suffix: suffix)
+            {
+                return .installed(
+                    path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+            }
+        }
+        return .notInstalled
     }
 
     private func repairCursorSessionStart(sessionStart: inout [[String: Any]], command: String)

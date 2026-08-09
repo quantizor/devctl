@@ -15,7 +15,8 @@ struct DevCtl: AsyncParsableCommand {
             ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
             HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self,
             Restart.self, Start.self,
-            Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self, Unregister.self, Up.self,
+            Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self,
+            Uninstall.self, Unregister.self, Up.self,
             Wait.self, Why.self, XURL.self, DaemonCommand.self,
         ]
     )
@@ -737,7 +738,10 @@ struct HookCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hook",
         abstract: "Agent-harness session hooks.",
-        subcommands: [HookInstall.self, HookClaudeSessionStart.self, HookCursorSessionStart.self]
+        subcommands: [
+            HookInstall.self, HookUninstall.self, HookClaudeSessionStart.self,
+            HookCursorSessionStart.self,
+        ]
     )
 }
 
@@ -745,6 +749,13 @@ struct HookInstall: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "install",
         abstract: "Wire the session-start context hook into an agent harness (idempotent).")
+
+    /** Absolute path to record in the hook command, overriding this binary's own
+        resolved path. The menu bar app passes the CLI owner's path (brew's shim
+        under a cask) so the hook points at a stable, on-PATH location instead of
+        the internal bundle path this binary resolves to. */
+    @Option(help: "Absolute devctl path to record in the hook (default: this binary's path).")
+    var devctlPath: String?
 
     @OptionGroup var global: GlobalOptions
 
@@ -763,7 +774,15 @@ struct HookInstall: AsyncParsableCommand {
                     message: "unknown harness '\(harness)'"),
                 json: global.json)
         }
-        let devctlPath = CLISelf.path
+        if let override = devctlPath, !override.hasPrefix("/") {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "pass an absolute path, e.g. --devctl-path /opt/homebrew/bin/devctl",
+                    message: "--devctl-path must be absolute, got '\(override)'"),
+                json: global.json)
+        }
+        let devctlPath = devctlPath ?? CLISelf.path
         do {
             let summary = try adapter.install(devctlPath: devctlPath)
             var output = summary
@@ -786,6 +805,47 @@ struct HookInstall: AsyncParsableCommand {
                 WireError(code: .internalError, message: "hook install failed: \(error)"),
                 json: global.json)
         }
+    }
+}
+
+struct HookUninstall: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "uninstall",
+        abstract: "Remove devctl's session hook from an agent harness (idempotent).")
+
+    @OptionGroup var global: GlobalOptions
+
+    /** Omitted means every harness, so a plain `hook uninstall` cleans up
+        wherever devctl wrote a hook rather than only the default one. */
+    @Option(help: "Harness to remove from: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: all).")
+    var harness: String?
+
+    func run() async throws {
+        let adapters: [any HarnessAdapter]
+        if let harness {
+            guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
+                CLIRunner.fail(
+                    WireError(
+                        code: .usage,
+                        hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", "))",
+                        message: "unknown harness '\(harness)'"),
+                    json: global.json)
+            }
+            adapters = [adapter]
+        } else {
+            adapters = harnessAdapters
+        }
+        var summaries: [String] = []
+        for adapter in adapters {
+            do {
+                summaries.append(try adapter.uninstall())
+            } catch {
+                CLIRunner.fail(
+                    WireError(code: .internalError, message: "hook uninstall failed: \(error)"),
+                    json: global.json)
+            }
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in summaries.joined(separator: "\n") }
     }
 }
 
@@ -1336,6 +1396,45 @@ struct Doctor: AsyncParsableCommand {
                 }
             }
         }
+        /** Update check: read the shared cache, refreshing only when stale, so a
+            machine where the menu bar app never runs still learns about a release
+            without doctor hitting the network every time. Silent on failure. */
+        if let update = await UpdateCheck.refreshIfStale(), update.updateAvailable {
+            findings.append(
+                Finding(
+                    detail:
+                        "devctl \(update.latestVersion) is available (you have \(update.currentVersion)); upgrade with `brew upgrade --cask \(DevCtlDistribution.homebrewCaskToken)` or download from \(DevCtlDistribution.releasesLatestURL)",
+                    kind: "update", severity: "info"))
+        }
+
+        /** Harness hooks: report only, never repair. devctl does not edit a file
+            the user owns, so a drifted hook is surfaced with the exact command to
+            fix it and nothing more. */
+        for adapter in harnessAdapters {
+            switch adapter.hookState() {
+            case .harnessAbsent:
+                break
+            case .installed(let path, let pathExists):
+                if pathExists {
+                    findings.append(
+                        Finding(
+                            detail: "\(adapter.name) session hook installed (\(path))",
+                            kind: "harness-hook", severity: "ok"))
+                } else {
+                    findings.append(
+                        Finding(
+                            detail:
+                                "\(adapter.name) session hook points at \(path), which no longer exists (run: devctl hook install --harness \(adapter.name), or devctl hook uninstall --harness \(adapter.name))",
+                            kind: "harness-hook", severity: "warning"))
+                }
+            case .notInstalled:
+                findings.append(
+                    Finding(
+                        detail:
+                            "\(adapter.name) detected without a devctl session hook (run: devctl hook install --harness \(adapter.name))",
+                        kind: "harness-hook", severity: "info"))
+            }
+        }
         if global.json {
             struct Report: Codable {
                 var findings: [Finding]
@@ -1349,6 +1448,66 @@ struct Doctor: AsyncParsableCommand {
         if findings.contains(where: { $0.severity == "error" }) {
             Foundation.exit(1)
         }
+    }
+}
+
+/** The one uninstall verb. Stops nothing that is running: the daemon shuts down
+    and its children survive it. Removes the background agent, then agent hooks,
+    then the CLI/daemon binaries devctl itself installed, keeping data unless
+    `--purge`. `--agent-only` stops after the agent, which is what the Homebrew
+    cask calls on every upgrade, so it must never touch hooks or user data. */
+struct Uninstall: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract:
+            "Remove devctl: unregister the agent, remove hooks and the CLI (running servers keep going; data kept unless --purge).")
+
+    @Flag(help: "Only unregister the background agent; leave hooks, CLI, and data in place.")
+    var agentOnly = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Flag(help: "Also delete devctl's data and logs.")
+    var purge = false
+
+    struct UninstallResult: Codable {
+        var actions: [String]
+        var agentOnly: Bool
+        var purged: Bool
+    }
+
+    func run() async throws {
+        let paths = DevCtlPaths()
+        var actions: [String] = []
+
+        /** Agent + launchd job (and any legacy home plist) first. Data purge is
+            handled below, not here, so ordering stays explicit and data is the
+            last thing to go. */
+        await LaunchdAdmin.uninstall(paths: paths, purge: false)
+        actions.append("unregistered the background agent")
+
+        if !agentOnly {
+            for adapter in harnessAdapters {
+                if let summary = try? adapter.uninstall() { actions.append(summary) }
+            }
+            /** Only the copies devctl installed, at `~/.local/bin`. A Homebrew
+                install keeps its CLI in brew's bin under brew's ownership, so
+                these paths simply do not exist there and this is a no-op; the
+                cask's own uninstall removes brew's symlink. */
+            for url in [SetupPlanner.installedCLIURL(), SetupPlanner.installedDaemonSiblingURL()]
+            where FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.removeItem(at: url)
+                actions.append("removed \(url.path)")
+            }
+        }
+
+        if purge && !agentOnly {
+            try? FileManager.default.removeItem(at: paths.dataDir)
+            try? FileManager.default.removeItem(at: paths.logsDir)
+            actions.append("removed data and logs")
+        }
+
+        let result = UninstallResult(actions: actions, agentOnly: agentOnly, purged: purge && !agentOnly)
+        CLIRunner.emit(result, json: global.json) { r in r.actions.joined(separator: "\n") }
     }
 }
 
@@ -1409,9 +1568,12 @@ struct DaemonInstall: AsyncParsableCommand {
     }
 }
 
+/** Deprecated alias for `devctl uninstall --agent-only` (plus `--purge` for data).
+    Kept working because the CLI JSON contract is a public surface; the notice
+    goes to stderr so `--json` stdout stays clean for agents parsing it. */
 struct DaemonUninstall: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        commandName: "uninstall", abstract: "Stop the daemon and remove the launchd agent.")
+        commandName: "uninstall", abstract: "Deprecated: use `devctl uninstall`.")
 
     @OptionGroup var global: GlobalOptions
 
@@ -1419,6 +1581,10 @@ struct DaemonUninstall: AsyncParsableCommand {
     var purge = false
 
     func run() async throws {
+        FileHandle.standardError.write(
+            Data(
+                "devctl: `devctl daemon uninstall` is deprecated; use `devctl uninstall` (or `devctl uninstall --agent-only` to remove just the agent)\n"
+                    .utf8))
         await LaunchdAdmin.uninstall(paths: DevCtlPaths(), purge: purge)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             purge ? "devctld uninstalled; data and logs removed" : "devctld uninstalled"
