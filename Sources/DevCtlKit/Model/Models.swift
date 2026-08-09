@@ -247,6 +247,34 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         self.waitFor = waitFor
         self.watch = watch
     }
+
+    /** Per-spec config-check messages for a spec entering the daemon directly
+        through `server.register`, where the project-file validator never runs.
+        Mirrors the per-server checks `ProjectConfigLoader.validate` applies to a
+        committed entry, so one of the two ways a spec reaches the daemon can no
+        longer accept a spec the other would refuse. Cross-spec checks (unknown
+        dependency, cycles) are the file validator's job and are not decidable
+        from a single spec. */
+    public func validationErrors() -> [String] {
+        var errors: [String] = []
+        if name.isEmpty {
+            errors.append("server name is empty")
+        }
+        /** `::` is the separator devctl uses to build a persisted server key
+            from a project path and a server name, so a name carrying it splits
+            back into the wrong project and server. */
+        if name.contains("::") {
+            errors.append("server '\(name)': name must not contain '::'")
+        }
+        if command.isEmpty {
+            errors.append("server '\(name)': command is empty")
+        }
+        for error in healthcheck?.validationErrors() ?? [] {
+            errors.append("server '\(name)': \(error)")
+        }
+        errors.append(contentsOf: PortClaim.configErrors(spec: self))
+        return errors
+    }
 }
 
 /** Exit forensics for a server that ran and then died. */

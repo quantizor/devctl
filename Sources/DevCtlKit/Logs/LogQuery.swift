@@ -41,17 +41,92 @@ public enum LogQuery {
         return files
     }
 
-    /** Why a caller-supplied grep pattern will not compile, or nil when it will.
-        Callers validate before querying: a pattern the engine cannot compile must
-        not silently degrade into "no filter", because returning every line reads
-        exactly like a query that matched everything. */
+    /** Why a caller-supplied grep pattern must be refused, or nil when it is safe
+        to run. Callers validate before querying: a pattern the engine cannot
+        compile must not silently degrade into "no filter", because returning
+        every line reads exactly like a query that matched everything. A pattern
+        that compiles but nests an unbounded quantifier inside another is refused
+        too: Swift's `Regex` backtracks, so `^(a+)+$` against a handful of
+        characters runs for seconds and against a longer line never returns,
+        wedging the log actor while it churns. The match runs per line, so this
+        screen is the only place to stop it before it starts. */
     public static func grepRejection(_ pattern: String) -> String? {
         do {
             _ = try Regex(pattern)
-            return nil
         } catch {
             return String(describing: error)
         }
+        if nestsUnboundedQuantifier(pattern) {
+            return
+                "'\(pattern)' repeats a group that itself repeats without bound (like (a+)+), which can make the log reader run for minutes on a single line; rewrite it without the nested repeat"
+        }
+        return nil
+    }
+
+    /** True when an unbounded quantifier (`*`, `+`, `{n,}`) is applied to a group
+        whose body already contains an unbounded quantifier: the exponential
+        backtracking family. A lexical scan rather than a full parser, tuned to
+        reject that shape while leaving common safe patterns alone: a bounded
+        outer repeat (`(a+){2}`), disjoint alternation (`(foo|bar)+`), a class
+        (`[a-z]+`), and any top-level quantifier (`error.*failed`) are all fine
+        because none nests an unbounded repeat inside a repeated group. */
+    static func nestsUnboundedQuantifier(_ pattern: String) -> Bool {
+        let chars = Array(pattern)
+        /** One flag per open group: does its body hold an unbounded quantifier. */
+        var groupHasUnbounded: [Bool] = []
+        var inClass = false
+        var index = 0
+        func unboundedBraceLength(at start: Int) -> Int? {
+            /** `{n,}` is unbounded; `{n}` and `{n,m}` are not. Returns the token
+                length when unbounded so the caller can also treat it as applying
+                to whatever precedes it. */
+            guard start < chars.count, chars[start] == "{" else { return nil }
+            var cursor = start + 1
+            var digits = 0
+            while cursor < chars.count, chars[cursor].isNumber { cursor += 1; digits += 1 }
+            guard digits > 0, cursor < chars.count, chars[cursor] == "," else { return nil }
+            cursor += 1
+            guard cursor < chars.count, chars[cursor] == "}" else { return nil }
+            return cursor - start + 1
+        }
+        while index < chars.count {
+            let char = chars[index]
+            if char == "\\" { index += 2; continue }
+            if inClass {
+                if char == "]" { inClass = false }
+                index += 1
+                continue
+            }
+            switch char {
+            case "[":
+                inClass = true
+            case "(":
+                groupHasUnbounded.append(false)
+            case ")":
+                let innerUnbounded = groupHasUnbounded.popLast() ?? false
+                let next = index + 1 < chars.count ? chars[index + 1] : nil
+                let appliedUnbounded =
+                    next == "*" || next == "+" || unboundedBraceLength(at: index + 1) != nil
+                if appliedUnbounded && innerUnbounded { return true }
+                /** A quantified group is itself an unbounded repeat inside its
+                    parent, so propagate upward. */
+                if appliedUnbounded, !groupHasUnbounded.isEmpty {
+                    groupHasUnbounded[groupHasUnbounded.count - 1] = true
+                }
+            case "*", "+":
+                if !groupHasUnbounded.isEmpty {
+                    groupHasUnbounded[groupHasUnbounded.count - 1] = true
+                }
+            case "{":
+                if unboundedBraceLength(at: index) != nil, !groupHasUnbounded.isEmpty {
+                    groupHasUnbounded[groupHasUnbounded.count - 1] = true
+                }
+            default:
+                break
+            }
+            index += 1
+        }
+        return false
     }
 
     /** Counts records on the given streams and brackets them in time, without

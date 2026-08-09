@@ -16,6 +16,15 @@ public actor DaemonClient {
 
     private let socketPath: String
 
+    /** How long a single request waits for the daemon to answer before giving
+        up. The daemon sends nothing between the request and its one response, so
+        this is a whole-response deadline, not an idle gap: without it a wedged
+        daemon (a blocked actor, a deadlock) hangs `devctl` and the app forever,
+        with no output and no way out. `request` raises it for a command that
+        carries its own timeout so a long but healthy `ensure`, `wait`, or group
+        rollout is never cut off. */
+    private static let defaultResponseTimeout: Double = 120
+
     public init(socketPath: String) {
         self.socketPath = socketPath
     }
@@ -57,6 +66,7 @@ public actor DaemonClient {
             )
         }
         fd = sock
+        setResponseTimeout(Self.defaultResponseTimeout)
         /** The socket is open but unproven from here, and `fd >= 0` is what the
             guard above reads as "already connected". So every failing exit has
             to put the client back to disconnected: leaving a live fd behind with
@@ -99,12 +109,32 @@ public actor DaemonClient {
         pending = []
     }
 
+    /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
+        fails with `EAGAIN` once no data arrives within the window. */
+    private func setResponseTimeout(_ seconds: Double) {
+        guard fd >= 0 else { return }
+        let whole = seconds.rounded(.down)
+        var tv = timeval(
+            tv_sec: Int(whole),
+            tv_usec: Int32((seconds - whole) * 1_000_000))
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
+    /** `operationTimeoutSeconds` is the command's own health/wait budget, when it
+        has one. The response deadline is set well above it so a legitimately long
+        `ensure`/`wait`/group rollout (including a few dependency waves) is never
+        cut off, while a wedged daemon still fails in bounded time. */
     public func request<P: Codable & Sendable, R: Codable & Sendable>(
         _ method: WireMethod,
         params: P,
-        expecting: R.Type
+        expecting: R.Type,
+        operationTimeoutSeconds: Double? = nil
     ) throws -> R {
         try connect()
+        if let operationTimeoutSeconds {
+            setResponseTimeout(max(Self.defaultResponseTimeout, operationTimeoutSeconds * 2 + 60))
+        }
+        defer { setResponseTimeout(Self.defaultResponseTimeout) }
         nextID += 1
         let id = "c\(nextID)"
         let line = try NDJSON.encodeLine(WireRequest(id: id, method: method.rawValue, params: params))
@@ -136,6 +166,12 @@ public actor DaemonClient {
             }
             if n < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    throw WireError(
+                        code: .daemonUnreachable,
+                        hint: "run: devctl daemon restart",
+                        message: "devctld did not answer in time; it may be wedged")
+                }
                 throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(errno)))")
             }
             pending.append(contentsOf: buffer.feed(Data(scratch[0..<n])))

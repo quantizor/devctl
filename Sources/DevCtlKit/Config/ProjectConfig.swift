@@ -259,6 +259,22 @@ public enum ProjectConfigLoader {
         case .cycle(let names):
             view.errors.append("dependency cycle: \(names.joined(separator: " -> "))")
         }
+        /** `lifecycle` is the one config field the daemon never spawns; `devctl
+            switch` runs its argv locally. It was also the one field this
+            validator skipped, so a playbook with an empty command reached
+            `/usr/bin/env` with no executable. Checked here so `config check`
+            rejects it and `switch` refuses to run it. */
+        for (playbook, commands) in (config.lifecycle ?? [:]).sorted(by: { $0.key < $1.key }) {
+            for (index, argv) in commands.enumerated() {
+                if argv.isEmpty {
+                    view.errors.append(
+                        "lifecycle '\(playbook)' command \(index + 1) is empty")
+                } else if argv[0].isEmpty {
+                    view.errors.append(
+                        "lifecycle '\(playbook)' command \(index + 1) has an empty executable")
+                }
+            }
+        }
         view.specs = specs
         view.warnings = warnings
         return view

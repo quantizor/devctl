@@ -105,6 +105,30 @@ import Testing
         #expect(LogQuery.run(current: current, options: LogQueryOptions(grep: "(unbalanced")).isEmpty)
     }
 
+    @Test func catastrophicBacktrackingPatternsAreRejected() throws {
+        /** Swift's Regex backtracks, so a group that repeats a group that itself
+            repeats runs for seconds on a short line and never returns on a long
+            one, wedging the log actor. These compile, so only the ReDoS screen
+            stops them. Each is refused before it ever runs. */
+        for pattern in ["^(a+)+$", "(a*)*", "(.*)+", "(a+)*$", "(\\d+)+", "(ab+)+"] {
+            #expect(LogQuery.grepRejection(pattern) != nil, "expected \(pattern) rejected")
+            #expect(LogQuery.nestsUnboundedQuantifier(pattern), "expected \(pattern) flagged")
+        }
+    }
+
+    @Test func safePatternsAreNotRejectedByTheReDoSScreen() throws {
+        /** Common log-grep shapes carry no nested unbounded repeat and must keep
+            working: a top-level quantifier, disjoint alternation, a character
+            class, a bounded outer repeat, and a plain literal. */
+        for pattern in [
+            "error.*failed", "(foo|bar)+", "[a-z]+", "(a+){2}", "(a+)?", "\\bwarn\\b",
+            "GET /api/\\d+", "timeout|refused",
+        ] {
+            #expect(!LogQuery.nestsUnboundedQuantifier(pattern), "expected \(pattern) allowed")
+            #expect(LogQuery.grepRejection(pattern) == nil, "expected \(pattern) accepted")
+        }
+    }
+
     @Test func summarizeCountsAndBracketsErrorStream() throws {
         let lines = [
             record(1, .out, "listening"),
