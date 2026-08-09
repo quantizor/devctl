@@ -1,0 +1,117 @@
+# Updates the Homebrew tap cask after a release DMG is published.
+#
+# Kicked by "Release DMG" via workflow_dispatch once the DMG is uploaded (a
+# GITHUB_TOKEN release does not fire release:published on other workflows, so the
+# explicit dispatch is the real path; release:published stays as a manual / PAT
+# fallback). Runs on ubuntu (no brew, no macOS minutes): it needs only the DMG's
+# checksum and a git push.
+#
+# The cask's structure lives in devctl's packaging/homebrew/devctl.rb; this job
+# only injects the release's version and sha256, so there is one home for the
+# cask and the tap is a generated artifact.
+#
+# Requires a repository secret HOMEBREW_TAP_TOKEN: a fine-grained PAT with
+# contents:write on quantizor/homebrew-tap (the default GITHUB_TOKEN cannot push
+# across repos). A GitHub App token via actions/create-github-app-token is the
+# equivalent alternative. Note dawidd6/action-homebrew-bump-formula is
+# formula-only despite being the action usually linked for this.
+name: Bump Homebrew cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump the cask to (e.g. v1.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-homebrew-cask
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Update the tap cask
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ -n "${TAG:-}" ]] || { echo "no tag provided" >&2; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout devctl at the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          path: devctl
+
+      - name: Verify the DMG asset exists and download it
+        id: dmg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET="devctl-${VERSION}.dmg"
+          # Fail fast if the DMG is not attached yet: the release DMG build must
+          # finish first, and shipping a cask whose URL 404s is worse than waiting.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+              --jq '.assets[].name' | grep -qx "$ASSET"; then
+            echo "Release $TAG has no asset $ASSET yet; run this after the DMG build finishes." >&2
+            exit 1
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir .
+          echo "sha=$(sha256sum "$ASSET" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the tap
+        uses: actions/checkout@v4
+        with:
+          repository: quantizor/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Rewrite the cask from the template
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          SHA: ${{ steps.dmg.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Casks
+          # Ruby, not `sed -i`: sub! returns nil on no match, so a drifted
+          # template aborts the job, where sed would exit 0 on zero matches and
+          # ship a cask still pointing at the previous version and checksum.
+          ruby -e '
+            version = ENV.fetch("VERSION")
+            sha = ENV.fetch("SHA")
+            text = File.read("devctl/packaging/homebrew/devctl.rb")
+            text.sub!(/version "[^"]*"/, %(version "#{version}")) or abort("version stanza not found in template")
+            text.sub!(/sha256 "[^"]*"/, %(sha256 "#{sha}")) or abort("sha256 stanza not found in template")
+            File.write("tap/Casks/devctl.rb", text)
+          '
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Casks/devctl.rb; then
+            echo "cask already at ${VERSION}; nothing to push"
+            exit 0
+          fi
+          git add Casks/devctl.rb
+          git commit -m "devctl ${VERSION}"
+          git push

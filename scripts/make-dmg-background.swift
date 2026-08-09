@@ -6,7 +6,9 @@ import AppKit
 import Foundation
 
 let width: CGFloat = 560
-let height: CGFloat = 380
+/** Kept in step with the container window bounds in make-dmg.sh, which is the
+    only place the window size is actually set. */
+let height: CGFloat = 400
 
 guard CommandLine.arguments.count > 1 else {
     FileHandle.standardError.write(Data("make-dmg-background: missing output directory\n".utf8))
@@ -48,25 +50,46 @@ func render(scale: CGFloat) -> Data? {
 
     /** The context has a bottom-left origin, so each rect's y is measured up from
         the bottom while the text itself lays out downward from the rect's top.
-        The Finder icon sits centered at 125 points down from the window's top. */
+
+        Reading order is the instruction, then the thing to do it to, then what
+        the thing is: "the app" sits directly above the icon it names, and the
+        supporting text below the icon reads as one block.
+
+        The one number nothing here can read is the icon's position, which lives
+        in make-dmg.sh. It is centered at 162, so its box runs 98 to 226, and
+        Finder draws the item NAME beneath that: measured on a mounted volume,
+        those glyphs sit 16 to 29 points below the icon box with a background a
+        few points further, so the label owns roughly 242 to 258. That label is
+        invisible in this PNG, and text placed to clear the icon alone once
+        shipped overlapping the word "devctl". Move the icon and every offset
+        below has to move with it. */
+    let tagline = NSAttributedString(
+        string: "An agent-friendly coordinator for many devservers\nand their unique configurations.",
+        attributes: [
+            .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+            .foregroundColor: NSColor(calibratedWhite: 0.302, alpha: 1),
+            .paragraphStyle: paragraph,
+        ])
+    tagline.draw(in: NSRect(x: 40, y: height - 282 - 36, width: width - 80, height: 36))
+
     let heading = NSAttributedString(
-        string: "Double-click to install",
+        string: "Double-click the app to install",
         attributes: [
             .font: NSFont.systemFont(ofSize: 19, weight: .semibold),
             .foregroundColor: NSColor(calibratedWhite: 0.153, alpha: 1),
             .paragraphStyle: paragraph,
         ])
-    heading.draw(in: NSRect(x: 40, y: height - 240 - 28, width: width - 80, height: 28))
+    heading.draw(in: NSRect(x: 40, y: height - 40 - 28, width: width - 80, height: 28))
 
     let detail = NSAttributedString(
         string:
-            "It sets up the command line tool, background service, and menu bar app.\nYou will see exactly what changes and confirm before anything runs.",
+            "The package comes with a menu bar app, CLI, and background service.\nConfirm preferences on the install screen.",
         attributes: [
-            .font: NSFont.systemFont(ofSize: 12.5, weight: .regular),
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
             .foregroundColor: NSColor(calibratedWhite: 0.435, alpha: 1),
             .paragraphStyle: paragraph,
         ])
-    detail.draw(in: NSRect(x: 40, y: height - 276 - 44, width: width - 80, height: 44))
+    detail.draw(in: NSRect(x: 40, y: height - 326 - 32, width: width - 80, height: 32))
 
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])

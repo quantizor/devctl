@@ -29,6 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -93,6 +94,9 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           DEVCTL_DMG_QUARANTINE: "0"
+          # Fail the build if signing falls back to ad-hoc: an unsigned release
+          # would install through the cask and then be disabled by Gatekeeper.
+          DEVCTL_REQUIRE_SIGNING: "1"
         run: |
           set -euo pipefail
           : "${SIGN_IDENTITY:?set APPLE_SIGN_IDENTITY secret}"
@@ -157,6 +161,18 @@ jobs:
             TAG="$(git describe --tags --abbrev=0)"
           fi
           gh release upload "$TAG" "$DMG" --clobber
+          echo "UPLOADED_TAG=$TAG" >> "$GITHUB_ENV"
+
+      # Now that the DMG is attached, update the Homebrew tap cask. Same
+      # explicit-dispatch pattern Release uses to kick this workflow, since a
+      # GITHUB_TOKEN release does not fire release:published on the bump job.
+      - name: Kick Homebrew cask bump
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run "Bump Homebrew cask" --ref main -f "tag=${UPLOADED_TAG}"
 
       # A dry run's whole point is inspecting the image, so hand it back.
       - name: Attach DMG to the run (dry run only)

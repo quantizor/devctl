@@ -25,6 +25,14 @@ identities="$(security find-identity -v -p codesigning 2>/dev/null \
   | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' || true)"
 
 if [[ -z "$identities" ]]; then
+  # Release builds set DEVCTL_REQUIRE_SIGNING=1 so a missing certificate fails
+  # loudly rather than silently shipping an ad-hoc image Gatekeeper will disable.
+  # make-app-bundle.sh enforces the same, since a $(shell ...) call in the
+  # Makefile swallows this exit code.
+  if [[ "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]]; then
+    echo "signing-identity: no Developer ID Application certificate found and DEVCTL_REQUIRE_SIGNING=1; refusing to fall back to ad-hoc." >&2
+    exit 1
+  fi
   echo -
   exit 0
 fi
