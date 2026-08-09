@@ -14,7 +14,15 @@ Agents forget their dev servers. After a context compaction they spawn duplicate
 
 ## Quick start
 
-Download the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Claude Code and Cursor (checked by default when needed).
+Install with Homebrew:
+
+```sh
+brew install --cask quantizor/tap/devctl
+```
+
+The fully qualified `quantizor/tap/devctl` trusts only this cask. `brew upgrade` keeps it current, and the in-app footer offers a one-click upgrade when a new version ships. To remove it later: `devctl uninstall` (or `brew uninstall --cask --zap quantizor/tap/devctl`).
+
+Prefer a direct download? Grab the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Either way nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Claude Code and Cursor (checked by default when needed).
 
 Or build from source (your agent can do this for you):
 
