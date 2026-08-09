@@ -87,8 +87,28 @@ sleep 1
 "$DEVCTL" daemon status | grep -q "pid" || fail "daemon not resurrected"
 pass "auto-bootstrap resurrects a dead daemon"
 
-"$DEVCTL" daemon uninstall > /dev/null
-[[ ! -f "$HOME/Library/LaunchAgents/${LABEL}.plist" ]] || fail "plist survived uninstall"
-pass "uninstall"
+# Deprecated alias: `daemon uninstall` still tears the agent down and warns on
+# stderr, keeping stdout clean for --json consumers. (This removes the agent.)
+ALIAS_ERR="$WORK/alias.err"
+set +e
+ALIAS_OUT="$("$DEVCTL" daemon uninstall --json 2>"$ALIAS_ERR")"
+set -e
+grep -q "deprecated" "$ALIAS_ERR" || fail "daemon uninstall did not warn on stderr (got: $(cat "$ALIAS_ERR"))"
+if echo "$ALIAS_OUT" | grep -q "deprecated"; then
+  fail "deprecation notice leaked into stdout: $ALIAS_OUT"
+fi
+[[ ! -f "$HOME/Library/LaunchAgents/${LABEL}.plist" ]] || fail "plist survived the deprecated alias"
+pass "deprecated 'daemon uninstall' warns on stderr, stdout clean, plist gone"
+
+# The new one-verb uninstall: --agent-only removes just the agent (what the cask
+# calls on every upgrade) and reports a stable JSON shape. Full uninstall's hook
+# and CLI removal is covered by unit tests, which do not touch the real machine.
+"$DEVCTL" daemon install --legacy > /dev/null || fail "reinstall before the agent-only test"
+AGENT_ONLY_OUT="$("$DEVCTL" uninstall --agent-only --json 2>/dev/null)"
+echo "$AGENT_ONLY_OUT" | /usr/bin/python3 -c \
+  'import json,sys; d=json.load(sys.stdin); assert d["agentOnly"] is True and d["purged"] is False, d' \
+  || fail "uninstall --agent-only JSON shape: $AGENT_ONLY_OUT"
+[[ ! -f "$HOME/Library/LaunchAgents/${LABEL}.plist" ]] || fail "plist survived uninstall --agent-only"
+pass "uninstall --agent-only removed the agent (hooks and data untouched)"
 
 echo "LAUNCHD-SMOKE PASS"

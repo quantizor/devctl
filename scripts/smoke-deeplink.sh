@@ -16,6 +16,12 @@ SLUG="$(basename "$PROJECT")"
 SERVER="web"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 DEVCTL="$BIN/devctl"
+# pgrep/pkill -f match their argument as a regex, where `.` is any character, so
+# `devctl.app` would also match an unrelated `devctlXapp`. Escape every dot in
+# the bundle path (including any in $ROOT) so the twin-count assertion counts
+# exactly this build's copies. APP is set to the same path below.
+APP_PATH="$ROOT/devctl.app"
+APP_MATCH="${APP_PATH//./\\.}/Contents/MacOS/devctl-app"
 
 fail() { echo "DEEPLINK SMOKE FAIL: $1" >&2; exit 1 }
 pass() { echo "  ok: $1" }
@@ -31,7 +37,11 @@ cleanup() {
   "$DEVCTL" stop "$SERVER" --project "$PROJECT" --json >/dev/null 2>&1 || true
   "$DEVCTL" unregister "$SERVER" --project "$PROJECT" --json >/dev/null 2>&1 || true
   [[ -n "${LOG_STREAM_PID:-}" ]] && kill "$LOG_STREAM_PID" 2>/dev/null || true
-  killall -9 DevCtlApp 2>/dev/null || true
+  # By bundle path, never by process name: the executable is devctl-app for the
+  # copy built here AND for the one the user has in /Applications, and killing
+  # theirs is not this script's business. `killall DevCtlApp` also matched
+  # neither, so the copy this script launched used to outlive the run.
+  pkill -f "$APP_MATCH" 2>/dev/null || true
   if [[ -d /Applications/devctl.app ]]; then
     "$LSREGISTER" -f /Applications/devctl.app >/dev/null 2>&1 || true
   fi
@@ -48,7 +58,7 @@ echo "building..."
 swift build --package-path "$ROOT" > /dev/null
 swift build --package-path "$ROOT" --product DevCtlApp > /dev/null
 "$ROOT/scripts/make-app-bundle.sh" - debug
-APP="$ROOT/devctl.app"
+APP="$APP_PATH"
 SCHEME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$APP/Contents/Info.plist")"
 [[ "$SCHEME" == "devctl" ]] || fail "scheme was $SCHEME"
 pass "Info.plist declares devctl://"
@@ -71,6 +81,21 @@ sleep 1
 
 open -a "$APP"
 sleep 2
+
+# A second copy of one bundle doubles the menu bar item, the poll and every
+# crash notification. `open -n` asks for exactly that, and is what the DMG
+# handoff asks for by name, so the newcomer has to stand down on its own. The
+# count is path-scoped: an installed /Applications copy shares the bundle id and
+# is allowed to keep running alongside this one.
+count_app() { pgrep -f "$APP_MATCH" | wc -l | tr -d ' ' }
+BEFORE_TWIN="$(count_app)"
+[[ "$BEFORE_TWIN" == "1" ]] || fail "wanted 1 copy of $APP before the twin probe, saw $BEFORE_TWIN"
+open -n "$APP"
+sleep 4
+AFTER_TWIN="$(count_app)"
+[[ "$AFTER_TWIN" == "1" ]] || fail "open -n left $AFTER_TWIN copies of $APP running; the launch stand-down did not fire"
+pass "open -n stood down; one copy still running"
+
 open -a "$APP" "devctl://ensure/${SLUG}/${SERVER}"
 PHASE=missing
 for i in {1..40}; do
@@ -81,9 +106,10 @@ done
 [[ "$PHASE" == "running" ]] || fail "warm ensure left phase $PHASE"
 pass "warm open ensure -> running"
 
-killall DevCtlApp 2>/dev/null || true
-# Bundle executable is named devctl-app; kill by that too.
-killall devctl-app 2>/dev/null || true
+# Path-scoped so an installed /Applications copy, which shares the executable
+# name, is left alone: only the copy under test has to be gone for the next open
+# to be a cold launch.
+pkill -f "$APP_MATCH" 2>/dev/null || true
 sleep 1
 open -a "$APP" "devctl://stop/${SLUG}/${SERVER}"
 PHASE=missing

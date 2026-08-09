@@ -177,6 +177,10 @@ final class KeyNavModel {
     Spotlight launches us. */
 final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        /** First, before anything claims the menu bar or the notification
+            center: a second copy of the same bundle doubles every menu bar item,
+            poll and crash notification the user sees. */
+        guard !SetupPerformer.quitIfTwinIsRunning() else { return }
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         /** MenuBarExtra / LSUIElement apps do not always receive
@@ -288,9 +292,16 @@ struct DevCtlApp: App {
         }
         .defaultSize(width: 860, height: 560)
 
+        Window("devctl Settings", id: "settings") {
+            SettingsView(model: model)
+        }
+        .windowResizability(.contentSize)
+        .defaultSize(width: 460, height: 520)
+
         Window(setupSession.migration || setupSession.replacingApplicationsApp
             ? "Upgrade devctl" : "Install devctl", id: "setup") {
             SetupPanel(
+                cliOwnedByBrew: setupSession.cliOwnedByBrew,
                 installAppToApplications: setupSession.installAppToApplications,
                 migration: setupSession.migration,
                 offers: setupSession.offers,
@@ -399,6 +410,10 @@ struct MenuContent: View {
                     .zIndex(1)
                 }
             }
+            if let update = model.updateStatus {
+                Divider()
+                UpdateFooterRow(status: update)
+            }
             Divider()
             HStack(spacing: 0) {
                 Button {
@@ -411,9 +426,18 @@ struct MenuContent: View {
                 .foregroundStyle(.secondary)
                 .help("Open the dashboard window")
                 .accessibilityLabel(Text("Open dashboard"))
-                /** Generous air between primary action and the login preference. */
-                LaunchAtLoginToggle()
-                    .padding(.leading, 22)
+                /** Generous air between primary action and the settings entry. */
+                Button {
+                    openWindow(id: "settings")
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    FooterIconLabel(systemImage: "gearshape", title: "Settings")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Manage hooks, login, and updates")
+                .accessibilityLabel(Text("Open settings"))
+                .padding(.leading, 22)
                 Spacer(minLength: 8)
                 Button {
                     NSApp.terminate(nil)
@@ -1002,6 +1026,45 @@ struct TallyDot: View {
     }
 }
 
+/** Quiet band shown above the footer when a newer release exists. A Homebrew
+    install gets an Upgrade button that runs `brew upgrade` in Terminal (a
+    GUI-launched app has no PATH to run brew itself, and a password prompt needs
+    somewhere to go); any other install gets a link to the release page. */
+struct UpdateFooterRow: View {
+    let status: UpdateStatus
+
+    private var owner: CLIOwner { SetupPlanner.cliOwner() }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.circle")
+                .foregroundStyle(.secondary)
+            Text("devctl \(status.latestVersion) available")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            if owner.isHomebrew {
+                Button("Upgrade") {
+                    TerminalRunner.run(
+                        title: "devctl upgrade", command: DevCtlDistribution.brewUpgradeCommand)
+                }
+                .controlSize(.small)
+                .help("Run brew upgrade in Terminal")
+            } else {
+                Button("Release notes") {
+                    if let url = URL(string: DevCtlDistribution.releasesLatestURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .controlSize(.small)
+                .help("Open the latest release page")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+}
+
 /** Icon + title with a tight gap; Label's default titleAndIcon spacing is wide
     for this dense footer. */
 struct FooterIconLabel: View {
@@ -1015,30 +1078,6 @@ struct FooterIconLabel: View {
         }
         .font(.caption)
         .contentShape(Rectangle())
-    }
-}
-
-struct LaunchAtLoginToggle: View {
-    @State private var enabled = SMAppService.mainApp.status == .enabled
-
-    var body: some View {
-        Toggle("Start at login", isOn: $enabled)
-            .toggleStyle(.checkbox)
-            .controlSize(.small)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .onChange(of: enabled) { _, wanted in
-                do {
-                    if wanted {
-                        try SMAppService.mainApp.register()
-                    } else {
-                        try SMAppService.mainApp.unregister()
-                    }
-                } catch {
-                    enabled = SMAppService.mainApp.status == .enabled
-                }
-            }
-            .help("Launch devctl.app at login")
     }
 }
 

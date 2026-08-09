@@ -102,8 +102,12 @@ final class DaemonModel {
         Start instead of resurrecting the daemon behind the user's back. */
     var daemonStoppedOnPurpose = false
     var projects: [ProjectGroup] = []
+    /** Newest release when one is available, for the popover footer. Nil when up
+        to date, unchecked, or the check is switched off in Settings. */
+    var updateStatus: UpdateStatus?
 
     private var lastRecoveryAttempt: Date?
+    private var updateTask: Task<Void, Never>?
 
     struct ProjectGroup: Identifiable {
         var id: String { path }
@@ -208,6 +212,26 @@ final class DaemonModel {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+        /** Update polling on its own slow cadence, honoring the Settings toggle.
+            The app owns the cadence; doctor reads the same cache. */
+        updateTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.checkForUpdates()
+                try? await Task.sleep(for: .seconds(UpdateCheck.defaultMaxAge))
+            }
+        }
+    }
+
+    /** Refresh the update cache when the preference allows, publishing the result
+        for the popover footer. Clears the banner when the check is off, so turning
+        it off in Settings takes effect without a relaunch. */
+    func checkForUpdates() async {
+        guard UpdatePreference.enabled else {
+            updateStatus = nil
+            return
+        }
+        let status = await UpdateCheck.refresh()
+        updateStatus = (status?.updateAvailable == true) ? status : nil
     }
 
     func refresh() async {

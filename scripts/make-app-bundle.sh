@@ -77,6 +77,15 @@ PLIST
 
 VERSION="$("$CLI_BINARY" --version 2>/dev/null || echo 0.1.0)"
 
+# Release builds require a real signature: an ad-hoc image installs through the
+# cask and is then disabled by Gatekeeper. Enforced here because the Makefile
+# resolves the identity through $(shell ...), which swallows the exit code of
+# scripts/signing-identity.sh.
+if [[ "$IDENTITY" == "-" && "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]]; then
+  echo "make-app-bundle: DEVCTL_REQUIRE_SIGNING=1 but no signing identity; refusing to build an ad-hoc release." >&2
+  exit 1
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -97,6 +106,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
+    <string>$VERSION</string>
+    <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>

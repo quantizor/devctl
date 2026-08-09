@@ -12,10 +12,16 @@
 # present but unused. Set DEVCTL_DMG_REQUIRE_LAYOUT=1 to make that a hard error,
 # so a release build never quietly loses the instructions.
 #
-# A Developer ID image is notarized, stapled and quarantine-stamped by default,
-# so opening it locally is what a user who downloaded it gets. SKIP_NOTARIZE=1
-# trades that fidelity for a faster loop; DEVCTL_DMG_QUARANTINE=0 drops the
-# download stamp.
+# Two kinds of image. A TEST image is what an external contributor gets: signed
+# with whatever identity is available (ad-hoc when the keychain has none) and not
+# notarized, so Gatekeeper blocks it on other machines, which is fine for local
+# testing. A REAL image is notarized and stapled, and is reserved for where the
+# notarytool credentials live: the maintainer's machine (the `devctl-notary`
+# keychain profile) or CI (App Store Connect API key env). make dmg notarizes
+# automatically when those credentials are reachable; DEVCTL_NOTARIZE=1 demands
+# the real path (failing if they are missing) and the release build sets
+# DEVCTL_REQUIRE_SIGNING=1, which implies it. SKIP_NOTARIZE=1 forces the fast
+# local loop; DEVCTL_DMG_QUARANTINE=0 drops the download stamp.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -83,13 +89,13 @@ on run argv
       set current view of container window to icon view
       set toolbar visible of container window to false
       set statusbar visible of container window to false
-      set the bounds of container window to {200, 120, 760, 500}
+      set the bounds of container window to {200, 120, 760, 520}
       set viewOptions to the icon view options of container window
       set arrangement of viewOptions to not arranged
       set icon size of viewOptions to 128
       set text size of viewOptions to 12
       set background picture of viewOptions to file ".background:background.tiff"
-      set position of item "devctl.app" of container window to {280, 125}
+      set position of item "devctl.app" of container window to {280, 162}
       update without registering applications
       delay 1
       close
@@ -120,6 +126,26 @@ hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG" > /d
 rm -f "$RW_DMG"
 rm -rf "$STAGE"
 
+# Whether notarytool credentials are reachable. Real (notarized) images are built
+# where these live: this machine's `devctl-notary` keychain profile, or CI's App
+# Store Connect API key env. A contributor without them still gets a signed TEST
+# image and a clear note, never a hard failure. A false negative here costs the
+# maintainer only a `DEVCTL_NOTARIZE=1`; it never blocks a contributor.
+notary_creds_available() {
+  if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" \
+        && ( -n "${APPLE_API_KEY_PATH:-}" || -n "${APPLE_API_KEY_BASE64:-}" ) ]]; then
+    return 0
+  fi
+  local profile="${NOTARY_KEYCHAIN_PROFILE:-devctl-notary}"
+  # notarytool's store-credentials service name has varied across Xcode; probe
+  # the known spellings by label and service.
+  security find-generic-password -l "$profile" >/dev/null 2>&1 && return 0
+  security find-generic-password -s "com.apple.gke.notary.tool.saved-creds.$profile" \
+    >/dev/null 2>&1 && return 0
+  security find-generic-password -s "com.apple.gke.notary.tool" >/dev/null 2>&1 && return 0
+  return 1
+}
+
 if [[ "$IDENTITY" == "-" ]]; then
   echo "note: ad-hoc image, so no notarization (it requires a Developer ID signature)." >&2
   echo "      Gatekeeper will refuse this on any machine that did not build it." >&2
@@ -127,16 +153,27 @@ else
   codesign --force --sign "$IDENTITY" "$DMG"
   echo "signed DMG with $IDENTITY"
 
-  # Notarize by default. An unnotarized Developer ID image is worse than useless
-  # for testing: Gatekeeper blocks it outright once quarantined, so a build that
-  # skipped this step cannot show what a user actually sees.
-  if [[ "${SKIP_NOTARIZE:-0}" == "1" ]]; then
+  # A real release is signed AND notarized; a contributor build is signed only.
+  # DEVCTL_NOTARIZE=1 (and the release build's DEVCTL_REQUIRE_SIGNING=1) demands
+  # the real path, so a missing credential fails loudly rather than shipping a
+  # test image. SKIP_NOTARIZE=1 forces the fast local loop. Otherwise notarize
+  # only when the credentials are actually reachable.
+  require_notarize=0
+  [[ "${DEVCTL_NOTARIZE:-}" == "1" || "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]] && require_notarize=1
+
+  if [[ "${SKIP_NOTARIZE:-0}" == "1" && "$require_notarize" != "1" ]]; then
     echo "note: SKIP_NOTARIZE=1. Quarantined, Gatekeeper will block this image." >&2
-  else
+  elif [[ "$require_notarize" == "1" ]] || notary_creds_available; then
+    # notarize.sh fails if the credentials are missing, which is the point when a
+    # real build was demanded.
     NOTARIZE_TARGET="$DMG" "$ROOT/scripts/notarize.sh"
     # Gatekeeper assesses the image and the app inside it separately, so check
     # the image here with the policy Finder uses when opening a download.
     spctl -a -vvv -t open --context context:primary-signature "$DMG"
+  else
+    echo "note: signed TEST DMG, not notarized (no notarytool credentials found)." >&2
+    echo "      Real notarized releases are built on the maintainer's machine or in CI." >&2
+    echo "      Quarantined, Gatekeeper will block this image; that is expected for a test build." >&2
   fi
 fi
 

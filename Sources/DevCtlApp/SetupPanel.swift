@@ -4,6 +4,7 @@ import SwiftUI
 /** First-run / upgrade panel: clear checklist of what Confirm will do, then
     opt-in harness hooks (default checked when install is still needed). */
 struct SetupPanel: View {
+    let cliOwnedByBrew: Bool
     let installAppToApplications: Bool
     let migration: Bool
     let offers: [HarnessOffer]
@@ -18,6 +19,7 @@ struct SetupPanel: View {
     @State private var willRelaunch = false
 
     init(
+        cliOwnedByBrew: Bool,
         installAppToApplications: Bool,
         migration: Bool,
         offers: [HarnessOffer],
@@ -25,6 +27,7 @@ struct SetupPanel: View {
         replacingApplicationsApp: Bool,
         onFinished: @escaping () -> Void
     ) {
+        self.cliOwnedByBrew = cliOwnedByBrew
         self.installAppToApplications = installAppToApplications
         self.migration = migration
         self.offers = offers
@@ -40,6 +43,14 @@ struct SetupPanel: View {
             Text(migration || replacingApplicationsApp ? "Upgrade devctl" : "Install devctl")
                 .font(.title3.weight(.semibold))
 
+            /** Only on a first install. Someone upgrading has been running this
+                for a while and does not need to be told what it is. */
+            if !(migration || replacingApplicationsApp) {
+                Text("An agent-friendly coordinator for many devservers and their unique configurations.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Text("Confirm to apply the changes below. Nothing runs until you confirm.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -54,10 +65,16 @@ struct SetupPanel: View {
                             ? "Quit the running menu bar app (if any), then replace /Applications/devctl.app with this version"
                             : "Install the menu bar app at /Applications/devctl.app")
                 }
-                bullet(
-                    migration
-                        ? "Update the CLI at \(SetupPlanner.defaultCLIDirectory().path)"
-                        : "Install the CLI at \(SetupPlanner.defaultCLIDirectory().path)")
+                /** Under a Homebrew install the cask owns the CLI symlink, so
+                    devctl neither installs nor updates it and says so instead. */
+                if cliOwnedByBrew {
+                    bullet("Leave the CLI to Homebrew (installed in brew's bin)")
+                } else {
+                    bullet(
+                        migration
+                            ? "Update the CLI at \(SetupPlanner.defaultCLIDirectory().path)"
+                            : "Install the CLI at \(SetupPlanner.defaultCLIDirectory().path)")
+                }
                 bullet(
                     "Install or update the background daemon and restart it (your running servers stay)")
                 if selected.isEmpty {
@@ -74,9 +91,7 @@ struct SetupPanel: View {
             .fixedSize(horizontal: false, vertical: true)
 
             if pathWarning {
-                Label(
-                    "\(SetupPlanner.defaultCLIDirectory().path) is not on your PATH. Add it after setup so shells find `devctl`.",
-                    systemImage: "exclamationmark.triangle")
+                Label(SetupPlanner.pathRemedy, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -190,7 +205,12 @@ struct SetupPanel: View {
                         Applications copy is allowed to register after settle. */
                     try? FileManager.default.removeItem(at: DevCtlPaths().stoppedIntentFile)
                 }
-                await SetupPerformer.quitOtherInstances()
+                guard await SetupPerformer.quitOtherInstances() else {
+                    errorText =
+                        "Another copy of devctl is still running, so replacing /Applications/devctl.app would leave it running code that is no longer on disk. Quit quantizor/devctl from Activity Monitor, then try again."
+                    busy = false
+                    return
+                }
             }
             do {
                 let result = try await Task.detached(priority: .userInitiated) {

@@ -18,6 +18,57 @@ public enum SetupPlanner {
         home.appending(path: ".local/bin")
     }
 
+    /** The two prefixes a Homebrew install can live under: Apple Silicon and
+        Intel. A cask's `binary` symlink always lands in `<prefix>/bin`, which
+        `brew shellenv` puts on the user's PATH. */
+    public static let homebrewPrefixes = ["/opt/homebrew", "/usr/local"]
+
+    /** Which install owns the CLI, decided from where the running app bundle
+        actually lives on disk rather than from any substring of its path.
+
+        Homebrew moves the app to `/Applications` and leaves a symlink behind in
+        `<prefix>/Caskroom/devctl/<version>/devctl.app` pointing back at it, so a
+        `/Caskroom/` substring test on the resolved bundle path is always false
+        for a normally-installed cask. The reliable signal is realpath equality:
+        the running bundle and the Caskroom symlink resolve to the same directory
+        only under a brew install. */
+    public static func cliOwner(
+        bundle: Bundle = .main, fileManager: FileManager = .default
+    ) -> CLIOwner {
+        let runningRealpath = bundle.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let staged: [(prefix: String, bundleRealpaths: [String])] = homebrewPrefixes.map { prefix in
+            let caskDir = URL(fileURLWithPath: prefix).appending(path: "Caskroom/devctl")
+            let versionDirs =
+                (try? fileManager.contentsOfDirectory(
+                    at: caskDir, includingPropertiesForKeys: nil)) ?? []
+            let bundles = versionDirs.compactMap { versionDir -> String? in
+                let candidate = versionDir.appending(path: "\(cliBinaryName).app")
+                guard fileManager.fileExists(atPath: candidate.path) else { return nil }
+                return candidate.resolvingSymlinksInPath().standardizedFileURL.path
+            }
+            return (prefix: prefix, bundleRealpaths: bundles)
+        }
+        return resolveCLIOwner(runningBundleRealpath: runningRealpath, caskStagedBundles: staged)
+    }
+
+    /** The pure decision behind `cliOwner`, taking the disk facts as data so it
+        is testable without a real Caskroom. `caskStagedBundles` pairs each brew
+        prefix with the realpaths of the `devctl.app` symlinks found under its
+        Caskroom; a match against the running bundle means brew owns the CLI in
+        that prefix's bin. */
+    public static func resolveCLIOwner(
+        runningBundleRealpath: String,
+        caskStagedBundles: [(prefix: String, bundleRealpaths: [String])],
+        cliDirectory: URL = defaultCLIDirectory()
+    ) -> CLIOwner {
+        for entry in caskStagedBundles
+        where entry.bundleRealpaths.contains(runningBundleRealpath) {
+            return .homebrew(
+                shim: URL(fileURLWithPath: entry.prefix).appending(path: "bin/\(cliBinaryName)"))
+        }
+        return .devctl(directory: cliDirectory)
+    }
+
     public static func stampURL(paths: DevCtlPaths) -> URL {
         paths.dataDir.appending(path: stampFileName)
     }
@@ -137,7 +188,38 @@ public enum SetupPlanner {
         return offers.sorted { $0.harness < $1.harness }
     }
 
-    /** Whether `~/.local/bin` appears on PATH (split on `:`). */
+    /** What to tell someone whose shell cannot find `devctl`. Carries the whole
+        command rather than describing it, because the reader is being asked to
+        edit a shell profile and the shape of that line is the part worth getting
+        right. devctl does not write it: nothing here edits files a user owns. */
+    public static let pathRemedy =
+        "\(defaultCLIDirectory().path) is not on your PATH, so shells and agents will not find `devctl`. "
+        + "Add it with: echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zprofile"
+
+    /** Whether the CLI directory is on the PATH the user actually has.
+
+        Two wrong answers are easy to reach here and both were shipped. The menu
+        bar app is launched by Finder, so its own `ProcessInfo` PATH is launchd's
+        and never contains `~/.local/bin`: asking that warned everyone. A login
+        shell is closer but still skips `.zshrc`, which is where the directory is
+        usually added, so it warned everyone too, for a different reason.
+        `capturedPath` is the one home for the right answer. */
+    public static func cliDirectoryOnUserPATH(
+        cliDirectory: URL = defaultCLIDirectory()
+    ) -> Bool {
+        cliDirectoryOnPATH(pathEnv: LaunchdAdmin.capturedPath(), cliDirectory: cliDirectory)
+    }
+
+    /** The PATH check for a specific owner: brew's bin is put on PATH by
+        `brew shellenv`, so a brew-owned CLI never warrants the warning, while a
+        `~/.local/bin` install still does until the user adds it. */
+    public static func cliDirectoryOnUserPATH(owner: CLIOwner) -> Bool {
+        cliDirectoryOnPATH(pathEnv: LaunchdAdmin.capturedPath(), cliDirectory: owner.cliDirectory)
+    }
+
+    /** The pure half, taking the PATH to inspect so it stays testable. Callers
+        outside a shell want `cliDirectoryOnUserPATH` instead: passing this
+        process's own PATH is the mistake described above. */
     public static func cliDirectoryOnPATH(
         pathEnv: String?,
         cliDirectory: URL = defaultCLIDirectory()
@@ -209,6 +291,39 @@ public enum SetupPlanner {
         let head = raw.split(separator: " ", maxSplits: 1).first.map(String.init) ?? raw
         let numeric = head.split(separator: "-").first.map(String.init) ?? head
         return numeric.split(separator: ".").compactMap { Int($0) }
+    }
+}
+
+/** Where the CLI lives for this install, so setup neither double-installs it nor
+    warns about a PATH that is already correct. Under a Homebrew cask the cask
+    owns a symlink in brew's bin (already on PATH, removed on cask uninstall);
+    writing a second copy to `~/.local/bin` would orphan it. */
+public enum CLIOwner: Equatable, Sendable {
+    /** devctl installs and removes the CLI itself, at this directory. */
+    case devctl(directory: URL)
+    /** Homebrew owns the CLI at this symlink in its bin; devctl leaves it alone. */
+    case homebrew(shim: URL)
+
+    /** The directory the CLI resolves from, for the PATH check. */
+    public var cliDirectory: URL {
+        switch self {
+        case .devctl(let directory): return directory
+        case .homebrew(let shim): return shim.deletingLastPathComponent()
+        }
+    }
+
+    /** The CLI binary path devctl should invoke and record in hooks. */
+    public var cliPath: URL {
+        switch self {
+        case .devctl(let directory): return directory.appending(path: SetupPlanner.cliBinaryName)
+        case .homebrew(let shim): return shim
+        }
+    }
+
+    /** True when Homebrew, not devctl, installs and removes the CLI and daemon. */
+    public var isHomebrew: Bool {
+        if case .homebrew = self { return true }
+        return false
     }
 }
 
