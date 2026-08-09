@@ -33,7 +33,12 @@ public enum WatchPaths {
             }
             let absolute = URL(fileURLWithPath: project).appending(path: entry)
                 .standardizedFileURL.path
-            guard absolute.hasPrefix(prefix) else {
+            /** `absolute == root` is admitted so this answers the same question
+                as `LockResource.statePath`, which already allows a declaration
+                resolving to the project root itself. A root entry is then
+                rejected below as a directory, with the message a reader can act
+                on, instead of being called an escape it is not. */
+            guard absolute == root || absolute.hasPrefix(prefix) else {
                 warnings.append("watch entry '\(entry)' points outside the project")
                 continue
             }

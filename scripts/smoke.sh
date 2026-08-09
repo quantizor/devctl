@@ -11,23 +11,41 @@ export DEVCTL_SOCKET="$WORK/daemon.sock"
 PROJECT="$WORK/project"
 mkdir -p "$PROJECT"
 
-fail() { echo "SMOKE FAIL: $1" >&2; exit 1 }
+# The daemon's log lives under $WORK, which the exit trap deletes, so a failure
+# has to carry the tail out with it or the one record of what the daemon was
+# doing is gone by the time anyone reads the failure.
+fail() {
+  echo "SMOKE FAIL: $1" >&2
+  if [[ -s "${DAEMON_LOG:-}" ]]; then
+    echo "--- last daemon output ($DAEMON_LOG) ---" >&2
+    tail -20 "$DAEMON_LOG" >&2
+  fi
+  exit 1
+}
 pass() { echo "  ok: $1" }
 
-# Wait until the daemon ANSWERS OVER THE SOCKET, never until the socket file
-# merely exists. Two traps this avoids, both of which report ready for the wrong
-# reason: a daemon killed with -9 leaves its socket file behind, so a file test
-# passes instantly against a dead listener; and `daemon status` falls back to
-# launchd state and exits 0 without connecting, so it answers even when nothing
-# is listening. Requiring daemonVersion in the payload forces a real round trip.
-# Fails loudly rather than letting a later command report a confusing error.
+# Wait until the daemon ANSWERS OVER THE SOCKET AND HAS FINISHED RESTORING,
+# never until the socket file merely exists. Three traps this avoids, all of
+# which report ready for the wrong reason: a daemon killed with -9 leaves its
+# socket file behind, so a file test passes instantly against a dead listener;
+# `daemon status` falls back to launchd state and exits 0 without connecting, so
+# it answers even when nothing is listening; and the daemon now accepts before
+# boot restore finishes, so `reachable` alone would let the next command race a
+# half-restored daemon and get refused. Fails loudly rather than letting a later
+# command report a confusing error.
+# `probe`, not `status`: zsh makes $status a read-only alias for $?, so assigning
+# to it aborts the script mid-function with a message that reads like a devctl
+# failure rather than a naming collision.
 await_daemon() {
-  local label="$1"
+  local label="$1" probe
   for i in {1..100}; do
-    "$BIN/devctl" daemon status --json 2>/dev/null | grep -q '"reachable":true' && return 0
+    probe="$("$BIN/devctl" daemon status --json 2>/dev/null || true)"
+    if grep -q '"reachable":true' <<<"$probe" && ! grep -q '"restoring":true' <<<"$probe"; then
+      return 0
+    fi
     sleep 0.1
   done
-  fail "daemon never answered over $DEVCTL_SOCKET ($label); it may be alive without having bound the socket"
+  fail "daemon never finished restoring over $DEVCTL_SOCKET ($label); last status: ${probe:-<none>}"
 }
 
 cleanup() {
@@ -45,8 +63,14 @@ trap cleanup EXIT
 echo "building..."
 swift build --package-path "$ROOT" > /dev/null
 
-echo "starting daemon..."
-"$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" &
+# The daemon's own stdio goes to a file, never to this script's. Inheriting it
+# means a daemon that outlives the run holds the write end of the caller's pipe
+# open, so `smoke.sh | anything` never sees EOF and hangs long after the script
+# itself has exited, showing no output at all to say why.
+DAEMON_LOG="$WORK/devctld.log"
+echo "starting daemon... (log: $DAEMON_LOG)"
+"$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 await_daemon "first boot"
 pass "daemon up (pid $DAEMON_PID)"
@@ -156,8 +180,26 @@ cat > "$PROJECT3/devservers.json" <<CFG
 }
 CFG
 # restart the smoke daemon (killed above) for the project phase
-"$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" &
+"$BIN/devctld" --foreground --socket "$DEVCTL_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
+# The claim under test: from the moment the listener accepts, a client gets an
+# answer. Boot restore used to run with the socket unlinked, so a client in that
+# window got ENOENT and reported the daemon gone, which is exactly what a daemon
+# that never started looks like. Waiting on the socket FILE is the correct gate
+# here and only here, because its creation IS the moment accept begins; every
+# other wait in this script goes through await_daemon for the reasons above it.
+for i in {1..200}; do [[ -S "$DEVCTL_SOCKET" ]] && break; sleep 0.05; done
+[[ -S "$DEVCTL_SOCKET" ]] || fail "daemon never created its socket"
+RESTORE_PROBE="$("$DEVCTL" daemon status --json 2>/dev/null || true)"
+grep -q '"restoring":true' <<<"$RESTORE_PROBE" && RESTORE_WINDOW="observed" || RESTORE_WINDOW="already finished"
+if ! RESTORE_OUT="$(cd "$PROJECT" && "$DEVCTL" status --json 2>/dev/null)"; then
+  fail "a command during boot restore failed instead of waiting it out: $RESTORE_OUT"
+fi
+grep -q 'daemon-unreachable' <<<"$RESTORE_OUT" && fail "a restoring daemon reported itself unreachable: $RESTORE_OUT"
+# Says which of the two ran, because an assertion that silently skipped the
+# window it exists to cover reads identically to one that passed through it.
+pass "a command racing boot restore waits instead of reporting the daemon gone (window $RESTORE_WINDOW)"
 await_daemon "project phase restart"
 cd "$PROJECT3"
 
@@ -535,7 +577,9 @@ echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelo
 pass "x-url rejects unknown slug"
 
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
-"$ROOT/scripts/make-app-bundle.sh" - debug
+# Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so
+# it needs no signing identity and wants no warning about lacking one.
+DEVCTL_ADHOC_EXPECTED=1 "$ROOT/scripts/make-app-bundle.sh" - debug
 SCHEME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$ROOT/devctl.app/Contents/Info.plist")"
 [[ "$SCHEME" == "devctl" ]] || fail "assembled Info.plist scheme was '$SCHEME'"
 pass "assembled app declares CFBundleURLSchemes=devctl"

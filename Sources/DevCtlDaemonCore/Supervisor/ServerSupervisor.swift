@@ -27,6 +27,17 @@ public actor ServerSupervisor {
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
     private var lastDescendantSnapshot: [ProcessIdentity] = []
+    /** Keeps the descendant snapshot fresh across the startup window; see
+        startDescendantWatch. */
+    private var descendantTask: Task<Void, Never>?
+    /** Short enough that a worker forked a beat after startup is recorded before
+        a crash can orphan it, and long enough that the sweeps cost nothing over
+        a startup window. */
+    private let descendantWatchIntervalMs = 200
+    /** The run's session, recorded at spawn while the root is certainly alive.
+        Read at teardown to find descendants that left the process group, which
+        the parent-pid chain can no longer reach once the root has exited. */
+    private var rootSessionID: pid_t?
     private let launcher: any ProcessLauncher
     /** Resolved named secondaries for this run (status.ports). */
     private var namedPorts: [String: Int]?
@@ -173,11 +184,20 @@ public actor ServerSupervisor {
     }
 
     /** An explicit restart re-arms a tripped breaker: the feature must not be
-        dead for the rest of the daemon's life after one bad afternoon. */
+        dead for the rest of the daemon's life after one bad afternoon.
+
+        The restart history goes with it, or the re-arm lasts exactly one
+        evaluation: `WatchPolicy.decide` weighs the burst before anything else,
+        so leaving three in-window restarts behind means the next observed change
+        suspends again with no restart in between. Only an explicit restart
+        clears it, which is why the watch sweep asks for `rearm: false`: an auto
+        restart wiping its own breaker's evidence is the one thing the breaker
+        exists to prevent. */
     public func rearmWatch() {
         watchSuspended = false
         watchPending = nil
         watchBaseline = nil
+        watchRestarts.removeAll()
     }
 
     /** Port metadata for status/agents. Call after materializing the spawn spec. */
@@ -520,7 +540,8 @@ public actor ServerSupervisor {
                 moment devctl recorded it starting; a recycled pid was born long
                 after. One second of slack covers the spawn-to-record gap. */
             guard let startedAt = entry.startedAt,
-                let identity = ProcessTree.identity(of: pid_t(pid))
+                let narrowed = ProcessTree.narrowed(pid),
+                let identity = ProcessTree.identity(of: narrowed)
             else { continue }
             let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
             guard processStart <= startedAt.addingTimeInterval(1) else { continue }
@@ -716,6 +737,10 @@ public actor ServerSupervisor {
 
     private func recordSpawn(pid childPid: pid_t, id: String) async {
         pid = childPid
+        /** Read now rather than at teardown: once the root exits, getsid on its
+            pid answers -1 and the escaped-descendant sweep loses its key. */
+        let session = getsid(childPid)
+        rootSessionID = session > 0 ? session : nil
         refreshDescendantSnapshot()
         let spawnedAt = Date()
         startedAt = spawnedAt
@@ -732,10 +757,7 @@ public actor ServerSupervisor {
         await logStore.append(stream: .sys, text: "started pid=\(childPid)")
         await events?.post(kind: .started, project: projectPath, server: spec.name, detail: "pid \(childPid)")
         startHealthMonitor()
-        Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(100))
-            await self?.refreshDescendantSnapshot()
-        }
+        startDescendantWatch()
         await registryUpdate(id: id) { entry in
             entry.lastExit = nil
             entry.phase = .starting
@@ -750,6 +772,48 @@ public actor ServerSupervisor {
     private func refreshDescendantSnapshot() {
         guard let pid else { return }
         lastDescendantSnapshot = ProcessTree.descendants(of: pid).identities
+    }
+
+    /** Re-snapshots descendants across the startup window, which is the only
+        stretch of a run where staleness is unbounded.
+
+        Why a snapshot is the only thing that can work: a child that calls
+        setsid or setpgid, and anything spawned through Foundation's `Process`,
+        which does so on the caller's behalf, sits in its own process group, so
+        the group-directed half of teardown cannot reach it. Once the root exits,
+        its children reparent to launchd and no parent-pid walk can find them
+        either. Whatever was recorded while the root still parented them is all
+        teardown has.
+
+        A single sample shortly after spawn was not enough. Servers commonly
+        fork their workers a beat after starting, and until the first health
+        probe nothing else refreshed the snapshot: with no healthcheck declared
+        that first probe is a full stabilization window away, so a worker that
+        appeared in between was in no snapshot at all and a crash orphaned it for
+        good. Health probes take over afterward, which bounds staleness to the
+        probe interval for the rest of the run.
+
+        The sweep is a whole-process-table sysctl measured at well under a
+        millisecond, and this runs only while the server is still starting, so
+        the cost is a handful of sweeps per run. */
+    private func startDescendantWatch() {
+        descendantTask?.cancel()
+        let intervalMs = descendantWatchIntervalMs
+        descendantTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(intervalMs))
+                guard !Task.isCancelled, let self else { return }
+                guard await self.refreshDescendantSnapshotWhileStarting() else { return }
+            }
+        }
+    }
+
+    /** Returns false once there is nothing left to watch, so the task ends
+        rather than polling a server that is already running or gone. */
+    private func refreshDescendantSnapshotWhileStarting() -> Bool {
+        guard pid != nil, phase == .starting else { return false }
+        refreshDescendantSnapshot()
+        return true
     }
 
     /** Snapshot the err-stream tally for the run that just started at
@@ -807,11 +871,22 @@ public actor ServerSupervisor {
         recentLogTail = spoolTail()
         terminalEvidence = recentLogTail
         errorSummary = captureErrorSummary(since: windowStart)
+        descendantTask?.cancel()
+        descendantTask = nil
         if !stopRequested, let rootPid = pid {
-            ProcessTree.signalTree(
-                descendants: lastDescendantSnapshot, rootPid: rootPid, signal: SIGTERM)
+            /** Union of the snapshot and a live session sweep. The snapshot can
+                be stale (a worker forked moments before the crash may never have
+                been sampled, and under load the sampler may not even have been
+                scheduled), while the session sweep cannot see a descendant that
+                called setsid for itself. Neither covers the other, so both run. */
+            let escaped = ProcessTree.sessionMembers(
+                of: rootSessionID ?? rootPid, sessionLeaderPid: rootPid
+            ).identities
+            let union = Array(Set(lastDescendantSnapshot).union(escaped))
+            ProcessTree.signalTree(descendants: union, rootPid: rootPid, signal: SIGTERM)
         }
         lastDescendantSnapshot = []
+        rootSessionID = nil
         pid = nil
         startedAt = nil
         observedPort = nil

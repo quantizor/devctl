@@ -55,7 +55,8 @@ public enum ConfigProjection {
             portSpan: spec.portSpan,
             shell: spec.shell,
             url: spec.url == derivedURL ? nil : spec.url,
-            waitFor: spec.waitFor
+            waitFor: spec.waitFor,
+            watch: spec.watch
         )
     }
 

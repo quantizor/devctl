@@ -3,8 +3,9 @@
 # directory layout + Info.plist + signature. Contents/Resources carries the CLI
 # (and a Resources copy of the daemon for setup); Contents/Helpers/devctld is the
 # SMAppService BundleProgram target; Contents/Library/LaunchAgents holds the
-# in-bundle agent plist. Ad-hoc signed by default; pass a Developer ID identity
-# as $1 to upgrade (notarization needs it).
+# in-bundle agent plist. $1 is the signing identity; the Makefile resolves it
+# through scripts/signing-identity.sh, which prefers a Developer ID certificate
+# and falls back to "-" (ad-hoc) when the keychain has none.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -139,3 +140,18 @@ sign "$APP/Contents/Helpers/devctld"
 sign "$APP/Contents/MacOS/devctl-app"
 sign "$APP"
 echo "assembled $APP (signed: $IDENTITY; Helpers/devctld + LaunchAgents + Resources)"
+
+# Warn at the point of signing, because the build succeeds either way and the
+# cost only lands later, on whoever installs over a previous copy. Reasoning for
+# why the Team ID matters lives in scripts/signing-identity.sh.
+#
+# DEVCTL_ADHOC_EXPECTED=1 silences it for a bundle nobody installs (smoke.sh
+# builds one to assert its layout), so the warning keeps meaning "this one will
+# bite you" rather than becoming noise the gate prints every run.
+if [[ "$IDENTITY" == "-" && "${DEVCTL_ADHOC_EXPECTED:-0}" != "1" ]]; then
+  echo "warning: ad-hoc signed (no Team ID). Installing this over an existing copy" >&2
+  echo "         stalls devctld for tens of seconds: the stale launch constraint" >&2
+  echo "         SIGKILLs it on exec until BTM invalidates its item." >&2
+  echo "         To sign, install a Developer ID certificate or pass SIGN_IDENTITY=..." >&2
+  echo "         (scripts/signing-identity.sh picks one up automatically when present.)" >&2
+fi

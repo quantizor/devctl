@@ -2,6 +2,13 @@
 # Kicked by Release via workflow_dispatch after Changesets publishes a tag
 # (GITHUB_TOKEN-created releases do not fire release:published elsewhere).
 # release:published remains as a manual / PAT-backed fallback.
+#
+# Dry runs: dispatch this from any branch other than main to build, sign,
+# notarize and verify without uploading. The image comes back as a run
+# artifact instead. Only a `release` event or a dispatch from main can write to
+# a release, so testing can never clobber a published asset.
+#   gh workflow run "Release DMG" --ref <branch>            # builds that branch
+#   gh workflow run "Release DMG" --ref <branch> -f tag=v1.3.0   # builds that tag
 # Requires repository secrets:
 #   APPLE_DEVELOPER_ID_P12_BASE64, APPLE_DEVELOPER_ID_P12_PASSWORD
 #   APPLE_SIGN_IDENTITY (e.g. "Developer ID Application: Name (TEAMID)")
@@ -73,26 +80,73 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
 
-      - name: Build signed DMG
+      - name: Build signed, notarized DMG
         env:
           # A released image must carry the double-click instructions, so a
           # runner that cannot drive Finder fails here instead of shipping a
           # bare icon view.
           DEVCTL_DMG_REQUIRE_LAYOUT: "1"
           SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
-        run: |
-          set -euo pipefail
-          : "${SIGN_IDENTITY:?set APPLE_SIGN_IDENTITY secret}"
-          make dmg
-
-      - name: Notarize and staple
-        env:
+          # make dmg notarizes and staples inline; these are what it authenticates
+          # with. The quarantine stamp is a local-testing aid only, so skip it here.
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: scripts/notarize.sh
+          DEVCTL_DMG_QUARANTINE: "0"
+        run: |
+          set -euo pipefail
+          : "${SIGN_IDENTITY:?set APPLE_SIGN_IDENTITY secret}"
+          # notarize.sh falls back to a local keychain profile when the API key
+          # vars are absent, and no runner has one, so an unset secret would
+          # surface as a confusing missing-profile error from two levels down.
+          : "${APPLE_API_KEY_BASE64:?set APPLE_API_KEY_BASE64 secret}"
+          : "${APPLE_API_KEY_ID:?set APPLE_API_KEY_ID secret}"
+          : "${APPLE_API_ISSUER:?set APPLE_API_ISSUER secret}"
+          make dmg
+
+      # The workflow runs from the dispatching ref while the source comes from
+      # the tag, so a tag whose make-dmg.sh predates inline notarization would
+      # build an unnotarized image and the upload below would --clobber a good
+      # asset with it. Assess the artifact itself rather than trusting the build
+      # that produced it.
+      - name: Verify the DMG is notarized and stapled
+        run: |
+          set -euo pipefail
+          DMG="$(ls -t dist/devctl-*.dmg | head -1)"
+          xcrun stapler validate "$DMG"
+          spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 | tee /tmp/spctl.txt
+          grep -q "source=Notarized Developer ID" /tmp/spctl.txt || {
+            echo "Refusing to upload: $DMG is not notarized." >&2
+            exit 1
+          }
+
+      # Only a run of the workflow definition from main may touch a published
+      # release. `Release` dispatches with `--ref main`, so real releases pass;
+      # a dispatch from any other branch is a dry run that builds, signs,
+      # notarizes and verifies, then stops short of the upload. That makes the
+      # whole path exercisable without risking a `--clobber` over a good asset.
+      - name: Decide whether this run publishes
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "release" || "$REF" == "refs/heads/main" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Publishing: event=$EVENT ref=$REF" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "**Dry run.** The DMG was built, signed, notarized and verified, but not uploaded."
+              echo ""
+              echo "Publishing needs a \`release\` event or a dispatch from \`main\`; this run was \`$REF\`."
+              echo "The image is attached to this run as an artifact."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload DMG to GitHub Release
+        if: steps.gate.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
@@ -103,6 +157,16 @@ jobs:
             TAG="$(git describe --tags --abbrev=0)"
           fi
           gh release upload "$TAG" "$DMG" --clobber
+
+      # A dry run's whole point is inspecting the image, so hand it back.
+      - name: Attach DMG to the run (dry run only)
+        if: steps.gate.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: devctl-dmg-dryrun
+          path: dist/devctl-*.dmg
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Cleanup keychain
         if: always()

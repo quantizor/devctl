@@ -67,6 +67,41 @@ public enum ProcessTree {
         }
     }
 
+    /** Live processes belonging to `session`, excluding the session leader and
+        this process's own session.
+
+        This is the one handle on an escaped descendant that does not depend on
+        when a snapshot was taken. A child that setpgid's out of the group (every
+        Foundation `Process` child does) still inherits the session, and unlike
+        the parent-pid chain, session membership survives the root exiting and
+        the orphan reparenting to launchd. So a descendant missed by the snapshot
+        because it appeared moments before the crash is still reachable here.
+
+        The safety guard is the whole design. `sessionLeaderPid` must equal
+        `session`, which is true exactly when the spawn used createSession and
+        the root really is its own session leader. Without that check, a root
+        sharing the daemon's session would turn this into a sweep of the daemon
+        and everything the daemon owns, so the caller's session is refused
+        outright rather than trusted to differ. */
+    public static func sessionMembers(of session: pid_t, sessionLeaderPid: pid_t)
+        -> DescendantsResult
+    {
+        guard session == sessionLeaderPid, session != getsid(getpid()), session > 0 else {
+            return .ok([])
+        }
+        switch fetchProcessTable() {
+        case .failed(let errno):
+            return .failed(errno: errno)
+        case .ok(let table):
+            let mine = getpid()
+            return .ok(
+                table.map(\.process).filter { identity in
+                    identity.pid != session && identity.pid != mine
+                        && getsid(identity.pid) == session
+                })
+        }
+    }
+
     /** Whether a snapshotted identity still names the same process. A nil live
         identity means the pid is gone; a start-time mismatch means reuse. */
     public static func shouldSignal(snapshotted: ProcessIdentity, live: ProcessIdentity?) -> Bool {
@@ -167,6 +202,39 @@ public enum ProcessTree {
             return .failed(errno: errno)
         }
         return .failed(errno: ENOMEM)
+    }
+
+    /** Narrow a pid that came from outside this process to the `Int32` the
+        signalling and sysctl calls take, or nil when no process could wear that
+        number.
+
+        Pids reach the daemon as unbounded `Int`: out of `state.json` and
+        `registry.json`, and off the wire in a lock holder record. `pid_t(_:)`
+        traps on anything past `Int32`, and a trap under launchd `KeepAlive` is a
+        crash loop, because boot restore re-reads the same file and dies again on
+        every relaunch. That is the failure the defensive-load rule exists to
+        prevent, and narrowing quietly reopened it after JSON parsing had already
+        let the value through.
+
+        Answering nil costs nothing: every caller already handles a pid that
+        names no live process, which is the same conclusion by a different route.
+        Zero and negatives are refused too, since both are process-group and
+        wildcard selectors to `kill(2)` rather than processes: `kill(0, sig)`
+        signals the caller's own group, which for the daemon is every server it
+        supervises. */
+    public static func narrowed(_ pid: Int) -> pid_t? {
+        guard let narrow = pid_t(exactly: pid), narrow > 0 else { return nil }
+        return narrow
+    }
+
+    /** Is some process currently wearing this pid. A number no process can wear
+        answers false, which is the same answer callers already act on for a pid
+        whose process has exited. Says nothing about whether it is the SAME
+        process the caller recorded: that needs `identity(of:)` and a start-time
+        compare. */
+    public static func isAlive(_ pid: Int) -> Bool {
+        guard let narrow = narrowed(pid) else { return false }
+        return kill(narrow, 0) == 0
     }
 
     /** Live identity for `pid`, or nil if gone / not readable. */

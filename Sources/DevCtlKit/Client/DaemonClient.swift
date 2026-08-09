@@ -57,20 +57,46 @@ public actor DaemonClient {
             )
         }
         fd = sock
-        let helloLine = try readLine()
-        let head = try JSONCoding.decoder().decode(WireEventHead.self, from: helloLine)
-        guard head.event == "hello" else {
-            throw WireError(code: .internalError, message: "daemon sent \(head.event) before hello")
+        /** The socket is open but unproven from here, and `fd >= 0` is what the
+            guard above reads as "already connected". So every failing exit has
+            to put the client back to disconnected: leaving a live fd behind with
+            no hello meant the next `connect()` returned at that guard and the
+            protocol check never ran again for the life of the client, turning a
+            version mismatch into requests written blind at a daemon that does
+            not speak this protocol. Minting a client per command hides it; the
+            `lock` command holds one across acquire, the guarded command and
+            release, which is long enough to reach. */
+        do {
+            let helloLine = try readLine()
+            let head = try JSONCoding.decoder().decode(WireEventHead.self, from: helloLine)
+            guard head.event == "hello" else {
+                throw WireError(
+                    code: .internalError, message: "daemon sent \(head.event) before hello")
+            }
+            let frame = try JSONCoding.decoder().decode(WireEvent<HelloParams>.self, from: helloLine)
+            guard frame.params.proto == DevCtlVersion.proto else {
+                throw WireError(
+                    code: .versionMismatch,
+                    hint: "run: devctl daemon restart",
+                    message: "daemon speaks protocol \(frame.params.proto) (v\(frame.params.daemonVersion)); this client speaks \(DevCtlVersion.proto) (v\(DevCtlVersion.version))"
+                )
+            }
+            hello = Hello(daemonVersion: frame.params.daemonVersion, proto: frame.params.proto)
+        } catch {
+            disconnect()
+            throw error
         }
-        let frame = try JSONCoding.decoder().decode(WireEvent<HelloParams>.self, from: helloLine)
-        hello = Hello(daemonVersion: frame.params.daemonVersion, proto: frame.params.proto)
-        guard frame.params.proto == DevCtlVersion.proto else {
-            throw WireError(
-                code: .versionMismatch,
-                hint: "run: devctl daemon restart",
-                message: "daemon speaks protocol \(frame.params.proto) (v\(frame.params.daemonVersion)); this client speaks \(DevCtlVersion.proto) (v\(DevCtlVersion.version))"
-            )
-        }
+    }
+
+    /** Back to the state a freshly constructed client is in. The buffered bytes
+        matter as much as the fd: half a frame left over from a failed handshake
+        would be read as the head of the next connection's hello. */
+    private func disconnect() {
+        if fd >= 0 { close(fd) }
+        buffer = NDJSONBuffer()
+        fd = -1
+        hello = nil
+        pending = []
     }
 
     public func request<P: Codable & Sendable, R: Codable & Sendable>(

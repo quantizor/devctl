@@ -22,6 +22,12 @@ public enum ServerPhase: String, Codable, Sendable {
 /** Healthcheck configuration. Absent spec + declared port implies a TCP probe;
     absent entirely means healthy = alive past a stabilization window. */
 public struct HealthCheckSpec: Codable, Equatable, Sendable {
+    /** Bounds for the numbers a probe loop runs on. Ten minutes is far past any
+        real healthcheck and still inside Int32, which `poll` needs; 255 rounds
+        of probing is likewise past any real patience. */
+    public static let countRange = 1...255
+    public static let durationRange = 1...600_000
+
     public var healthyAfter: Int?
     public var intervalMs: Int?
     public var port: Int?
@@ -29,6 +35,32 @@ public struct HealthCheckSpec: Codable, Equatable, Sendable {
     public var type: HealthCheckType
     public var unhealthyAfter: Int?
     public var url: String?
+
+    /** Config-check messages for values a probe loop cannot use. Every field
+        here reaches a syscall or paces a loop: `port` is narrowed for a
+        `sockaddr`, `timeoutMs` becomes a `poll` deadline where a negative reads
+        as wait-forever, `intervalMs` sets how often devctl probes somebody
+        else's server, and the counters decide when a phase flips. None of them
+        was checked, so a repo could set devctl's own probe cadence. */
+    public func validationErrors() -> [String] {
+        var errors: [String] = []
+        if let healthyAfter, !Self.countRange.contains(healthyAfter) {
+            errors.append("healthcheck.healthyAfter must be 1...255")
+        }
+        if let intervalMs, !Self.durationRange.contains(intervalMs) {
+            errors.append("healthcheck.intervalMs must be 1...600000")
+        }
+        if let port, !PortClaim.portRange.contains(port) {
+            errors.append("healthcheck.port must be 1...65535")
+        }
+        if let timeoutMs, !Self.durationRange.contains(timeoutMs) {
+            errors.append("healthcheck.timeoutMs must be 1...600000")
+        }
+        if let unhealthyAfter, !Self.countRange.contains(unhealthyAfter) {
+            errors.append("healthcheck.unhealthyAfter must be 1...255")
+        }
+        return errors
+    }
 
     public init(
         healthyAfter: Int? = nil,
@@ -340,6 +372,25 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     }
 }
 
+extension ServerStatus {
+    /** The one port to show a human, from the three the status carries.
+
+        Observed first because it is the only one measured rather than intended:
+        it is scraped from what the child actually bound. The supervisor sets it
+        to the expected port whenever the child binds where it was told, so this
+        differs from the effective port only under drift, which `portConflict`
+        reports separately.
+
+        Effective before declared is the part that was getting lost. A server
+        that auto-rebound off a sibling collision has an effective port that its
+        declared port disagrees with, and showing the declared one sends the
+        reader to a port where nothing is listening. Three call sites spelled
+        this precedence three different ways and two of them dropped the
+        effective port, so the menu bar and the statusline disagreed with the
+        agent context about where the same server was. */
+    public var displayPort: Int? { observedPort ?? effectivePort ?? declaredPort }
+}
+
 /** The unified event feed: lifecycle transitions, health changes, and marks as
     one queryable stream. */
 public enum EventKind: String, Codable, Sendable {
@@ -413,6 +464,11 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
     public var logsDir: String
     public var pid: Int
     public var proto: Int
+    /** Present and true only while boot restore is running, so a serving daemon
+        encodes exactly the payload it always did. A reader that does not know
+        the key sees a normal daemon, which is the right default: the flag marks
+        a window measured in seconds. */
+    public var restoring: Bool?
     public var searchPath: String?
     public var socketPath: String
 
@@ -422,6 +478,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         logsDir: String,
         pid: Int,
         proto: Int,
+        restoring: Bool? = nil,
         searchPath: String? = nil,
         socketPath: String
     ) {
@@ -430,6 +487,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         self.logsDir = logsDir
         self.pid = pid
         self.proto = proto
+        self.restoring = restoring
         self.searchPath = searchPath
         self.socketPath = socketPath
     }

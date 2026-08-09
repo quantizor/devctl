@@ -194,14 +194,15 @@ public enum LaunchdAdmin {
         _ = try await install(daemonBinary: binary, paths: paths, forceLegacy: true)
     }
 
-    /** Install (or upgrade) the LaunchAgent. Same bounce contract as restart:
-        capture what is running, drain, swap binary + bootstrap, re-ensure. The
-        daemon's recoverAtStartup is the reboot path; install cannot rely on it
-        alone because a pre-feature state.json may lack resumeOnBoot, and the
-        CLI already knows the live names from status. */
     /** Install (or upgrade) the agent. When `/Applications/devctl.app` exists
         and `forceLegacy` is false, asks the app to register via SMAppService
-        (correct Bundle.main). Otherwise writes the home LaunchAgent. */
+        (correct Bundle.main). Otherwise writes the home LaunchAgent.
+
+        Same bounce contract as restart either way: capture what is running,
+        drain, swap binary + bootstrap, re-ensure. The daemon's recoverAtStartup
+        is the reboot path; install cannot rely on it alone because a pre-feature
+        state.json may lack resumeOnBoot, and the CLI already knows the live
+        names from status. */
     @discardableResult
     public static func install(
         daemonBinary: URL, paths: DevCtlPaths, forceLegacy: Bool = false

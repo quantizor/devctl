@@ -37,6 +37,21 @@ import Testing
         #expect(abs(parsed!.timeIntervalSince(date)) < 0.001)
     }
 
+    /** The formatter builds its fractional digits from a millisecond integer,
+        and Swift's `/` and `%` round toward zero, so a date before the epoch
+        used to render as `.-500Z`: the formatter's own parser rejects that, and
+        a timestamp that will not parse is a log line that cannot be queried.
+        Nothing in devctl formats a pre-1970 date today, so this pins a property
+        of the formatter rather than a live path. */
+    @Test(arguments: [-0.5, -1.25, -1_000_000.001, -0.999])
+    func aDateBeforeTheEpochStillRoundTrips(seconds: Double) throws {
+        let date = Date(timeIntervalSince1970: seconds)
+        let text = JSONCoding.formatISO8601(date)
+        #expect(!text.contains(".-"))
+        let parsed = try #require(JSONCoding.parseISO8601(text))
+        #expect(abs(parsed.timeIntervalSince(date)) < 0.001)
+    }
+
     @Test func ndjsonBufferSplitsFrames() {
         var buffer = NDJSONBuffer()
         let first = buffer.feed(Data("{\"a\":1}\n{\"b\":".utf8))
@@ -85,6 +100,34 @@ import Testing
         )
     }
 
+    /** `daemon.info` is what every other command's hint points at, so its shape
+        is a contract like any other and had no golden until it grew a field. A
+        serving daemon encodes exactly what it always did: `restoring` is omitted
+        rather than false, which is the compatibility claim. */
+    @Test func daemonInfoSchemaGoldenOmitsRestoringWhenServing() throws {
+        let info = DaemonInfo(
+            dataDir: "/data", daemonVersion: "1.4.0", logsDir: "/logs", pid: 42, proto: 1,
+            socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
+    /** The one shape a client branches on to tell a daemon that is coming back
+        from one that is gone. */
+    @Test func daemonInfoSchemaGoldenWhileRestoring() throws {
+        let info = DaemonInfo(
+            dataDir: "/data", daemonVersion: "1.4.0", logsDir: "/logs", pid: 42, proto: 1,
+            restoring: true, socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"restoring":true,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
     /** A main checkout answers exactly as it did before the effective-host
         fields existed: they are omitted when nil, which is the compatibility
         claim, asserted rather than assumed. */
@@ -127,6 +170,24 @@ import Testing
 
     @Test func serverIDShape() {
         #expect(serverID(project: "/a/b", name: "web") == "/a/b::web")
+    }
+
+    /** The menu bar logs and displays failures through `localizedDescription`,
+        and a bare Error struct renders there as "The operation couldn't be
+        completed. (DevCtlKit.WireError error 1.)". That is what a real failed
+        agent register showed: nothing wrong, nowhere, nothing to do, while the
+        message and its remediation command sat unread on the value. */
+    @Test func wireErrorReadsAsItsOwnMessageAndHint() {
+        let withHint = WireError(
+            code: .daemonUnreachable, hint: "run: devctl daemon start",
+            message: "devctld is not listening")
+        #expect(withHint.localizedDescription == "devctld is not listening (run: devctl daemon start)")
+
+        let withoutHint = WireError(code: .internalError, message: "devctld never answered")
+        #expect(withoutHint.localizedDescription == "devctld never answered")
+
+        /** The regression guard: the Foundation default must not come back. */
+        #expect(withHint.localizedDescription.contains("couldn't be completed") == false)
     }
 
     @Test func hash8Stable() {

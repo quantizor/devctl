@@ -172,7 +172,18 @@ enum AgentService {
                     DevCtlLog.app.info(
                         "post-replace spawn missed (ad-hoc LWCR repair is a dead end); re-registering")
                     try await reregister()
-                    try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 10)
+                    /** Not `try`: a miss here used to throw straight out of
+                        launch, which abandoned the sequence and left the daemon
+                        to whatever recovery poll came next, a whole cooldown
+                        later. Falling through instead keeps the escalation in
+                        this call, where the marker is still set and the next
+                        step is already written. */
+                    if (try? await LaunchdAdmin.pollHello(
+                        paths: paths,
+                        timeoutSeconds: AgentRebindPolicy.postReregisterHelloSeconds)) == nil
+                    {
+                        try await waitForHelloOrEscalate(paths: paths, escalate: true)
+                    }
                 }
                 LaunchdAdmin.clearAgentRebindMarker(paths: paths)
             } else {

@@ -20,6 +20,13 @@ public enum LoopbackProbe {
     /** Non-blocking connect with a poll deadline, so an unreachable port cannot
         stall a status call for the kernel's full connect timeout. */
     private static func connects(port: Int, timeoutMs: Int, family: Int32) -> Bool {
+        /** A port arrives from a repo's devservers.json, from `--port`, and from
+            portSpan arithmetic that can run off the end of the range, and
+            `UInt16(port)` traps on anything outside 0...65535. Under launchd
+            KeepAlive that trap is a crash loop: boot restore re-reads the same
+            config and dies again on every relaunch. Nothing can be listening on
+            a port that does not exist, so answer that instead of trapping. */
+        guard let narrowed = UInt16(exactly: port), narrowed > 0 else { return false }
         let sock = socket(family, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { close(sock) }
@@ -30,7 +37,7 @@ public enum LoopbackProbe {
         if family == AF_INET6 {
             var addr = sockaddr_in6()
             addr.sin6_family = sa_family_t(AF_INET6)
-            addr.sin6_port = UInt16(port).bigEndian
+            addr.sin6_port = narrowed.bigEndian
             addr.sin6_addr = in6addr_loopback
             sockLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
             withUnsafeMutablePointer(to: &storage) { ptr in
@@ -39,7 +46,7 @@ public enum LoopbackProbe {
         } else {
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = UInt16(port).bigEndian
+            addr.sin_port = narrowed.bigEndian
             addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
             sockLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             withUnsafeMutablePointer(to: &storage) { ptr in
@@ -54,7 +61,15 @@ public enum LoopbackProbe {
         if result == 0 { return true }
         guard errno == EINPROGRESS else { return false }
         var pollTarget = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
-        guard poll(&pollTarget, 1, Int32(timeoutMs)) == 1 else { return false }
+        /** The same hazard as the port above, on the value sitting beside it: a
+            healthcheck's `timeoutMs` comes from a repo's devservers.json, and
+            `Int32(timeoutMs)` traps outside Int32's range. A negative value does
+            not trap but is worse, because `poll` reads it as "wait forever" and
+            wedges the health task with no error anywhere. Clamping answers both:
+            a probe that cannot report inside its deadline is a probe reporting
+            that nothing is listening. */
+        let deadline = Int32(clamping: max(0, timeoutMs))
+        guard poll(&pollTarget, 1, deadline) == 1 else { return false }
         var soError: Int32 = 0
         var soLen = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &soLen)

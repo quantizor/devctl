@@ -160,6 +160,9 @@ public enum ProjectConfigLoader {
                 warnings.append(
                     "server '\(name)': healthcheck type is http but no url is set, so it will be probed over TCP instead; add a url or set type to tcp")
             }
+            for error in entry.healthcheck?.validationErrors() ?? [] {
+                view.errors.append("server '\(name)': \(error)")
+            }
             if let explicitHost = entry.host, isBareLoopback(explicitHost) {
                 warnings.append(
                     "server '\(name)': host '\(explicitHost)' is a bare loopback address; prefer a '\(recommendedHost)' subdomain")
@@ -361,8 +364,14 @@ public enum DependencyGraph {
             var next: Set<String> = []
             for name in frontier {
                 for dependent in dependents[name] ?? [] {
-                    inDegree[dependent]! -= 1
-                    if inDegree[dependent] == 0 { next.insert(dependent) }
+                    /** Every dependent was seeded into `inDegree`, so the key is
+                        present by construction. Written as a defaulted read
+                        rather than a force unwrap so a future edit to the
+                        seeding loop degrades into a wrong wave rather than a
+                        crash in the daemon's start path. */
+                    let remaining = (inDegree[dependent] ?? 0) - 1
+                    inDegree[dependent] = remaining
+                    if remaining == 0 { next.insert(dependent) }
                 }
             }
             frontier = next.sorted()

@@ -158,7 +158,7 @@ struct ServerDetail: View {
         if let pid = server.pid {
             parts.append("pid \(pid)")
         }
-        if let port = server.observedPort ?? server.declaredPort {
+        if let port = server.displayPort {
             parts.append("port \(port)")
         }
         if let uptime = server.uptimeSec, server.phase == .running || server.phase == .unhealthy {
@@ -248,7 +248,11 @@ struct LogsPane: View {
                 }
             }
         }
-        .task(id: "\(server.server)|\(stream)|\(grep)|\(sinceMark ?? "")") {
+        /** The project is part of the identity: two projects can each register a
+            server of the same name, and without it selecting the second one left
+            this task running against the first, tailing the wrong logs under the
+            right header. */
+        .task(id: "\(server.project)|\(server.server)|\(stream)|\(grep)|\(sinceMark ?? "")") {
             while !Task.isCancelled {
                 await refresh()
                 try? await Task.sleep(for: .seconds(1))

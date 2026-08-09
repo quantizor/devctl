@@ -20,9 +20,14 @@ public struct SecondaryPort: Codable, Equatable, Sendable {
             return "ports.\(name): set offset or port"
         case (.some, .some):
             return "ports.\(name): set offset or port, not both"
-        case (.some(let value), nil) where value < 0:
-            return "ports.\(name): offset must be >= 0"
-        case (nil, .some(let value)) where value < 1 || value > 65_535:
+        case (.some(let value), nil) where !PortClaim.offsetRange.contains(value):
+            /** Bounded above as well as below. With a floor only, an extreme
+                offset produced no config error at all, so `devctl config check`
+                called the file clean and `primary + offset` then trapped on the
+                spawn path, taking the daemon down with a message about the
+                daemon being unreachable. */
+            return "ports.\(name): offset must be 0...65534"
+        case (nil, .some(let value)) where !PortClaim.portRange.contains(value):
             return "ports.\(name): port must be 1...65535"
         default:
             return nil
@@ -33,6 +38,14 @@ public struct SecondaryPort: Codable, Equatable, Sendable {
 /** Every port a spawn claims: primary, optional consecutive span sugar, and
     named secondaries. Pure; allocate / settle / materialize all use this set. */
 public struct PortClaim: Equatable, Sendable {
+    /** What a TCP port can hold, and the widest offset from a primary that can
+        still land inside it. One home, because these bounds were previously
+        stated three times with three different answers: the primary was checked,
+        a secondary port was checked, an offset had a floor but no ceiling, and a
+        span had neither. Every check below reads them from here. */
+    public static let offsetRange = 0...65_534
+    public static let portRange = 1...65_535
+
     /** Fixed ports that never shift with sibling rebind. */
     public var absolute: [Int]
     /** Env key → resolved number for child injection (primary + named with env). */
@@ -88,8 +101,11 @@ public struct PortClaim: Equatable, Sendable {
             injections[envKey] = primary
         }
         if let span = spec.portSpan {
-            guard span >= 1 else {
-                return (nil, "portSpan must be >= 1")
+            /** Bounded above too: `0..<span` below is both the loop bound and an
+                operand of `primary + offset`, so an unbounded span is an
+                unbounded allocation and an overflow at the same time. */
+            guard portRange.contains(span) else {
+                return (nil, "portSpan must be 1...65535")
             }
             guard let primary = effectivePort else {
                 return (nil, "portSpan requires a primary port")
@@ -142,11 +158,31 @@ public struct PortClaim: Equatable, Sendable {
     /** Config-time checks that do not need an effective (rebound) primary. */
     public static func configErrors(spec: ServerSpec) -> [String] {
         var errors: [String] = []
-        if let span = spec.portSpan, span < 1 {
-            errors.append("server '\(spec.name)': portSpan must be >= 1")
+        /** The primary was unchecked while named secondaries were, so a value a
+            TCP port cannot hold reached the socket layer, where narrowing it
+            traps and takes the daemon down on every relaunch. Caught here, where
+            `config check` reads it, rather than at the syscall. */
+        let portInRange = spec.port.map { portRange.contains($0) } ?? true
+        if !portInRange {
+            errors.append("server '\(spec.name)': port must be 1...65535")
+        }
+        let spanInRange = spec.portSpan.map { portRange.contains($0) } ?? true
+        if !spanInRange {
+            errors.append("server '\(spec.name)': portSpan must be 1...65535")
+        }
+        /** Reached only once both operands are known to be in range. Every check
+            here appends and falls through rather than returning, so computing
+            the sum unconditionally trapped on a config holding Int.max: the
+            exact crash the range check above exists to prevent, and a permanent
+            one, since the daemon re-reads the same file on every relaunch. */
+        if portInRange, spanInRange, let port = spec.port, let span = spec.portSpan,
+            span > 1, port + span - 1 > 65_535
+        {
+            errors.append(
+                "server '\(spec.name)': port \(port) with portSpan \(span) runs past 65535")
         }
         var spanOffsets: Set<Int> = []
-        if let span = spec.portSpan, span > 1 {
+        if spanInRange, let span = spec.portSpan, span > 1 {
             spanOffsets = Set(1..<span)
         }
         for (name, secondary) in spec.ports ?? [:] {

@@ -57,11 +57,15 @@ public enum ResourceChange: Equatable, Sendable {
 }
 
 public enum ResourceFingerprint {
-    /** Files at or below this hash whole; larger ones contribute head, tail,
-        size, and mtime. SHA256Portable takes a whole `[UInt8]` with no streaming
-        entry point, so an exact digest of a large file costs a full buffer. */
-    public static let fileByteCap = 8 << 20
-    public static let sampleWindowBytes = 1 << 20
+    /** A single file is hashed whole at any size: the digest streams, so peak
+        memory is one chunk rather than the file, and there is no size above
+        which a middle-only rewrite stops being visible.
+
+        A directory keeps a byte budget, because its cost is the sum over every
+        file in the tree and this runs twice per guarded command. Files past the
+        budget contribute name, inode, size, and mtime but no content hash, and
+        the identity reports `exact: false` so a caller is told the walk was
+        partial instead of being left to assume it was not. */
     public static let directoryContentBudget = 8 << 20
     public static let maxDepth = 6
     public static let maxEntries = 4096
@@ -79,10 +83,15 @@ public enum ResourceFingerprint {
         if info.st_mode & S_IFMT == S_IFDIR {
             return captureDirectory(inode: inode, path: path)
         }
-        let sample = sampleFile(path: path, size: Int64(info.st_size), stat: info)
+        /** An unreadable file is reported as inexact rather than given the digest
+            of an empty read, which would compare equal to every other unreadable
+            file and answer "unchanged" for a resource nobody could open. */
+        guard let digest = DevCtlPaths.hashHex(contentsOf: path) else {
+            return ResourceIdentity(
+                bytes: Int64(info.st_size), entryCount: 1, exact: false, inode: inode, kind: .file)
+        }
         return ResourceIdentity(
-            bytes: Int64(info.st_size), digest: DevCtlPaths.hashHex(sample.bytes), entryCount: 1,
-            exact: sample.exact, inode: inode, kind: .file)
+            bytes: Int64(info.st_size), digest: digest, entryCount: 1, inode: inode, kind: .file)
     }
 
     public static func compare(after: ResourceIdentity, before: ResourceIdentity)
@@ -150,11 +159,9 @@ public enum ResourceFingerprint {
                 + Int64(info.st_mtimespec.tv_nsec)
             var content = "-"
             if info.st_mode & S_IFMT == S_IFREG {
-                if budget >= Int(info.st_size) {
-                    let sample = sampleFile(path: full, size: Int64(info.st_size), stat: info)
-                    content = DevCtlPaths.hashHex(sample.bytes)
+                if budget >= Int(info.st_size), let digest = DevCtlPaths.hashHex(contentsOf: full) {
+                    content = digest
                     budget -= Int(info.st_size)
-                    exact = exact && sample.exact
                 } else {
                     exact = false
                 }
@@ -168,26 +175,4 @@ public enum ResourceFingerprint {
             truncated: clipped)
     }
 
-    /** Whole contents up to the cap, else head plus tail plus size and mtime.
-        Above the cap a middle-only rewrite that preserves head, tail, size, and
-        mtime is invisible; the identity says so through `exact`. */
-    private static func sampleFile(path: String, size: Int64, stat info: stat) -> (
-        bytes: [UInt8], exact: Bool
-    ) {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return ([], false) }
-        defer { try? handle.close() }
-        if size <= Int64(fileByteCap) {
-            let data = (try? handle.readToEnd()) ?? Data()
-            return (Array(data), true)
-        }
-        let head = (try? handle.read(upToCount: sampleWindowBytes)) ?? Data()
-        try? handle.seek(toOffset: UInt64(max(size - Int64(sampleWindowBytes), 0)))
-        let tail = (try? handle.read(upToCount: sampleWindowBytes)) ?? Data()
-        let mtime = Int64(info.st_mtimespec.tv_sec) * 1_000_000_000
-            + Int64(info.st_mtimespec.tv_nsec)
-        var bytes = Array(head)
-        bytes.append(contentsOf: Array(tail))
-        bytes.append(contentsOf: Array("\(size)\t\(mtime)".utf8))
-        return (bytes, false)
-    }
 }

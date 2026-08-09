@@ -329,7 +329,11 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     @Test func rapidAcquireReleaseNeverLeavesCrashed() async throws {
         let fixture = try #require(fixtureServerPath())
         let env = try makeLockEnv()
-        let port = 41_000 + Int.random(in: 0..<500)
+        /** Inside the block TestPorts reserves. At 41_000 these fixtures were
+            outside it, so a failure here leaked one that nothing reaped, and
+            they collided with scripts/smoke.sh, which draws its project-phase
+            ports from that same range. */
+        let port = 45_500 + Int.random(in: 0..<250)
         let body = """
         {
           "servers": {
@@ -400,7 +404,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     @Test func rapidAcquireReleaseWithGrandchildNeverLeavesCrashed() async throws {
         let fixture = try #require(fixtureServerPath())
         let env = try makeLockEnv()
-        let port = 42_000 + Int.random(in: 0..<500)
+        let port = 45_750 + Int.random(in: 0..<250)
         let body = """
         {
           "servers": {
@@ -462,15 +466,4 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     }
 }
 
-private func fixtureServerPath() -> String? {
-    let candidates = [
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appending(path: ".build/debug/fixture-server"),
-        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appending(path: ".build/debug/fixture-server"),
-    ]
-    return candidates.map(\.path).first { FileManager.default.isExecutableFile(atPath: $0) }
-}
+private func fixtureServerPath() -> String? { fixtureServerExecutable() }

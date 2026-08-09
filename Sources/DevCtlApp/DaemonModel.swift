@@ -85,6 +85,9 @@ final class DaemonModel {
     /** Bumped on system theme change so the baked menu bar label re-renders. */
     var appearanceTick = 0
     var daemonReachable = false
+    /** True while the daemon answers but is still bringing supervised servers
+        back, which is a busy daemon rather than a missing one. */
+    var daemonRestoring = false
     /** Last failed recovery, surfaced in the popover so a dead daemon is never
         a dead end. */
     var daemonRecoveryError: String?
@@ -222,11 +225,22 @@ final class DaemonModel {
             }
             SpotlightIndexer.sync(projects: projects)
             daemonRecoveryError = nil
+            daemonRestoring = false
             lastRecoveryAttempt = nil
             daemonStoppedOnPurpose = false
             await surfaceCrashNotifications(client: client)
+        } catch let error as WireError where error.code == .daemonStarting {
+            /** A restoring daemon is answering, so it is reachable: treating the
+                refusal as a dead socket emptied the popover and fired agent
+                recovery at a daemon that was working, across every install,
+                restart and login. The server list is held rather than cleared,
+                since it is about to be correct again. */
+            daemonReachable = true
+            daemonRestoring = true
+            daemonStoppedOnPurpose = false
         } catch {
             daemonReachable = false
+            daemonRestoring = false
             projects = []
             daemonStoppedOnPurpose = LaunchdAdmin.deliberatelyStopped()
             await recoverDaemonIfNeeded()
@@ -379,8 +393,14 @@ final class DaemonModel {
                 params: EventsQueryParams(since: lastEventCheck),
                 expecting: EventsQueryResult.self)
         else { return }
-        for event in feed.events where event.at > lastEventCheck {
-            lastEventCheck = max(lastEventCheck, event.at)
+        /** The cursor advances once, after the whole batch. Advancing it inside
+            the loop made the loop's own `where` clause filter on a value the
+            loop had just moved: event timestamps are millisecond-resolution, so
+            two servers crashing together share an `at` and the second was
+            dropped, permanently, since the cursor had already passed it. */
+        let fresh = feed.events.filter { $0.at > lastEventCheck }
+        lastEventCheck = fresh.reduce(lastEventCheck) { max($0, $1.at) }
+        for event in fresh {
             guard CrashNotificationPolicy.shouldNotify(kind: event.kind, detail: event.detail)
             else { continue }
             let content = UNMutableNotificationContent()
