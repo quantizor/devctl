@@ -1,5 +1,9 @@
 PREFIX ?= $(HOME)/.local
-SIGN_IDENTITY ?= -
+# Resolved lazily, so only the signing targets pay for the keychain lookup, and
+# `make test` never does. Falls back to "-" (ad-hoc) where no Developer ID
+# identity exists, which is what a fresh clone and CI get. Override explicitly
+# with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
+SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
 .PHONY: build test app dmg install clean
 

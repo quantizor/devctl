@@ -577,7 +577,9 @@ echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelo
 pass "x-url rejects unknown slug"
 
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
-"$ROOT/scripts/make-app-bundle.sh" - debug
+# Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so
+# it needs no signing identity and wants no warning about lacking one.
+DEVCTL_ADHOC_EXPECTED=1 "$ROOT/scripts/make-app-bundle.sh" - debug
 SCHEME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$ROOT/devctl.app/Contents/Info.plist")"
 [[ "$SCHEME" == "devctl" ]] || fail "assembled Info.plist scheme was '$SCHEME'"
 pass "assembled app declares CFBundleURLSchemes=devctl"
