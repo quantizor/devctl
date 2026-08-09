@@ -42,8 +42,17 @@ public enum JSONCoding {
             Double(ms)/1000 (which can sit a hair below the true ms) would emit
             ms-1 and break round-trip equality. */
         let ms = Int64((date.timeIntervalSince1970 * 1000).rounded())
-        let base = iso8601Plain.format(Date(timeIntervalSince1970: Double(ms / 1000)))
-        return base.replacing("Z", with: String(format: ".%03dZ", ms % 1000))
+        /** Floored, not truncated. Swift's `/` and `%` round toward zero, so a
+            pre-1970 date took the second that is too late and a remainder that
+            is negative, emitting `.-500Z`, which nothing can parse back. Every
+            date devctl formats today is `Date()` or a parse of its own output,
+            so this is not reachable; a formatter that can emit text its own
+            parser rejects is worth closing anyway. Identical output for every
+            non-negative value, which is what the round-trip goldens pin. */
+        let seconds = Int64((Double(ms) / 1000).rounded(.down))
+        let millis = Int(ms - seconds * 1000)
+        let base = iso8601Plain.format(Date(timeIntervalSince1970: Double(seconds)))
+        return base.replacing("Z", with: String(format: ".%03dZ", millis))
     }
 
     /** The wire and file format carry millisecond precision, and Date equality

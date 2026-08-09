@@ -603,7 +603,7 @@ struct ServerRow: View {
             let port = parsed.port.map { ":\($0)" } ?? ""
             return "\(host)\(port)"
         }
-        if let port = server.declaredPort {
+        if let port = server.displayPort {
             return "port \(port)"
         }
         return server.server

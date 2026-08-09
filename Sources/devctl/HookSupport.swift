@@ -74,6 +74,62 @@ protocol HarnessAdapter: Sendable {
         a human summary of what changed. */
     func install(devctlPath: String) throws -> String
     var name: String { get }
+    /** The harness's own settings file. devctl edits it in place and never owns
+        it, so everything devctl does not recognize has to survive the write. */
+    var settingsURL: URL { get }
+}
+
+/** Reading and writing a settings file devctl does not own. Both halves live
+    here rather than in each adapter because the pair is one mechanism: `install`
+    merges into whatever `loadSettings` returns and hands the whole result to
+    `writeSettings`, so a read that answers "empty" for a file that exists turns
+    the merge into a replacement. Keeping them together also means a harness
+    added later gets the safe version without knowing why it matters. */
+extension HarnessAdapter {
+    /** Absent means an empty seed. Present but unreadable is refused, because
+        the caller writes back everything this returns: collapsing the two is
+        what let one malformed byte in the user's settings take every other
+        hook, permission and key in the file with it on the next write. */
+    func loadSettings() throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: settingsURL.path) else { return [:] }
+        let data: Data
+        do {
+            data = try Data(contentsOf: settingsURL)
+        } catch {
+            throw refusal(because: error.localizedDescription)
+        }
+        /** A zero-byte file is a seed, not a loss: there is nothing in it to erase. */
+        guard !data.isEmpty else { return [:] }
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw refusal(because: error.localizedDescription)
+        }
+        guard let object = parsed as? [String: Any] else {
+            throw refusal(because: "its top level is not a JSON object")
+        }
+        return object
+    }
+
+    func writeSettings(_ settings: [String: Any]) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
+        try FileManager.default.createDirectory(
+            at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: settingsURL)
+    }
+
+    private func refusal(because reason: String) -> WireError {
+        WireError(
+            code: .configInvalid,
+            hint: "devctl hook install",
+            message:
+                "\(settingsURL.path) exists but could not be read (\(reason)), so devctl left it "
+                + "alone. Installing the hook rewrites the whole file from what it reads back, so "
+                + "merging into a file it cannot parse would delete every other setting in it. "
+                + "Repair that file, then rerun")
+    }
 }
 
 let harnessAdapters: [any HarnessAdapter] = [ClaudeCodeAdapter(), CursorAdapter()]
@@ -110,11 +166,7 @@ struct ClaudeCodeAdapter: HarnessAdapter {
 
     func install(devctlPath: String) throws -> String {
         let command = "\(devctlPath) hook claude-session-start"
-        var settings: [String: Any] = [:]
-        if let data = try? Data(contentsOf: settingsURL),
-            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            settings = parsed
-        }
+        var settings = try loadSettings()
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var sessionStart = hooks["SessionStart"] as? [[String: Any]] ?? []
         if let repaired = repairClaudeSessionStart(sessionStart: &sessionStart, command: command) {
@@ -139,14 +191,6 @@ struct ClaudeCodeAdapter: HarnessAdapter {
         settings["hooks"] = hooks
         try writeSettings(settings)
         return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
-    }
-
-    private func writeSettings(_ settings: [String: Any]) throws {
-        let data = try JSONSerialization.data(
-            withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(
-            at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: settingsURL)
     }
 
     /** Rewrite a prior install whose command path no longer resolves (e.g. a
@@ -183,13 +227,8 @@ struct CursorAdapter: HarnessAdapter {
 
     func install(devctlPath: String) throws -> String {
         let command = "\(devctlPath) hook cursor-session-start"
-        var settings: [String: Any] = ["version": 1]
-        if let data = try? Data(contentsOf: settingsURL),
-            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        {
-            settings = parsed
-            if settings["version"] == nil { settings["version"] = 1 }
-        }
+        var settings = try loadSettings()
+        if settings["version"] == nil { settings["version"] = 1 }
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var sessionStart = hooks["sessionStart"] as? [[String: Any]] ?? []
         if let repaired = repairCursorSessionStart(sessionStart: &sessionStart, command: command) {
@@ -209,14 +248,6 @@ struct CursorAdapter: HarnessAdapter {
         settings["hooks"] = hooks
         try writeSettings(settings)
         return "Cursor sessionStart hook installed in \(settingsURL.path)"
-    }
-
-    private func writeSettings(_ settings: [String: Any]) throws {
-        let data = try JSONSerialization.data(
-            withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(
-            at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: settingsURL)
     }
 
     private func repairCursorSessionStart(sessionStart: inout [[String: Any]], command: String)

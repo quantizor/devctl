@@ -83,12 +83,11 @@ enum SetupPerformer: Sendable {
             stampVersion: stamp,
             resourcesPresent: resources,
             runningOutsideApplications: outside)
-        let agentPlist = FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/LaunchAgents/dev.quantizor.devctl.plist")
         let migration = SetupPlanner.isMigration(
             installedCLIExists: FileManager.default.isExecutableFile(atPath: cliURL.path),
             stampExists: stamp != nil,
-            launchAgentExists: FileManager.default.fileExists(atPath: agentPlist.path))
+            launchAgentExists: FileManager.default.fileExists(
+                atPath: LaunchdAdmin.plistURL.path))
         let offers = SetupPlanner.harnessOffers(installedCLIPath: cliURL.path)
         let pathWarning = !SetupPlanner.cliDirectoryOnPATH(
             pathEnv: ProcessInfo.processInfo.environment["PATH"])
@@ -117,9 +116,7 @@ enum SetupPerformer: Sendable {
         let migration = SetupPlanner.isMigration(
             installedCLIExists: fm.isExecutableFile(atPath: cliDest.path),
             stampExists: SetupPlanner.readStamp(at: SetupPlanner.stampURL(paths: paths)) != nil,
-            launchAgentExists: fm.fileExists(
-                atPath: fm.homeDirectoryForCurrentUser
-                    .appending(path: "Library/LaunchAgents/dev.quantizor.devctl.plist").path))
+            launchAgentExists: fm.fileExists(atPath: LaunchdAdmin.plistURL.path))
 
         var notes: [String] = []
         var relocated = false

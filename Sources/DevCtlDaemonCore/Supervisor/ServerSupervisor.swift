@@ -540,7 +540,8 @@ public actor ServerSupervisor {
                 moment devctl recorded it starting; a recycled pid was born long
                 after. One second of slack covers the spawn-to-record gap. */
             guard let startedAt = entry.startedAt,
-                let identity = ProcessTree.identity(of: pid_t(pid))
+                let narrowed = ProcessTree.narrowed(pid),
+                let identity = ProcessTree.identity(of: narrowed)
             else { continue }
             let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
             guard processStart <= startedAt.addingTimeInterval(1) else { continue }

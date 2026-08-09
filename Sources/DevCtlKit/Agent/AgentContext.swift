@@ -135,7 +135,7 @@ public enum AgentContext {
                 .joined(separator: ", ")
             parts.append("heads: \(rendered)")
         }
-        if let port = server.effectivePort ?? server.observedPort ?? server.declaredPort {
+        if let port = server.displayPort {
             parts.append("port \(port)")
         }
         if let ports = server.ports, !ports.isEmpty {

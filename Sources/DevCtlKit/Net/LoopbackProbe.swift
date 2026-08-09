@@ -61,7 +61,15 @@ public enum LoopbackProbe {
         if result == 0 { return true }
         guard errno == EINPROGRESS else { return false }
         var pollTarget = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
-        guard poll(&pollTarget, 1, Int32(timeoutMs)) == 1 else { return false }
+        /** The same hazard as the port above, on the value sitting beside it: a
+            healthcheck's `timeoutMs` comes from a repo's devservers.json, and
+            `Int32(timeoutMs)` traps outside Int32's range. A negative value does
+            not trap but is worse, because `poll` reads it as "wait forever" and
+            wedges the health task with no error anywhere. Clamping answers both:
+            a probe that cannot report inside its deadline is a probe reporting
+            that nothing is listening. */
+        let deadline = Int32(clamping: max(0, timeoutMs))
+        guard poll(&pollTarget, 1, deadline) == 1 else { return false }
         var soError: Int32 = 0
         var soLen = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &soLen)

@@ -419,9 +419,6 @@ public actor Router {
     /** Forget registered projects whose checkout path is gone: stop children,
         bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
         (boot + machine-wide status), not a watcher. */
-    /** Forget registered projects whose checkout path is gone: stop children,
-        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
-        (boot + machine-wide status), not a watcher. */
     public func pruneMissingProjects() async {
         for project in await registry.allProjects() {
             if FileManager.default.fileExists(atPath: project) { continue }
@@ -472,7 +469,7 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
-                if let pid = persisted.pid.map(pid_t.init),
+                if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
                     let identity = ProcessTree.identity(of: pid)
                 {
                     await bounceOrphan(identity, project: project, name: name)
@@ -585,7 +582,7 @@ public actor Router {
             let name = String(id[separator.upperBound...])
             names.insert(name)
             let status = await supervisor.status()
-            if let pid = status.pid.map(pid_t.init),
+            if let pid = status.pid.flatMap(ProcessTree.narrowed),
                 let identity = ProcessTree.identity(of: pid)
             {
                 liveRoots.append((identity: identity, name: name))
@@ -595,7 +592,7 @@ public actor Router {
             guard let separator = id.range(of: "::") else { continue }
             let name = String(id[separator.upperBound...])
             names.insert(name)
-            if let pid = persisted.pid.map(pid_t.init),
+            if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
                 let identity = ProcessTree.identity(of: pid),
                 !liveRoots.contains(where: { $0.identity.pid == pid })
             {
@@ -679,9 +676,6 @@ public actor Router {
         exit(0)
     }
 
-    /** Resolve effective port, apply overlay/worktree host/materialization, and
-        either auto-rebind a sibling conflict or refuse with port-held. Every
-        start-shaped path routes through here. */
     /** Writes a devservers.json from what the daemon already knows, which is the
         only way back for a file that was gitignored and lost. The projection runs
         over the merged view, never a supervisor's spec: a running spec has been
@@ -817,7 +811,11 @@ public actor Router {
         return (projectHost, servers)
     }
 
-    /** `force` resolves and validates even for a server that is currently up,
+    /** Resolve effective port, apply overlay/worktree host/materialization, and
+        either auto-rebind a sibling conflict or refuse with port-held. Every
+        start-shaped path routes through here.
+
+        `force` resolves and validates even for a server that is currently up,
         which is what lets `restart` raise every refusal before it stops
         anything. The port pre-check treats a listener the target itself owns as
         free, so a running server does not report its own port as held. */
@@ -985,11 +983,23 @@ public actor Router {
             || status.observedPort == port || (status.ports?.values.contains(port) ?? false)
     }
 
+    /** How many candidates a sibling rebind tries before giving up and handing
+        back the last one, which then fails the ordinary port-held way. A bound
+        rather than a budget: the search walks consecutive ports, so needing more
+        than this many means the range is genuinely full and a wider search would
+        only take longer to say so. */
+    private static let siblingRebindAttempts = 200
+
+    /** Where a rebind is allowed to land. Stays clear of the low ports a project
+        actually declares and stops short of the ephemeral range the kernel hands
+        to outbound connections, which a listener cannot hold reliably. */
+    private static let siblingPortRange = 10_000...65_000
+
     private func allocateSiblingPort(
         declared: Int, excluding: String, project: String, spec: ServerSpec
     ) async -> Int {
         var candidate = CheckoutIdentity.siblingPortCandidate(declared: declared, project: project)
-        for _ in 0..<200 {
+        for _ in 0..<Self.siblingRebindAttempts {
             let resolved = PortClaim.resolve(spec: spec, effectivePort: candidate)
             if let claim = resolved.claim, resolved.error == nil,
                 await firstBusyPort(in: claim, excluding: excluding) == nil
@@ -997,7 +1007,9 @@ public actor Router {
                 return candidate
             }
             candidate += 1
-            if candidate > 65_000 { candidate = 10_000 }
+            if candidate > Self.siblingPortRange.upperBound {
+                candidate = Self.siblingPortRange.lowerBound
+            }
         }
         return candidate
     }
@@ -1058,9 +1070,7 @@ public actor Router {
             let active =
                 persisted.phase == .running || persisted.phase == .starting
                 || persisted.phase == .unhealthy
-            guard active, let pid = persisted.pid.map(pid_t.init), kill(pid, 0) == 0 else {
-                continue
-            }
+            guard active, let pid = persisted.pid, ProcessTree.isAlive(pid) else { continue }
             guard let separator = id.range(of: "::") else { continue }
             let project = String(id[id.startIndex..<separator.lowerBound])
             let name = String(id[separator.upperBound...])
@@ -1160,8 +1170,14 @@ public actor Router {
         var live: [String] = []
         var paused: [String] = []
         let shouldPause = params.pause ?? true
-        let merged = try? await mergedSpecs(project: params.project)
-        for spec in merged?.specs ?? []
+        /** Not `try?`. Swallowing the merge failure left `specs` empty, so no
+            declarer was found, nothing was paused, and the lock reported success:
+            the caller then ran its migration against a live server holding the
+            resource open, which is the exact accident `lock` exists to prevent.
+            A broken config has to refuse the hold rather than grant a hold that
+            protects nothing. `config init` on the same failure already throws. */
+        let merged = try await mergedSpecs(project: params.project)
+        for spec in merged.specs
         where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
             let status = await supervisor.status()
@@ -1189,7 +1205,7 @@ public actor Router {
         /** Refusing here is correct when devctl cannot tell which state the lock
             guards: taking it anyway would report on the wrong file. */
         let statePath = try LockResource.statePath(
-            project: params.project, resource: params.resource, specs: merged?.specs ?? [])
+            project: params.project, resource: params.resource, specs: merged.specs)
         resourceLocks[key] = LockHolder(
             live: live.isEmpty ? nil : live, pause: shouldPause, paused: paused,
             pid: params.holderPid, resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
@@ -1228,7 +1244,7 @@ public actor Router {
         never leaves servers stopped. */
     private func releaseOrphanedLock(key: String) async {
         guard let holder = resourceLocks[key] else { return }
-        guard kill(pid_t(holder.pid), 0) != 0 else { return }
+        guard !ProcessTree.isAlive(holder.pid) else { return }
         guard let separator = key.range(of: "::") else {
             resourceLocks[key] = nil
             persistLocks()
@@ -1295,7 +1311,7 @@ public actor Router {
         let prefix = "\(canonicalProjectPath(project))::"
         for (key, holder) in resourceLocks {
             guard key.hasPrefix(prefix) else { continue }
-            guard kill(pid_t(holder.pid), 0) == 0 else { continue }
+            guard ProcessTree.isAlive(holder.pid) else { continue }
             if holder.paused.contains(name) { return true }
         }
         return false
@@ -1411,9 +1427,6 @@ public actor Router {
         return annotated
     }
 
-    /** Wave-parallel group start honoring the dependency graph: a wave holds
-        servers whose dependencies all settled in earlier waves. waitFor .started
-        launches without blocking on health; the default blocks until healthy. */
     /** The one restart path. Every refusal happens before anything stops: a
         client-side `stop && ensure` takes the server down and only then discovers
         a held resource or a broken config, leaving it down. The stop is
@@ -1537,6 +1550,9 @@ public actor Router {
         }
     }
 
+    /** Wave-parallel group start honoring the dependency graph: a wave holds
+        servers whose dependencies all settled in earlier waves. waitFor .started
+        launches without blocking on health; the default blocks until healthy. */
     private func groupUp(_ params: GroupParams) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
@@ -1562,8 +1578,9 @@ public actor Router {
         /** Port ownership is checked for the whole set before anything spawns, so
             a held port refuses the rollout instead of leaving half a project up
             next to a server that lost a race it never knew it entered. Servers
-            already up skip the check against their own listeners. */
-        /** Hold the prepared supervisors rather than re-resolving them per wave.
+            already up skip the check against their own listeners.
+
+            Hold the prepared supervisors rather than re-resolving them per wave.
             `supervisor(project:spec:)` re-applies the committed spec to anything
             not yet up, which would discard exactly what prepareSpawn just wrote:
             the rebound port, the worktree host, the substituted argv, and the
@@ -1704,6 +1721,12 @@ public final class ControlServer: Sendable {
         }
     }
 
+    /** How long the listener gets to reach `.ready` before `startAccepting`
+        gives up. Generous: this is not a latency budget, it is the line between
+        a slow start and a daemon that will never serve, and crossing it means
+        the process exits so launchd can try a clean one. */
+    static let listenerReadySeconds = 10.0
+
     /** Returns when the listener is actually accepting, which is later than
         `NWListener.start` returns: start is asynchronous, and the socket path is
         unlinked during init and only recreated on the way to `.ready`. Treating
@@ -1721,6 +1744,9 @@ public final class ControlServer: Sendable {
             still fail later), and resuming a continuation twice traps, so the
             first terminal state wins and the rest are dropped. */
         let settled = OSAllocatedUnfairLock(initialState: false)
+        /** The last state seen, so the deadline below can say what the listener
+            was stuck in rather than only that it never arrived. */
+        let lastState = OSAllocatedUnfairLock(initialState: "setup")
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let claim: @Sendable () -> Bool = {
                 settled.withLock { done in
@@ -1729,7 +1755,27 @@ public final class ControlServer: Sendable {
                     return true
                 }
             }
+            /** `.setup` and `.waiting` are not terminal and were both swallowed
+                by the default arm below, and `.waiting` retries indefinitely by
+                design, so the promise above to throw rather than wait forever was
+                not one the code kept. This deadline is what keeps it. `claim()`
+                already makes a second resume a no-op, so a listener that becomes
+                ready as the deadline fires still wins if it got there first. */
+            Task {
+                try? await Task.sleep(for: .seconds(Self.listenerReadySeconds))
+                guard claim() else { return }
+                let stuck = lastState.withLock { $0 }
+                DevCtlLog.daemon.error("control listener never became ready (state: \(stuck))")
+                continuation.resume(
+                    throwing: WireError(
+                        code: .internalError,
+                        hint: "run: devctl doctor",
+                        message:
+                            "devctld could not start listening on \(socketPath) (listener state: \(stuck))"
+                    ))
+            }
             listener.stateUpdateHandler = { state in
+                lastState.withLock { $0 = String(describing: state) }
                 switch state {
                 case .ready:
                     /** Owner-only, and it has to run here: the socket file does

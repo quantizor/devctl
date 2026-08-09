@@ -160,6 +160,9 @@ public enum ProjectConfigLoader {
                 warnings.append(
                     "server '\(name)': healthcheck type is http but no url is set, so it will be probed over TCP instead; add a url or set type to tcp")
             }
+            for error in entry.healthcheck?.validationErrors() ?? [] {
+                view.errors.append("server '\(name)': \(error)")
+            }
             if let explicitHost = entry.host, isBareLoopback(explicitHost) {
                 warnings.append(
                     "server '\(name)': host '\(explicitHost)' is a bare loopback address; prefer a '\(recommendedHost)' subdomain")

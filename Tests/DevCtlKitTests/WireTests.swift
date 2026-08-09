@@ -37,6 +37,21 @@ import Testing
         #expect(abs(parsed!.timeIntervalSince(date)) < 0.001)
     }
 
+    /** The formatter builds its fractional digits from a millisecond integer,
+        and Swift's `/` and `%` round toward zero, so a date before the epoch
+        used to render as `.-500Z`: the formatter's own parser rejects that, and
+        a timestamp that will not parse is a log line that cannot be queried.
+        Nothing in devctl formats a pre-1970 date today, so this pins a property
+        of the formatter rather than a live path. */
+    @Test(arguments: [-0.5, -1.25, -1_000_000.001, -0.999])
+    func aDateBeforeTheEpochStillRoundTrips(seconds: Double) throws {
+        let date = Date(timeIntervalSince1970: seconds)
+        let text = JSONCoding.formatISO8601(date)
+        #expect(!text.contains(".-"))
+        let parsed = try #require(JSONCoding.parseISO8601(text))
+        #expect(abs(parsed.timeIntervalSince(date)) < 0.001)
+    }
+
     @Test func ndjsonBufferSplitsFrames() {
         var buffer = NDJSONBuffer()
         let first = buffer.feed(Data("{\"a\":1}\n{\"b\":".utf8))

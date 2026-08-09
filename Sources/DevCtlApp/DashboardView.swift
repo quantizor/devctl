@@ -158,7 +158,7 @@ struct ServerDetail: View {
         if let pid = server.pid {
             parts.append("pid \(pid)")
         }
-        if let port = server.observedPort ?? server.declaredPort {
+        if let port = server.displayPort {
             parts.append("port \(port)")
         }
         if let uptime = server.uptimeSec, server.phase == .running || server.phase == .unhealthy {

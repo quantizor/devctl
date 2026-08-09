@@ -5,6 +5,36 @@ import Testing
 @testable import DevCtlDaemonCore
 
 @Suite struct ProcessTreeTests {
+    /** A pid reaches the daemon as an unbounded `Int`, out of `state.json` or a
+        lock holder record on the wire, and `pid_t(_:)` trapped on anything past
+        `Int32`. Under launchd `KeepAlive` that is a crash loop rather than a
+        crash: boot restore re-reads the same file and dies again on relaunch.
+        Returning from these is the assertion; a trap takes the whole runner
+        down rather than failing one case. */
+    @Test(arguments: [Int.max, Int.min, Int(Int32.max) + 1, Int(Int32.min) - 1, 4_294_967_296])
+    func aPidTooLargeForTheKernelIsRefusedRatherThanTrapping(pid: Int) {
+        #expect(ProcessTree.narrowed(pid) == nil)
+        #expect(!ProcessTree.isAlive(pid))
+    }
+
+    /** Zero and negatives are `kill(2)` selectors, not processes: `kill(0, sig)`
+        signals the caller's own process group, which for the daemon is every
+        server it supervises. Narrowing them to a live-looking pid would turn a
+        corrupt state file into a fleet-wide teardown. */
+    @Test(arguments: [0, -1, -42])
+    func aSelectorIsNotAProcess(pid: Int) {
+        #expect(ProcessTree.narrowed(pid) == nil)
+        #expect(!ProcessTree.isAlive(pid))
+    }
+
+    /** The positive control. Without it the two tests above pass just as well
+        against a `narrowed` that refuses everything. */
+    @Test func theRunnersOwnPidIsRepresentableAndAlive() {
+        let mine = Int(getpid())
+        #expect(ProcessTree.narrowed(mine) == pid_t(mine))
+        #expect(ProcessTree.isAlive(mine))
+    }
+
     @Test func allocationRoundsUpAndNeverOverstatesBytes() {
         let stride = MemoryLayout<kinfo_proc>.stride
         let plan = ProcessTree.allocation(forProbedBytes: stride * 3 + 1)

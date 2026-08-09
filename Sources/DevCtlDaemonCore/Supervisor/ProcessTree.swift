@@ -204,6 +204,39 @@ public enum ProcessTree {
         return .failed(errno: ENOMEM)
     }
 
+    /** Narrow a pid that came from outside this process to the `Int32` the
+        signalling and sysctl calls take, or nil when no process could wear that
+        number.
+
+        Pids reach the daemon as unbounded `Int`: out of `state.json` and
+        `registry.json`, and off the wire in a lock holder record. `pid_t(_:)`
+        traps on anything past `Int32`, and a trap under launchd `KeepAlive` is a
+        crash loop, because boot restore re-reads the same file and dies again on
+        every relaunch. That is the failure the defensive-load rule exists to
+        prevent, and narrowing quietly reopened it after JSON parsing had already
+        let the value through.
+
+        Answering nil costs nothing: every caller already handles a pid that
+        names no live process, which is the same conclusion by a different route.
+        Zero and negatives are refused too, since both are process-group and
+        wildcard selectors to `kill(2)` rather than processes: `kill(0, sig)`
+        signals the caller's own group, which for the daemon is every server it
+        supervises. */
+    public static func narrowed(_ pid: Int) -> pid_t? {
+        guard let narrow = pid_t(exactly: pid), narrow > 0 else { return nil }
+        return narrow
+    }
+
+    /** Is some process currently wearing this pid. A number no process can wear
+        answers false, which is the same answer callers already act on for a pid
+        whose process has exited. Says nothing about whether it is the SAME
+        process the caller recorded: that needs `identity(of:)` and a start-time
+        compare. */
+    public static func isAlive(_ pid: Int) -> Bool {
+        guard let narrow = narrowed(pid) else { return false }
+        return kill(narrow, 0) == 0
+    }
+
     /** Live identity for `pid`, or nil if gone / not readable. */
     public static func identity(of pid: pid_t) -> ProcessIdentity? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]

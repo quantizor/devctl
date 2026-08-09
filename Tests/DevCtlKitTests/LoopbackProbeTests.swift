@@ -93,4 +93,26 @@ import Testing
     func anImpossiblePortIsNotListeningRatherThanATrap(port: Int) {
         #expect(!LoopbackProbe.isListening(port: port))
     }
+
+    /** The commit that guarded the port left the value beside it unguarded, so
+        `Int32(timeoutMs)` still trapped on a healthcheck `timeoutMs` a repo
+        supplied. Returning from this test is the assertion: a trap would take
+        the whole runner down rather than fail one case.
+
+        The negative argument is the one that is not a trap and is worse for it:
+        `poll` reads a negative deadline as wait-forever, so before the clamp
+        this wedged the health task silently instead of reporting anything. It
+        is bounded here by the port being closed, so the probe must answer
+        promptly rather than block. */
+    @Test(arguments: [-1, Int.min, Int.max, Int(Int32.max) + 1])
+    func anImpossibleTimeoutAnswersRatherThanTrappingOrHanging(timeoutMs: Int) {
+        /** Port 1 is privileged, so nothing on a developer machine is bound to
+            it and the connect is refused with an immediate RST. That matters for
+            the clock, not just the verdict: a port that is bound but NOT
+            listening (which is how the test above builds its negative) gets no
+            RST, so the IPv4 connect sits in SYN retransmit for about 7.8s and
+            these four cases alone cost more than a quarter of the suite budget.
+            Measured both ways before choosing. */
+        #expect(!LoopbackProbe.isListening(port: 1, timeoutMs: timeoutMs))
+    }
 }

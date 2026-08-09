@@ -860,7 +860,7 @@ struct Statusline: AsyncParsableCommand {
             !list.servers.isEmpty
         else { return }
         let parts = list.servers.map { server in
-            let port = (server.observedPort ?? server.declaredPort).map { ":\($0)" } ?? ""
+            let port = server.displayPort.map { ":\($0)" } ?? ""
             let state =
                 switch server.phase {
                 case .running: "ok"
