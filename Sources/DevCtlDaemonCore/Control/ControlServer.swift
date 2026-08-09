@@ -119,6 +119,17 @@ public actor Router {
             case .serverRegister:
                 let request = try decoder.decode(WireRequest<RegisterParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
+                /** register is the second way a spec enters the daemon, and until
+                    now the only unchecked one: the committed-file path runs the
+                    validator, so a spec `config check` would reject could still be
+                    registered directly and then spawned. Refuse it at the seam. */
+                let specErrors = request.params.spec.validationErrors()
+                guard specErrors.isEmpty else {
+                    throw WireError(
+                        code: .configInvalid,
+                        hint: "run: devctl config check",
+                        message: specErrors.joined(separator: "; "))
+                }
                 try await registry.register(project: project, spec: request.params.spec)
                 let supervisor = await supervisor(project: project, spec: request.params.spec)
                 await events.post(
@@ -131,11 +142,12 @@ public actor Router {
                     name: request.params.name, port: request.params.port, project: project)
                 let merged = try await mergedSpecs(project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                await recordTrustIfNeeded(project: project, name: target.name, fileNames: merged.fileNames)
                 if let spec = merged.specs.first(where: { $0.name == target.name }) {
                     try await lockGate(project: project, spec: spec)
                 }
-                try await prepareSpawn(target: target, supervisor: supervisor, portOverride: request.params.port)
+                try await prepareSpawn(
+                    target: target, supervisor: supervisor, portOverride: request.params.port,
+                    userInitiated: true)
                 let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
                 DevCtlLog.daemon.info(
                     "ensure \(target.name)@\(project) -> \(result.server.phase.rawValue)")
@@ -147,12 +159,12 @@ public actor Router {
                     name: request.params.name, port: request.params.port, project: project)
                 let merged = try await mergedSpecs(project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                await recordTrustIfNeeded(
-                    project: project, name: target.name, fileNames: merged.fileNames)
                 if let spec = merged.specs.first(where: { $0.name == target.name }) {
                     try await lockGate(project: project, spec: spec)
                 }
-                try await prepareSpawn(target: target, supervisor: supervisor, portOverride: request.params.port)
+                try await prepareSpawn(
+                    target: target, supervisor: supervisor, portOverride: request.params.port,
+                    userInitiated: true)
                 return try respond(id: head.id, result: ServerResult(server: await supervisor.start()))
             case .serverStatus:
                 let request = try decoder.decode(WireRequest<ProjectParams>.self, from: line)
@@ -205,7 +217,23 @@ public actor Router {
                 return try respond(id: head.id, result: try await initConfig(request.params))
             case .projectWriteConfig:
                 let request = try decoder.decode(WireRequest<WriteConfigParams>.self, from: line)
-                let url = ProjectConfigLoader.configURL(project: request.params.project)
+                let project = canonicalProjectPath(request.params.project)
+                let url = ProjectConfigLoader.configURL(project: project)
+                /** writeConfig edits a project's committed config in place, so it
+                    may only target a project devctl already tracks or one whose
+                    devservers.json already exists. Without this a wire client
+                    could hand any path and AtomicFile.write, which creates
+                    intermediate directories, would drop a devservers.json
+                    anywhere on disk. Creating a config for a brand-new project is
+                    `config init`, not this method. */
+                let known = await registry.project(project) != nil
+                let configExists = FileManager.default.fileExists(atPath: url.path)
+                guard known || configExists else {
+                    throw WireError(
+                        code: .notFound,
+                        hint: "run: devctl config init in the project, or register a server there first",
+                        message: "refusing to write devservers.json for a project devctl does not track: \(project)")
+                }
                 let currentHash = (try? Data(contentsOf: url)).map {
                     DevCtlPaths.hash8(String(decoding: $0, as: UTF8.self))
                 } ?? ""
@@ -222,7 +250,7 @@ public actor Router {
                 } catch {
                     throw ProjectConfigLoader.configError(from: error, at: url)
                 }
-                let view = ProjectConfigLoader.validate(config: parsed, project: request.params.project)
+                let view = ProjectConfigLoader.validate(config: parsed, project: project)
                 guard view.errors.isEmpty else {
                     throw WireError(
                         code: .configInvalid,
@@ -230,7 +258,7 @@ public actor Router {
                         message: view.errors.joined(separator: "; "))
                 }
                 try AtomicFile.write(Data(request.params.content.utf8), to: url)
-                configCache[request.params.project] = nil
+                configCache[project] = nil
                 return try respond(
                     id: head.id,
                     result: CheckResult(
@@ -258,7 +286,9 @@ public actor Router {
                 let request = try decoder.decode(WireRequest<RestartParams>.self, from: line)
                 var params = request.params
                 params.project = canonicalProjectPath(params.project)
-                return try respond(id: head.id, result: try await restartServers(params))
+                return try respond(
+                    id: head.id,
+                    result: try await restartServers(params, userInitiated: true))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(
@@ -289,7 +319,9 @@ public actor Router {
                 return try respond(id: head.id, result: result)
             case .logsQuery:
                 let request = try decoder.decode(WireRequest<LogsQueryParams>.self, from: line)
-                let target = ServerTargetParams(name: request.params.name, project: request.params.project)
+                let target = ServerTargetParams(
+                    name: request.params.name,
+                    project: canonicalProjectPath(request.params.project))
                 let supervisor = try await resolvedSupervisor(target)
                 var since = request.params.since
                 if let markID = request.params.sinceMark {
@@ -316,15 +348,16 @@ public actor Router {
                 return try respond(id: head.id, result: LogsQueryResult(lines: lines))
             case .logsMark:
                 let request = try decoder.decode(WireRequest<MarkParams>.self, from: line)
+                let project = canonicalProjectPath(request.params.project)
                 let label = request.params.label ?? "cli"
                 var marks: [PlacedMark] = []
                 if request.params.all == true {
-                    for spec in await registry.specs(project: request.params.project) {
-                        let supervisor = await supervisor(project: request.params.project, spec: spec)
+                    for spec in await registry.specs(project: project) {
+                        let supervisor = await supervisor(project: project, spec: spec)
                         marks.append(await supervisor.placeMark(label: label, text: request.params.text))
                     }
                 } else if let name = request.params.name {
-                    let target = ServerTargetParams(name: name, project: request.params.project)
+                    let target = ServerTargetParams(name: name, project: project)
                     let supervisor = try await resolvedSupervisor(target)
                     marks.append(await supervisor.placeMark(label: label, text: request.params.text))
                 } else {
@@ -333,8 +366,11 @@ public actor Router {
                 return try respond(id: head.id, result: MarkResult(marks: marks))
             case .eventsQuery:
                 let request = try decoder.decode(WireRequest<EventsQueryParams>.self, from: line)
+                /** Empty/nil project means machine-wide; only a real project path
+                    is canonicalized, matching how EventStore.query keys the feed. */
+                let project = request.params.project.map(canonicalProjectPath)
                 var since = request.params.since
-                if let markID = request.params.sinceMark, let project = request.params.project {
+                if let markID = request.params.sinceMark, let project {
                     for spec in await registry.specs(project: project) {
                         let supervisor = await supervisor(project: project, spec: spec)
                         if let markDate = await supervisor.resolveMark(markID) {
@@ -349,20 +385,21 @@ public actor Router {
                     }
                 }
                 let events = await events.query(
-                    project: request.params.project, since: since, tail: request.params.tail)
+                    project: project, since: since, tail: request.params.tail)
                 return try respond(id: head.id, result: EventsQueryResult(events: events))
             case .serverWhy:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
-                _ = try await resolvedSupervisor(request.params)
-                let merged = try await mergedSpecs(project: request.params.project)
+                let project = canonicalProjectPath(request.params.project)
+                let target = ServerTargetParams(name: request.params.name, project: project)
+                _ = try await resolvedSupervisor(target)
+                let merged = try await mergedSpecs(project: project)
                 var statuses: [String: ServerStatus] = [:]
                 var specsByName: [String: ServerSpec] = [:]
                 for spec in merged.specs {
                     statuses[spec.name] = await annotatedStatus(
-                        project: request.params.project, spec: spec)
+                        project: project, spec: spec)
                     specsByName[spec.name] = spec
                 }
-                let project = request.params.project
                 let paths = self.paths
                 let result = WhyEngine.diagnose(
                     target: request.params.name,
@@ -819,9 +856,17 @@ public actor Router {
         which is what lets `restart` raise every refusal before it stops
         anything. The port pre-check treats a listener the target itself owns as
         free, so a running server does not report its own port as held. */
+    /** Every start-shaped path funnels through here, which is why the trust gate
+        lives here rather than at each call site. `userInitiated` is the security
+        boundary: an explicit command (ensure, start, up, restart) acting on a
+        server declared in the committed devservers.json IS the user's approval,
+        so it records trust and proceeds. An autonomous path (boot restore, the
+        watch sweep) must not act on a project's committed config until that
+        approval was given, so it refuses. A spec that came from `register`
+        rather than the file carries its own approval and is never gated. */
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
-        force: Bool = false
+        force: Bool = false, userInitiated: Bool = false
     ) async throws {
         if !force {
             let current = await supervisor.status()
@@ -838,6 +883,18 @@ public actor Router {
                 code: .notFound,
                 hint: "run: devctl status --json",
                 message: "no server named '\(target.name)' in \(target.project)")
+        }
+        if merged.fileNames.contains(target.name) {
+            let trusted = await registry.isTrusted(project: target.project)
+            if userInitiated {
+                if !trusted { try? await registry.setTrusted(project: target.project) }
+            } else if !trusted {
+                throw WireError(
+                    code: .notTrusted,
+                    hint: "run: devctl ensure \(target.name) --project \(target.project)",
+                    message:
+                        "refusing to start '\(target.name)' from \(target.project)/devservers.json: this project's committed config has not been approved. Start a server there once by hand to approve it.")
+            }
         }
         let overlay = LocalOverlay.load(project: target.project)
         let overlayServer = overlay?.servers?[target.name]
@@ -1135,14 +1192,6 @@ public actor Router {
         return view
     }
 
-    /** Acting on a committed config is what records trust: an explicit start or
-        ensure IS the approval. The hook advertises only already-trusted projects. */
-    private func recordTrustIfNeeded(project: String, name: String, fileNames: Set<String>) async {
-        if fileNames.contains(name), await !registry.isTrusted(project: project) {
-            try? await registry.setTrusted(project: project)
-        }
-    }
-
     /** Acquire: refuse if another live holder owns it, pause active declarers
         without retiring boot intent, persist the hold, return who was paused. */
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
@@ -1437,9 +1486,9 @@ public actor Router {
         a held resource or a broken config, leaving it down. The stop is
         non-retiring because the server is coming straight back, so resume-on-boot
         survives what `stop` would otherwise clear. */
-    private func restartServers(_ params: RestartParams, rearm: Bool = true) async throws
-        -> GroupResult
-    {
+    private func restartServers(
+        _ params: RestartParams, rearm: Bool = true, userInitiated: Bool = false
+    ) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
         if let names = params.names {
@@ -1453,8 +1502,6 @@ public actor Router {
         }
         var prepared: [(spec: ServerSpec, supervisor: ServerSupervisor)] = []
         for spec in wanted {
-            await recordTrustIfNeeded(
-                project: params.project, name: spec.name, fileNames: merged.fileNames)
             try await lockGate(project: params.project, spec: spec)
             try await refuseIfPaused(project: params.project, spec: spec)
             prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
@@ -1471,7 +1518,8 @@ public actor Router {
             try await prepareSpawn(
                 target: ServerTargetParams(
                     name: entry.spec.name, port: params.port, project: params.project),
-                supervisor: entry.supervisor, portOverride: params.port, force: true)
+                supervisor: entry.supervisor, portOverride: params.port, force: true,
+                userInitiated: userInitiated)
         }
         var results: [EnsureResult] = []
         for entry in prepared {
@@ -1498,9 +1546,11 @@ public actor Router {
                 continue
             }
             guard let split = Self.splitServerID(id) else { continue }
-            /** The daemon never acts on a project's config before trust is
-                recorded. A running server implies trust was recorded, so this is
-                belt and braces rather than the only guard. */
+            /** The daemon never acts on a project's committed config before trust
+                is recorded. `restartServers` runs autonomously here (userInitiated
+                defaults to false), so `prepareSpawn` enforces the same gate; this
+                skips the work early and cleanly for an untrusted project rather
+                than letting the restart raise and defer. */
             guard await registry.isTrusted(project: split.project) else { continue }
             let relative = changed.map {
                 $0.replacingOccurrences(of: split.project + "/", with: "")
@@ -1576,10 +1626,6 @@ public actor Router {
             }
             wanted = wanted.filter { keep.contains($0.name) }
         }
-        for spec in wanted {
-            await recordTrustIfNeeded(
-                project: params.project, name: spec.name, fileNames: merged.fileNames)
-        }
         /** Port ownership is checked for the whole set before anything spawns, so
             a held port refuses the rollout instead of leaving half a project up
             next to a server that lost a race it never knew it entered. Servers
@@ -1597,7 +1643,8 @@ public actor Router {
                 name: spec.name, port: params.port, project: params.project)
             let supervisor = await supervisor(project: params.project, spec: spec)
             try await prepareSpawn(
-                target: target, supervisor: supervisor, portOverride: params.port)
+                target: target, supervisor: supervisor, portOverride: params.port,
+                userInitiated: true)
             prepared[spec.name] = supervisor
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
