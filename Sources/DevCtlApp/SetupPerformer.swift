@@ -17,10 +17,10 @@ enum SetupPerformer: Sendable {
     }
 
     struct Presentation: Sendable {
+        var cliOwnedByBrew: Bool
         var installAppToApplications: Bool
         var migration: Bool
         var offers: [HarnessOffer]
-        var pathWarning: Bool
         var replacingApplicationsApp: Bool
         var shouldPresent: Bool
     }
@@ -72,7 +72,11 @@ enum SetupPerformer: Sendable {
     ) -> Presentation {
         let resources = resourceURLs(bundle: bundle) != nil
         let bundled = bundledVersion(bundle: bundle)
-        let cliURL = SetupPlanner.installedCLIURL()
+        let owner = SetupPlanner.cliOwner(bundle: bundle)
+        /** Read the installed version from the path this owner actually uses, so
+            an absent `~/.local/bin/devctl` under a brew install does not read as
+            "never installed" and force the panel open on every launch. */
+        let cliURL = owner.cliPath
         let installedVersion = readCLIVersion(at: cliURL)
         let stamp = SetupPlanner.readStamp(at: SetupPlanner.stampURL(paths: paths))
         let outside = SetupPlanner.isRunningOutsideApplications(
@@ -89,15 +93,22 @@ enum SetupPerformer: Sendable {
             launchAgentExists: FileManager.default.fileExists(
                 atPath: LaunchdAdmin.plistURL.path))
         let offers = SetupPlanner.harnessOffers(installedCLIPath: cliURL.path)
-        let pathWarning = !SetupPlanner.cliDirectoryOnPATH(
-            pathEnv: ProcessInfo.processInfo.environment["PATH"])
         return Presentation(
+            cliOwnedByBrew: owner.isHomebrew,
             installAppToApplications: outside,
             migration: migration,
             offers: offers,
-            pathWarning: pathWarning,
             replacingApplicationsApp: outside && SetupPlanner.applicationsAppExists(),
             shouldPresent: should)
+    }
+
+    /** Whether to warn that the CLI directory is off the user's PATH. Split from
+        `evaluatePresentation` because it sources the login shell (up to a 12s
+        ceiling) and must never run on the main thread; the panel fills this in
+        after it opens. Owner-aware: brew's bin is on PATH via `brew shellenv`, so
+        a brew-owned CLI never warrants the warning. */
+    nonisolated static func evaluatePathWarning() -> Bool {
+        !SetupPlanner.cliDirectoryOnUserPATH(owner: SetupPlanner.cliOwner())
     }
 
     /** Install app (when needed), CLI, register the SMAppService agent from
@@ -110,7 +121,11 @@ enum SetupPerformer: Sendable {
     ) async throws -> Result {
         guard let resources = resourceURLs(bundle: bundle) else { throw Failure.missingResources }
         let paths = DevCtlPaths()
-        let cliDest = SetupPlanner.installedCLIURL()
+        let owner = SetupPlanner.cliOwner(bundle: bundle)
+        /** The CLI to drive for hook install and to record in the hook command.
+            Under brew this is the shim in brew's bin, which is on PATH and
+            survives upgrades; under a DMG install it is `~/.local/bin/devctl`. */
+        let cliDest = owner.cliPath
         let daemonSibling = SetupPlanner.installedDaemonSiblingURL()
         let fm = FileManager.default
         let migration = SetupPlanner.isMigration(
@@ -147,9 +162,16 @@ enum SetupPerformer: Sendable {
             notes.append("Migrating the existing CLI and daemon to this version.")
         }
 
-        try SetupPlanner.installBinary(from: resources.cli, to: cliDest)
-        try SetupPlanner.installBinary(from: resources.daemon, to: daemonSibling)
-        notes.append("Installed CLI to \(cliDest.path)")
+        /** Homebrew owns the CLI symlink in its bin and the daemon runs from the
+            bundle's `Contents/Helpers/devctld` under SMAppService, so installing a
+            second copy to `~/.local/bin` would only orphan it on cask uninstall. */
+        if owner.isHomebrew {
+            notes.append("CLI managed by Homebrew at \(cliDest.path)")
+        } else {
+            try SetupPlanner.installBinary(from: resources.cli, to: cliDest)
+            try SetupPlanner.installBinary(from: resources.daemon, to: daemonSibling)
+            notes.append("Installed CLI to \(cliDest.path)")
+        }
 
         /** SMAppService must run with Bundle.main as the hosting app. After a
             relocate, the Applications copy registers on launch; otherwise do it
@@ -179,18 +201,25 @@ enum SetupPerformer: Sendable {
 
         var harnessSummaries: [String] = []
         for harness in selectedHarnesses.sorted() {
-            let out = try runCLI(cliDest, arguments: ["hook", "install", "--harness", harness])
+            /** `--devctl-path` pins the command the hook records to this owner's
+                CLI path. Without it the invoked CLI resolves its own symlink back
+                into the bundle, so a brew install would record the internal
+                Resources path instead of the stable shim in brew's bin. */
+            let out = try runCLI(
+                cliDest,
+                arguments: ["hook", "install", "--harness", harness, "--devctl-path", cliDest.path])
             harnessSummaries.append(out.isEmpty ? "Installed \(harness) hook" : out)
         }
 
         try SetupPlanner.writeStamp(
             version: bundledVersion(bundle: bundle), to: SetupPlanner.stampURL(paths: paths))
 
-        let onPATH = SetupPlanner.cliDirectoryOnPATH(
-            pathEnv: ProcessInfo.processInfo.environment["PATH"])
+        /** Bound once: the login-shell PATH is captured by spawning a shell.
+            Owner-aware, so a brew install (whose bin is already on PATH) does not
+            print the `~/.local/bin` remedy. */
+        let onPATH = SetupPlanner.cliDirectoryOnUserPATH(owner: owner)
         if !onPATH {
-            notes.append(
-                "\(SetupPlanner.defaultCLIDirectory().path) is not on your PATH. Add it so shells and agents can find `devctl`.")
+            notes.append(SetupPlanner.pathRemedy)
         }
 
         return Result(
@@ -201,28 +230,74 @@ enum SetupPerformer: Sendable {
             relocatedToApplications: relocated)
     }
 
-    /** Quit every other running copy so /Applications/devctl.app can be replaced. */
+    /** Symlinks resolved and the path standardized, so `/Volumes/devctl` and
+        `/Applications` compare by what they are rather than how they were
+        spelled. Every bundle-path comparison in the app goes through here. */
+    nonisolated static func canonicalPath(_ url: URL?) -> String? {
+        url?.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /** Quit at launch when an older copy of this same bundle is already running.
+        Returns whether this process is on its way out, so the caller can skip the
+        rest of launch.
+
+        The DMG copy and the Applications copy overlap for the length of the
+        handoff and are both wanted, so this compares bundle paths: two copies at
+        one path are the failure, and `AppInstancePolicy` decides which of them
+        leaves. */
     @MainActor
-    static func quitOtherInstances() async {
-        let peers = NSWorkspace.shared.runningApplications.filter {
-            $0.bundleIdentifier == appBundleIdentifier && $0 != .current
+    static func quitIfTwinIsRunning() -> Bool {
+        guard let ownPath = canonicalPath(Bundle.main.bundleURL) else { return false }
+        let current = NSRunningApplication.current
+        let own = AppInstance(
+            bundlePath: ownPath,
+            launchDate: current.launchDate,
+            processIdentifier: current.processIdentifier)
+        let running = NSWorkspace.shared.runningApplications.compactMap { app -> AppInstance? in
+            guard app.bundleIdentifier == appBundleIdentifier,
+                let path = canonicalPath(app.bundleURL)
+            else { return nil }
+            return AppInstance(
+                bundlePath: path,
+                launchDate: app.launchDate,
+                processIdentifier: app.processIdentifier)
         }
-        for app in peers {
+        guard AppInstancePolicy.shouldStandDown(own: own, running: running) else { return false }
+        DevCtlLog.app.info("\(ownPath) is already running; this copy is standing down")
+        NSApp.terminate(nil)
+        return true
+    }
+
+    /** Quit every other running copy so /Applications/devctl.app can be replaced.
+        Returns whether the field is clear: replacing a bundle out from under a
+        live process leaves that process running code that no longer exists on
+        disk, so a caller that ignores a false here does real damage. */
+    @MainActor
+    static func quitOtherInstances() async -> Bool {
+        for app in peerInstances() {
             app.terminate()
         }
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
-            let still = NSWorkspace.shared.runningApplications.contains {
-                $0.bundleIdentifier == appBundleIdentifier && $0 != .current
-            }
-            if !still { return }
+            if peerInstances().isEmpty { return true }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        for app in NSWorkspace.shared.runningApplications
-        where app.bundleIdentifier == appBundleIdentifier && app != .current {
+        for app in peerInstances() {
             app.forceTerminate()
         }
-        try? await Task.sleep(for: .milliseconds(200))
+        let forcedDeadline = Date().addingTimeInterval(2)
+        while Date() < forcedDeadline {
+            if peerInstances().isEmpty { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return peerInstances().isEmpty
+    }
+
+    @MainActor
+    private static func peerInstances() -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == appBundleIdentifier && $0 != .current
+        }
     }
 
     /** Open the Applications copy and quit this (DMG/Downloads) process. Quitting
@@ -233,7 +308,7 @@ enum SetupPerformer: Sendable {
     @MainActor
     static func relaunchFromApplicationsAndQuit() {
         let url = URL(fileURLWithPath: SetupPlanner.applicationsAppPath)
-        let appsPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let appsPath = canonicalPath(url)
         let selfPID = ProcessInfo.processInfo.processIdentifier
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -247,8 +322,7 @@ enum SetupPerformer: Sendable {
                         "relaunch from \(SetupPlanner.applicationsAppPath) failed: \(error.localizedDescription)")
                     return
                 }
-                let launchedPath = app?.bundleURL?
-                    .resolvingSymlinksInPath().standardizedFileURL.path
+                let launchedPath = canonicalPath(app?.bundleURL)
                 let differentProcess = (app?.processIdentifier).map { $0 != selfPID } ?? false
                 if differentProcess, launchedPath == appsPath {
                     NSApp.terminate(nil)
@@ -256,46 +330,40 @@ enum SetupPerformer: Sendable {
                 }
                 DevCtlLog.app.info(
                     "openApplication returned self or wrong path; waiting for Applications peer")
-                let deadline = Date().addingTimeInterval(8)
-                while Date() < deadline {
-                    let peer = NSWorkspace.shared.runningApplications.first { running in
-                        guard running.bundleIdentifier == appBundleIdentifier else { return false }
-                        guard running.processIdentifier != selfPID else { return false }
-                        let path = running.bundleURL?
-                            .resolvingSymlinksInPath().standardizedFileURL.path
-                        return path == appsPath
-                    }
-                    if peer != nil {
-                        NSApp.terminate(nil)
-                        return
-                    }
-                    try? await Task.sleep(for: .milliseconds(100))
+                if await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 8) {
+                    NSApp.terminate(nil)
+                    return
                 }
                 /** Last resort: `open(1)` bypasses some LS same-bundle shortcuts. */
                 let open = LaunchdAdmin.shell("/usr/bin/open", [SetupPlanner.applicationsAppPath])
-                if open.status == 0 {
-                    let openDeadline = Date().addingTimeInterval(5)
-                    while Date() < openDeadline {
-                        let peer = NSWorkspace.shared.runningApplications.contains { running in
-                            guard running.bundleIdentifier == appBundleIdentifier else {
-                                return false
-                            }
-                            guard running.processIdentifier != selfPID else { return false }
-                            let path = running.bundleURL?
-                                .resolvingSymlinksInPath().standardizedFileURL.path
-                            return path == appsPath
-                        }
-                        if peer {
-                            NSApp.terminate(nil)
-                            return
-                        }
-                        try? await Task.sleep(for: .milliseconds(100))
-                    }
+                if open.status == 0,
+                    await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 5)
+                {
+                    NSApp.terminate(nil)
+                    return
                 }
                 DevCtlLog.app.error(
                     "could not hand off to \(SetupPlanner.applicationsAppPath); staying alive so setup is not lost")
             }
         }
+    }
+
+    /** Poll for another process of this app running from `path`. */
+    @MainActor
+    private static func waitForPeer(
+        atPath path: String?, otherThan selfPID: Int32, seconds: TimeInterval
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            let found = NSWorkspace.shared.runningApplications.contains { running in
+                running.bundleIdentifier == appBundleIdentifier
+                    && running.processIdentifier != selfPID
+                    && canonicalPath(running.bundleURL) == path
+            }
+            if found { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return false
     }
 
     nonisolated private static func readCLIVersion(at url: URL) -> String? {
