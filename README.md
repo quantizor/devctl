@@ -1,6 +1,8 @@
 # devctl
 
-A macOS menu bar command center for local dev servers, built so coding agents never lose track of the servers they started.
+An agent-friendly coordinator for many devservers and their unique configurations.
+
+A macOS menu bar app and a CLI, built so coding agents never lose track of the servers they started.
 
 ![devctl menu bar popover showing per-project servers, status dots, and pinned heads](./docs/images/menu-bar.png)
 

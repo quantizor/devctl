@@ -1,6 +1,6 @@
 # devctl
 
-macOS menu bar command center for local dev servers, built so coding agents never lose track of running servers across compaction and session boundaries. All Swift, no Xcode. Design spec and phase plan: docs/design.md (the map for everything not yet built). CLI JSON contract: docs/cli-contract.md. Open work: BACKLOG.md. Commit and changeset hygiene: CONTRIBUTING.md.
+An agent-friendly coordinator for many devservers and their unique configurations. A macOS menu bar app and CLI over a launchd-supervised daemon, built so coding agents never lose track of running servers across compaction and session boundaries. All Swift, no Xcode. Design spec and phase plan: docs/design.md (the map for everything not yet built). CLI JSON contract: docs/cli-contract.md. Open work: BACKLOG.md. Commit and changeset hygiene: CONTRIBUTING.md.
 
 Identity and stack
 - Swift 6.3 toolchain, swift-tools-version 6.2, Swift 6 language mode with strict concurrency. macOS 14+, single SPM package.
