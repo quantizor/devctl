@@ -5,3 +5,6 @@ devctl.app/
 dist/
 *.corrupt-*
 .DS_Store
+# Maintainer-local backlog: holds release-ops detail and known-issue notes that
+# do not belong in a public repo. Tracked history still contains earlier copies.
+/BACKLOG.md
