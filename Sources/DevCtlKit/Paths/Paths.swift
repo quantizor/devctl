@@ -53,13 +53,22 @@ public struct DevCtlPaths: Sendable {
         of `../../../x` made the daemon create directories outside the logs tree
         and write raw child stdout into them. Separators and dot-only components
         are replaced rather than rejected so an odd name still gets a home, and
-        the hash keeps two names that flatten to the same text apart. */
+        the hash keeps two names that flatten to the same text apart.
+
+        Every name the flattening CHANGED carries the hash, not only the ones
+        that would have escaped. Hashing just the escaping cases left `a/b` and
+        `a_b` both landing on `a_b`, so two servers shared one log directory and
+        intermixed their output, which is the collision this comment already
+        claimed to have handled. A name the flattening left alone cannot collide
+        with a flattened one on its own text, so it keeps a readable directory
+        with no suffix. */
     public static func serverPathComponent(_ server: String) -> String {
         let flattened = String(
             server.map { $0 == "/" || $0 == ":" || $0 == "\0" ? "_" : $0 })
         let resolvesToADirectoryOtherThanItself =
             flattened == "." || flattened == ".." || flattened.isEmpty
-        return resolvesToADirectoryOtherThanItself ? "server-\(hash8(server))" : flattened
+        if resolvesToADirectoryOtherThanItself { return "server-\(hash8(server))" }
+        return flattened == server ? flattened : "\(flattened)-\(hash8(server))"
     }
 
     /** Per-server log directory: `<slug>-<hash8>/<server>`. The slug keeps paths

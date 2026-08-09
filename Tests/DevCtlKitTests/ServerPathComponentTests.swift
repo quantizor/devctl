@@ -39,10 +39,36 @@ import Testing
     }
 
     /** Two names that flatten to the same text must not share a log directory,
-        or one server's output lands in another's file. */
-    @Test func namesThatFlattenAlikeStayApart() {
+        or one server's output lands in another's file.
+
+        The pairs matter: `.` against `..` proves nothing here, because those two
+        do not flatten to the same text and take the dot-only branch anyway. Each
+        pair below genuinely collides after separator replacement, which is the
+        property the name claims. */
+    @Test(arguments: [
+        ("a/b", "a_b"),
+        ("x:y", "x_y"),
+        ("p/q", "p:q"),
+        ("../x", ".._x"),
+    ])
+    func namesThatFlattenAlikeStayApart(first: String, second: String) {
+        #expect(
+            DevCtlPaths.serverPathComponent(first)
+                != DevCtlPaths.serverPathComponent(second))
+    }
+
+    /** The dot-only cases keep their own branch, and still have to differ. */
+    @Test func dotOnlyNamesStayApart() {
         #expect(
             DevCtlPaths.serverPathComponent(".")
                 != DevCtlPaths.serverPathComponent(".."))
+    }
+
+    /** The control. Without it the collision tests above pass just as well
+        against an implementation that hashes every name, which would make every
+        log directory unreadable. */
+    @Test(arguments: ["web", "api-2", "worker_3"])
+    func anOrdinaryNameIsItsOwnDirectory(name: String) {
+        #expect(DevCtlPaths.serverPathComponent(name) == name)
     }
 }
