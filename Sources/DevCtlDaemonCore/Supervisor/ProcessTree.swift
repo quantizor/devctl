@@ -151,20 +151,36 @@ public enum ProcessTree {
                 let live = self.identity(of: identity.pid)
                 guard shouldSignal(snapshotted: identity, live: live) else { continue }
             }
-            if getpgid(identity.pid) != rootPid {
+            /** Skip a group member only when the group itself was signaled;
+                otherwise (the root is gone or recycled, so `kill(-rootPid)` was
+                withheld) a member still in that group would be missed, and it
+                must be signaled individually instead. */
+            if !rootStillOurs || getpgid(identity.pid) != rootPid {
                 kill(identity.pid, signal)
             }
         }
     }
 
-    /** Individually SIGKILL snapshotted PIDs that still match, used when the
-        root is already gone so group-directed kill no longer applies. */
-    public static func escalateIndividuals(_ identities: [ProcessIdentity]) {
-        for identity in identities {
-            let live = self.identity(of: identity.pid)
-            guard shouldSignal(snapshotted: identity, live: live) else { continue }
-            kill(identity.pid, SIGKILL)
+    /** Every way a live descendant of a run can be found, deduped by pid: the
+        snapshot taken while the root still parented them, a fresh parent-chain
+        sweep, and the session members that kept the root's session after
+        setpgid/setsid took them out of the group. No single source is enough
+        (see the note on ServerSupervisor.startDescendantWatch), so both the
+        deliberate-stop and crash paths union all three and revalidate each pid
+        at signal time. A failed sweep contributes nothing rather than throwing:
+        teardown proceeds with whatever the other sources found. */
+    public static func liveDescendants(
+        rootPid: pid_t, sessionID: pid_t?, snapshot: [ProcessIdentity]
+    ) -> [ProcessIdentity] {
+        var byPid: [pid_t: ProcessIdentity] = [:]
+        for identity in snapshot { byPid[identity.pid] = identity }
+        for identity in descendants(of: rootPid).identities { byPid[identity.pid] = identity }
+        if let sessionID {
+            for identity in sessionMembers(of: sessionID, sessionLeaderPid: rootPid).identities {
+                byPid[identity.pid] = identity
+            }
         }
+        return Array(byPid.values)
     }
 
     private struct TableRow: Sendable {

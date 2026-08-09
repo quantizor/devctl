@@ -571,12 +571,12 @@ public actor Router {
             return
         }
         let pid = root.pid
-        let sweep = ProcessTree.descendants(of: pid)
-        if case .failed(let code) = sweep {
-            DevCtlLog.daemon.error(
-                "orphan bounce descendant sweep failed (errno \(code)); group-only")
-        }
-        let descendants = sweep.identities
+        /** A server is spawned as a session leader (createSession), so its
+            session id is its own pid; sweeping the session as well as the parent
+            chain catches an orphan descendant that setpgid'd or setsid'd out of
+            the group, the same union stop() and the crash path use. */
+        let descendants = ProcessTree.liveDescendants(
+            rootPid: pid, sessionID: pid, snapshot: [])
         ProcessTree.signalTree(
             descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
             signal: SIGTERM)

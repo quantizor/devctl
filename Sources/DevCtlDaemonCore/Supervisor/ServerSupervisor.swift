@@ -352,47 +352,51 @@ public actor ServerSupervisor {
         stopRequested = true
         stopWasDeliberate = deliberate
         phase = .stopping
-        /** Capture before any signal: after the grace window the pid number may
-            name a different process, and SIGKILL must not follow a recycled id. */
+        /** Capture the run's identity and its session before any signal and
+            before any await: after the grace window the pid number may name a
+            different process, recordOutcome for this same exit can run during the
+            awaits below and clear the live fields, and signalRun revalidates
+            against the captured identity so a recycled pid is never hit. */
         let rootIdentity = ProcessTree.identity(of: target)
-        let snapshotResult = ProcessTree.descendants(of: target)
-        if case .failed(let code) = snapshotResult {
-            DevCtlLog.supervisor.error(
-                "descendant sweep failed before SIGTERM (errno \(code)); group-only teardown")
-        }
-        let snapshot = snapshotResult.identities
-        ProcessTree.signalTree(
-            descendants: snapshot, rootPid: target, signal: SIGTERM)
+        let sessionID = rootSessionID
+        let snapshot = lastDescendantSnapshot
+        signalRun(
+            target: target, rootIdentity: rootIdentity, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGTERM)
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
         while ContinuousClock.now < deadline {
             if runTask == nil { break }
             if kill(target, 0) != 0 { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        /** Escalate: the pre-signal snapshot plus a fresh sweep (new children may
-            have appeared during the grace window while the parent lived). */
-        let fresh = ProcessTree.descendants(of: target)
-        if case .failed(let code) = fresh {
-            DevCtlLog.supervisor.error(
-                "descendant sweep failed before SIGKILL (errno \(code)); using pre-signal snapshot")
-        }
-        var byPid: [pid_t: ProcessIdentity] = [:]
-        for identity in snapshot + fresh.identities {
-            byPid[identity.pid] = identity
-        }
-        let escalation = Array(byPid.values)
-        if let rootIdentity,
-            ProcessTree.shouldSignal(
-                snapshotted: rootIdentity, live: ProcessTree.identity(of: target))
-        {
-            ProcessTree.signalTree(
-                descendants: escalation, revalidate: true, rootIdentity: rootIdentity,
-                rootPid: target, signal: SIGKILL)
-        } else {
-            ProcessTree.escalateIndividuals(escalation)
-        }
+        /** Escalate over a freshly re-derived union (new children may have
+            appeared during the grace window); signalRun SIGKILLs the group only
+            while the root still lives, and otherwise the survivors individually. */
+        signalRun(
+            target: target, rootIdentity: rootIdentity, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGKILL)
         await waitForRunTaskCompletion()
         return status()
+    }
+
+    /** One revalidated teardown pass. Descendants come from every source at once
+        (the startup snapshot, a fresh parent-chain sweep, and the root's session
+        members), so a child that escaped the group by setpgid or setsid is still
+        found. The root's process group is signaled only while `rootPid` still
+        names the process `rootIdentity` recorded; once it has exited (or been
+        recycled) the group is never touched and only the descendants that still
+        match their recorded identity are signaled individually. Pass
+        `rootIdentity: nil` from the crash path, where the root is already reaped,
+        so `kill(-pid)` can never follow a recycled id. This is the one home for
+        turning a run's descendants into kernel signals. */
+    private func signalRun(
+        target: pid_t, rootIdentity: ProcessIdentity?, sessionID: pid_t?,
+        snapshot: [ProcessIdentity], signal: Int32
+    ) {
+        ProcessTree.signalTree(
+            descendants: ProcessTree.liveDescendants(
+                rootPid: target, sessionID: sessionID, snapshot: snapshot),
+            revalidate: true, rootIdentity: rootIdentity, rootPid: target, signal: signal)
     }
 
     public func status() -> ServerStatus {
@@ -850,6 +854,13 @@ public actor ServerSupervisor {
 
     private func recordOutcome(_ outcome: ProcessOutcome, id: String) async {
         runTask = nil
+        /** Capture this run's teardown inputs before the awaits below: a
+            concurrent start() can replace `pid`, `rootSessionID`, and the
+            snapshot while recordOutcome is suspended, and the crash sweep must
+            act on the run that just exited, never on a newly started one. */
+        let capturedPid = pid
+        let capturedSessionID = rootSessionID
+        let capturedSnapshot = lastDescendantSnapshot
         healthTask?.cancel()
         healthTask = nil
         switch outcome {
@@ -873,17 +884,17 @@ public actor ServerSupervisor {
         errorSummary = captureErrorSummary(since: windowStart)
         descendantTask?.cancel()
         descendantTask = nil
-        if !stopRequested, let rootPid = pid {
-            /** Union of the snapshot and a live session sweep. The snapshot can
-                be stale (a worker forked moments before the crash may never have
-                been sampled, and under load the sampler may not even have been
-                scheduled), while the session sweep cannot see a descendant that
-                called setsid for itself. Neither covers the other, so both run. */
-            let escaped = ProcessTree.sessionMembers(
-                of: rootSessionID ?? rootPid, sessionLeaderPid: rootPid
-            ).identities
-            let union = Array(Set(lastDescendantSnapshot).union(escaped))
-            ProcessTree.signalTree(descendants: union, rootPid: rootPid, signal: SIGTERM)
+        if !stopRequested, let rootPid = capturedPid {
+            /** The root is already reaped here, so signalRun gets rootIdentity:
+                nil and never signals its process group: kill(-pid) on a reaped id
+                could land on a recycled group. Only the escaped descendants that
+                still match their recorded identity are swept, drawn from the
+                snapshot, a parent-chain sweep, and the session at once, since no
+                one source sees a child that setpgid'd, setsid'd, or forked after
+                the last sample. */
+            signalRun(
+                target: rootPid, rootIdentity: nil, sessionID: capturedSessionID,
+                snapshot: capturedSnapshot, signal: SIGTERM)
         }
         lastDescendantSnapshot = []
         rootSessionID = nil

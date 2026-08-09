@@ -174,6 +174,92 @@ private func makeEnv() throws -> TestEnv {
         if !reaped { kill(child, SIGKILL) }
     }
 
+    /** Deliberate stop must sweep the session, not only the parent chain. The
+        fixture backgrounds a sleep through a shell that then exits, so by stop
+        time the sleep has reparented away and a `descendants(of: root)` walk can
+        no longer reach it: only the session sweep can. Before stop() unioned in
+        the session members, this sleep outlived `devctl stop`. */
+    @Test func deliberateStopKillsAnOrphanedSessionGrandchild() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: [fixture, "--orphan-grandchild"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let root = pid_t(exactly: try #require(started.pid))
+        var grandchild: pid_t?
+        for _ in 0..<40 {
+            let spool =
+                (try? String(
+                    contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
+                    encoding: .utf8)) ?? ""
+            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
+                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let child = try #require(grandchild)
+        #expect(kill(child, 0) == 0)
+        /** The precondition that makes this a session-only case: the sleep is no
+            longer a parent-chain descendant of the root, so only a session sweep
+            finds it. */
+        if let root {
+            #expect(!ProcessTree.descendants(of: root).identities.contains { $0.pid == child })
+        }
+        let stopped = await supervisor.stop(graceSeconds: 2)
+        #expect(stopped.phase == .stopped)
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 {
+                reaped = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(
+            reaped,
+            "orphaned session grandchild \(child) survived devctl stop (state: \(processState(of: child)))")
+        if !reaped { kill(child, SIGKILL) }
+    }
+
+    /** A stop racing concurrent starts must signal only the run being torn
+        down. The race is pid churn: a start can replace `pid` while a stop for
+        the previous run is mid-teardown, and recordOutcome for the old exit can
+        run while a new run is live. Every teardown signal now revalidates the pid
+        against the identity captured while that process was alive and reads the
+        run's fields captured at entry, so a recycled or replaced pid is never
+        hit. The supervisor's host process (this test) is therefore never signaled
+        out from under itself. Reaching the assertion at all is the guarantee the
+        SIGKILL bug removed; the rounds force the churn that surfaced it. */
+    @Test func concurrentStopAndStartNeverSignalTheWrongProcess() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        /** A short-lived child bounds the test: even an interleaving that leaves a
+            teardown waiting on the run task resolves when the child exits on its
+            own, so a regression cannot hang the suite, only slow this case. */
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 2"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        for _ in 0..<4 {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { _ = await supervisor.stop(graceSeconds: 1) }
+                group.addTask { _ = await supervisor.start() }
+                group.addTask { _ = await supervisor.start() }
+                for await _ in group {}
+            }
+        }
+        let phase = await supervisor.status().phase
+        #expect([.stopped, .starting, .running, .crashed].contains(phase))
+        _ = await supervisor.stop(graceSeconds: 2)
+        #expect(getpid() > 0)  // the test process survived the race
+    }
+
     /** Reads a live process's parent from ps, for failure evidence only. */
     private func parentPid(of pid: pid_t) -> String {
         shell(["/bin/ps", "-o", "ppid=", "-p", String(pid)])
