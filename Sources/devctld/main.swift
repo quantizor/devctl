@@ -87,6 +87,24 @@ try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
     stay findable under a sealed in-bundle LaunchAgent. */
 LaunchdAdmin.applyAgentPathToProcess(paths: paths)
 
+/** Refuse to start on a persisted store that exists but cannot be READ (EMFILE
+    as the daemon nears its fd limit, an I/O error, a permission change): treating
+    it as absent would let the next write erase real registry, state, or lock
+    data. A missing file is fine (first run), and a corrupt one is quarantined by
+    the load. Exiting non-zero here leaves the data intact and lets launchd retry
+    after the throttle window, when a transient failure has likely cleared. */
+do {
+    _ = try AtomicFile.load(RegistryFile.self, from: paths.registryFile)
+    _ = try AtomicFile.load(StateFile.self, from: paths.stateFile)
+    _ = try AtomicFile.load(LocksFile.self, from: paths.locksFile)
+} catch {
+    FileHandle.standardError.write(
+        Data(
+            "devctld: a saved store exists but could not be read (\(error)); refusing to start so it is not overwritten. Free file descriptors or fix the file's permissions, then retry.\n"
+                .utf8))
+    exit(1)
+}
+
 let registry = Registry(paths: paths)
 let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
 

@@ -175,8 +175,24 @@ public enum AtomicFile {
         _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     }
 
-    public static func loadDefensively<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+    /** Loads a persisted store, distinguishing three outcomes a single nil used
+        to blur together. A missing file returns nil: there is no prior state, so
+        starting empty is correct. A file that exists but cannot be READ (EMFILE
+        as the daemon nears its fd limit, an I/O error, a permission change)
+        THROWS, so the caller refuses to start rather than treating real data as
+        absent and erasing it on the next write. A file that reads but will not
+        PARSE is quarantined to `.corrupt-<timestamp>` and returns nil, because
+        the bytes are unusable and starting empty is the only recovery (a parse
+        crash under launchd KeepAlive would loop forever). */
+    public static func load<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError
+            where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile
+        {
+            return nil
+        }
         do {
             return try JSONCoding.decoder().decode(type, from: data)
         } catch {
@@ -185,6 +201,15 @@ public enum AtomicFile {
             try? FileManager.default.moveItem(at: url, to: quarantine)
             return nil
         }
+    }
+
+    /** Non-throwing convenience: a missing, unreadable, or corrupt file all yield
+        nil. Use only where losing the value is safe (a rebuildable cache, a
+        secondary hint read after the primary store already loaded), never for a
+        store whose next write would overwrite real data. Reach for `load` there,
+        and refuse to start on a read failure. */
+    public static func loadDefensively<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
+        try? load(type, from: url)
     }
 }
 
