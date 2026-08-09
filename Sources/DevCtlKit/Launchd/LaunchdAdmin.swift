@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /** launchd administration: install renders the LaunchAgent and bootstraps it;
     upgrades stage-and-rename the binary (overwriting a running signed Mach-O
@@ -126,7 +127,11 @@ public enum LaunchdAdmin {
         `~/.local/bin/devctld`, and the Application Support install path. */
     public static func resolveDaemonBinary(extraCandidates: [URL] = []) -> URL? {
         var candidates = extraCandidates
-        let arg0 = URL(fileURLWithPath: CommandLine.arguments[0])
+        /** Resolve symlinks first: invoked through a Homebrew shim, argv0 is
+            `<brew prefix>/bin/devctl`, whose sibling `devctld` does not exist,
+            while the resolved path sits next to the real `devctld` in the bundle
+            or install directory. */
+        let arg0 = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
         candidates.append(arg0.deletingLastPathComponent().appending(path: "devctld"))
         candidates.append(SetupPlanner.installedDaemonSiblingURL())
         candidates.append(DevCtlPaths().daemonBinaryDir.appending(path: "devctld"))
@@ -364,11 +369,74 @@ public enum LaunchdAdmin {
     public static let pathFloor =
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-    /** Captured login-shell PATH so launchd children can find Homebrew/asdf/mise
-        tools; launchd agents otherwise get a minimal PATH. Goes stale after a
-        Homebrew migration, which doctor surfaces via daemon.info. */
+    /** How long a shell profile gets to finish before the capture gives up and
+        falls back to `pathFloor`. Sourcing a file the user wrote means devctl
+        does not control how long it takes, and a profile that waits on the
+        network or on a terminal that is not there would otherwise hang the app
+        at launch. Generous by the standards of the same probe elsewhere: VS Code
+        allows 10 seconds by default, JetBrains 20. Measured locally at about
+        1.2s, so this is roughly ten times the real cost. */
+    public static let pathCaptureTimeoutSeconds = 12.0
+
+    /** The PATH the user actually has, so launchd children can find the tools
+        the user installed; launchd agents otherwise get a minimal PATH. Goes
+        stale after a Homebrew migration, which doctor surfaces via daemon.info.
+
+        `.zshrc` is sourced explicitly because `-lc` is a login but NON
+        interactive shell, so zsh runs `.zshenv`, `.zprofile` and `.zlogin` and
+        skips `.zshrc` entirely. That is where most tools put themselves: on the
+        machine this was measured, `-lc` alone missed `~/.local/bin` (so a server
+        devctl spawned could not run `devctl`), plus pnpm, conda, gcloud and the
+        rest. Sourcing it produces byte-identical output to an interactive login
+        shell and costs less, without running an interactive session, so rc files
+        that gate prompts and completions on interactivity stay skipped.
+
+        Errors from the source are discarded rather than checked: a machine with
+        no `.zshrc` is ordinary, and the fallback is the login-only PATH, which
+        is what this returned before.
+
+        Do not measure this from a terminal. A shell started from a shell
+        inherits its parent's PATH, so `zsh -lc 'echo $PATH'` looks complete
+        there and is missing entries under launchd, where there is no parent to
+        inherit from. Use `env -i HOME=$HOME PATH=/usr/bin:/bin ...` to see what
+        the daemon really gets.
+
+        zsh is hardcoded on purpose. It is the macOS default and the tools that
+        solve this elsewhere pick the user's shell from `$SHELL` or `getpwuid`,
+        which would also mean branching the invocation per shell family, since
+        fish has no login/interactive split and csh rejects these flags. That
+        buys nothing until a devctl user is on another shell, so it waits for
+        one rather than being built on speculation. A bash or fish user gets the
+        login-only PATH here, which degrades rather than breaks. */
     public static func capturedPath() -> String {
-        let result = shell("/bin/zsh", ["-lc", "echo $PATH"])
+        /** Built, not inherited, so the answer is the same whoever asks. A child
+            shell inherits its parent's environment, so this returned the user's
+            full PATH when the CLI called it from a terminal and a much shorter
+            one when the app called it under launchd, and whichever binary
+            happened to write `agent.path` last decided what every spawned server
+            got.
+
+            Overriding PATH alone is not enough, which is worth stating because
+            it is the obvious half-fix: an rc file can read any variable, and
+            tools that initialize themselves idempotently go quiet when they see
+            their own. Measured here, inheriting `CONDA_SHLVL` and `CONDA_EXE`
+            made conda's hook decide it had already run, so its directory was
+            missing from the captured PATH while every other entry was present.
+            Only these four are set, being what a login shell can rely on. */
+        let environment = [
+            /** Set so a profile can tell this apart from a real session and skip
+                whatever needs a terminal. VS Code and the JetBrains IDEs both
+                publish one for the same purpose; ours is documented in the
+                README so it is worth guarding against. */
+            "DEVCTL_RESOLVING_ENVIRONMENT": "1",
+            "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
+            "LOGNAME": NSUserName(),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "USER": NSUserName(),
+        ]
+        let result = shell(
+            "/bin/zsh", ["-lc", #"source "$HOME/.zshrc" >/dev/null 2>&1; echo $PATH"#],
+            environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds)
         let path = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? pathFloor : path
     }
@@ -450,20 +518,71 @@ public enum LaunchdAdmin {
     }
 
     @discardableResult
-    public static func shell(_ path: String, _ arguments: [String]) -> (status: Int32, output: String) {
+    /** `environment` nil inherits this process's, which is what most callers
+        want. Pass one to make the child's answer independent of who asked.
+
+        `timeoutSeconds` nil waits forever, which is right for a command devctl
+        controls end to end. Pass one for anything that runs a file the user
+        wrote: a shell profile can prompt, wait on the network, or expect a
+        terminal that is not there, and waiting forever for it is how a menu bar
+        app hangs at launch with nothing on screen explaining why. */
+    public static func shell(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        timeoutSeconds: Double? = nil
+    ) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
+        process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        /** Drained on another thread because the timeout path below waits on
+            termination first, and a read to EOF on this thread would block until
+            the child closed the pipe, which is the thing being timed out. The
+            untimed path could read inline as it always did; it shares this one
+            so both return output the same way. */
+        let collected = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            collected.withLock { $0 = data }
+            drained.signal()
+        }
+        /** Installed before `run()`, not after: a child that exits in the window
+            between `run()` returning and a later assignment is already terminated
+            when the handler is set, and Foundation does not fire terminationHandler
+            for an already-dead process. The timeout path below would then wait out
+            its full ceiling and SIGKILL a pid the kernel may have recycled, and the
+            PATH capture that rides this would silently fall back to `pathFloor`. */
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         do {
             try process.run()
         } catch {
+            drained.signal()
             return (status: -1, output: String(describing: error))
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+        guard let timeoutSeconds else {
+            process.waitUntilExit()
+            drained.wait()
+            return (
+                status: process.terminationStatus,
+                output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
+            )
+        }
+        if exited.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            /** SIGKILL rather than SIGTERM: this is already the path where the
+                child ignored its chance to finish, and a profile blocked on a
+                read will not act on a term either. */
+            kill(process.processIdentifier, SIGKILL)
+            _ = exited.wait(timeout: .now() + 2)
+            return (status: -1, output: "")
+        }
+        drained.wait()
+        return (
+            status: process.terminationStatus,
+            output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
+        )
     }
 }

@@ -95,6 +95,87 @@ struct SetupPlannerTests {
                 pathEnv: "/usr/bin:/bin", cliDirectory: dir))
     }
 
+    /** The PATH a GUI app sees is launchd's, not the shell's, and on a stock
+        machine it can never contain `~/.local/bin`. Feeding it to this check
+        produced a warning telling the user to add a directory their shell
+        already had. This pins the two apart: the launchd default answers false
+        for a directory that a user PATH containing it answers true for, so a
+        caller that reaches for the process environment again fails here rather
+        than shipping a confident wrong warning. */
+    @Test func theLaunchdDefaultPathNeverContainsTheCLIDirectory() {
+        let dir = SetupPlanner.defaultCLIDirectory(home: URL(fileURLWithPath: "/Users/test"))
+        let launchdDefault = "/usr/bin:/bin:/usr/sbin:/sbin"
+        #expect(!SetupPlanner.cliDirectoryOnPATH(pathEnv: launchdDefault, cliDirectory: dir))
+        #expect(
+            SetupPlanner.cliDirectoryOnPATH(
+                pathEnv: "\(dir.path):" + launchdDefault, cliDirectory: dir))
+    }
+
+    /** The capture has to see what the user's shell sees, and the trap is that
+        it looks correct when measured wrong. A shell started from a shell
+        inherits its parent's PATH, so the missing entries appear anyway; only an
+        empty environment shows what launchd gets. This runs the real capture
+        that way, which is the only shape that can fail when `.zshrc` is skipped.
+
+        Asserted against the machine's own answer rather than a fixed list: what
+        a developer puts in `.zshrc` is theirs, so the contract is "the capture
+        agrees with the user's shell", not "the capture contains pnpm". */
+    @Test func theCaptureSeesWhatTheUsersShellSees() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        func pathFrom(_ arguments: [String]) throws -> Set<String> {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = arguments
+            process.environment = ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return Set(
+                String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(separator: ":").map(String.init))
+        }
+        let interactive = try pathFrom(["-ilc", "echo $PATH"])
+        try withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
+            try #require(FileManager.default.fileExists(atPath: "\(home)/.zshrc"))
+        }
+        guard FileManager.default.fileExists(atPath: "\(home)/.zshrc") else { return }
+        /** The control: login-only must MISS something an interactive shell has,
+            or this machine cannot demonstrate the bug and the assertion below
+            would pass against the old implementation too. */
+        let loginOnly = try pathFrom(["-lc", "echo $PATH"])
+        try withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
+            try #require(!interactive.subtracting(loginOnly).isEmpty)
+        }
+        guard !interactive.subtracting(loginOnly).isEmpty else { return }
+        let captured = Set(LaunchdAdmin.capturedPath().split(separator: ":").map(String.init))
+        #expect(interactive.subtracting(captured).isEmpty)
+    }
+
+    /** A prefix match would call `/Users/test/.local/binaries` a hit, and a
+        substring match would do the same for any path containing the directory's
+        name. The check splits on `:` and compares whole components. */
+    @Test func aPathComponentMustMatchWholeNotAsAPrefix() {
+        let dir = SetupPlanner.defaultCLIDirectory(home: URL(fileURLWithPath: "/Users/test"))
+        #expect(
+            !SetupPlanner.cliDirectoryOnPATH(
+                pathEnv: "\(dir.path)aries:/usr/bin", cliDirectory: dir))
+        #expect(
+            !SetupPlanner.cliDirectoryOnPATH(
+                pathEnv: "/opt\(dir.path):/usr/bin", cliDirectory: dir))
+    }
+
+    /** The remedy is handed to someone about to edit a shell profile, so it has
+        to name the directory and carry the command rather than describe it. */
+    @Test func theRemedyNamesTheDirectoryAndTheCommand() {
+        #expect(SetupPlanner.pathRemedy.contains(SetupPlanner.defaultCLIDirectory().path))
+        #expect(SetupPlanner.pathRemedy.contains("export PATH="))
+        #expect(SetupPlanner.pathRemedy.contains(">> ~/.zprofile"))
+    }
+
     @Test func harnessOffersDefaultCheckedOnlyWhenNeeded() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "devctl-setup-\(UUID().uuidString)")
@@ -169,5 +250,57 @@ struct SetupPlannerTests {
         try SetupPlanner.installAppBundle(from: source, to: dest)
         let body = try String(contentsOf: dest.appending(path: "Contents/marker"), encoding: .utf8)
         #expect(body == "v1")
+    }
+
+    @Test func cliOwnerIsHomebrewWhenCaskBundleMatchesRunningBundle() {
+        let running = "/Applications/devctl.app"
+        let owner = SetupPlanner.resolveCLIOwner(
+            runningBundleRealpath: running,
+            caskStagedBundles: [
+                (prefix: "/opt/homebrew", bundleRealpaths: [running]),
+                (prefix: "/usr/local", bundleRealpaths: []),
+            ])
+        #expect(owner == .homebrew(shim: URL(fileURLWithPath: "/opt/homebrew/bin/devctl")))
+        #expect(owner.isHomebrew)
+        #expect(owner.cliPath == URL(fileURLWithPath: "/opt/homebrew/bin/devctl"))
+        #expect(owner.cliDirectory == URL(fileURLWithPath: "/opt/homebrew/bin"))
+    }
+
+    @Test func cliOwnerIsHomebrewUnderIntelPrefix() {
+        let running = "/Applications/devctl.app"
+        let owner = SetupPlanner.resolveCLIOwner(
+            runningBundleRealpath: running,
+            caskStagedBundles: [
+                (prefix: "/opt/homebrew", bundleRealpaths: []),
+                (prefix: "/usr/local", bundleRealpaths: [running]),
+            ])
+        #expect(owner == .homebrew(shim: URL(fileURLWithPath: "/usr/local/bin/devctl")))
+    }
+
+    @Test func cliOwnerFallsBackToDevctlWhenNoCaskMatches() {
+        let cliDir = URL(fileURLWithPath: "/Users/x/.local/bin")
+        let owner = SetupPlanner.resolveCLIOwner(
+            runningBundleRealpath: "/Applications/devctl.app",
+            caskStagedBundles: [
+                (prefix: "/opt/homebrew", bundleRealpaths: ["/opt/homebrew/Caskroom/other.app"]),
+            ],
+            cliDirectory: cliDir)
+        #expect(owner == .devctl(directory: cliDir))
+        #expect(!owner.isHomebrew)
+        #expect(owner.cliPath == cliDir.appending(path: "devctl"))
+        #expect(owner.cliDirectory == cliDir)
+    }
+
+    @Test func pathCheckIsSatisfiedForBrewOwnerOnDefaultPATH() {
+        /** brew's bin is on the login PATH via `brew shellenv`, so a brew owner's
+            directory is found and no warning fires. */
+        let brew = CLIOwner.homebrew(shim: URL(fileURLWithPath: "/opt/homebrew/bin/devctl"))
+        #expect(
+            SetupPlanner.cliDirectoryOnPATH(
+                pathEnv: "/opt/homebrew/bin:/usr/bin:/bin", cliDirectory: brew.cliDirectory))
+        let local = CLIOwner.devctl(directory: URL(fileURLWithPath: "/Users/x/.local/bin"))
+        #expect(
+            !SetupPlanner.cliDirectoryOnPATH(
+                pathEnv: "/opt/homebrew/bin:/usr/bin:/bin", cliDirectory: local.cliDirectory))
     }
 }
