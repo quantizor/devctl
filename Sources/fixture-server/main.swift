@@ -11,6 +11,11 @@ import Foundation
     --grandchild-after S   delay that spawn, which is what puts it past the
                            supervisor's early snapshot and makes the teardown
                            race deterministic instead of load-dependent
+    --orphan-grandchild    background a `sleep 1000` through a shell that then
+                           exits, so the sleep reparents away from this process
+                           but keeps its session. A parent-chain sweep can no
+                           longer find it; only a session sweep can. Prints
+                           `grandchild pid N` so a teardown test can verify it
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
@@ -26,6 +31,7 @@ var exitAfter: Double?
 var exitCode: Int32 = 0
 var spawnGrandchild = false
 var grandchildAfter: Double?
+var orphanGrandchild = false
 var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
@@ -46,6 +52,8 @@ while let arg = argIterator.next() {
         spawnGrandchild = true
     case "--grandchild-after":
         grandchildAfter = argIterator.next().flatMap { Double($0) }
+    case "--orphan-grandchild":
+        orphanGrandchild = true
     case "--ignore-sigterm":
         ignoreSigterm = true
     case "--emit-binary":
@@ -78,6 +86,19 @@ func launchGrandchild() {
     print("grandchild pid \(child.processIdentifier)")
 }
 
+/** Backgrounds a sleep through a shell that exits immediately, so the sleep
+    reparents to launchd while keeping this process's session (no setsid). Only a
+    session sweep can find it afterward, which is what a deliberate-stop teardown
+    test needs to distinguish from a parent-chain sweep. `$!` is the backgrounded
+    pid, echoed to the inherited stdout so the test can read it from the spool. */
+func launchOrphanGrandchild() {
+    let shell = Process()
+    shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+    shell.arguments = ["-c", "sleep 1000 & echo grandchild pid $!"]
+    try? shell.run()
+    shell.waitUntilExit()
+}
+
 if spawnGrandchild {
     if let grandchildAfter {
         /** On a background queue so the heartbeat loop below still runs and the
@@ -86,6 +107,10 @@ if spawnGrandchild {
     } else {
         launchGrandchild()
     }
+}
+
+if orphanGrandchild {
+    launchOrphanGrandchild()
 }
 
 if emitBinary {
