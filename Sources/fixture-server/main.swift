@@ -7,7 +7,7 @@ import Foundation
     --spawn-grandchild     spawn a `sleep 1000` child (group-kill verification).
                            Foundation's Process puts it in its OWN process group,
                            so a group-directed kill cannot reach it and only the
-                           daemon's descendant snapshot can
+                           daemon's descendant snapshot can find it
     --grandchild-after S   delay that spawn, which is what puts it past the
                            supervisor's early snapshot and makes the teardown
                            race deterministic instead of load-dependent

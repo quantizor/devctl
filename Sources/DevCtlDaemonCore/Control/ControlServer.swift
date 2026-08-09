@@ -1161,11 +1161,16 @@ public actor Router {
             first acquire did: dropping `live` or `statePath` here would leave the
             retrying client unable to judge the resource for the rest of the hold. */
         if let existing = resourceLocks[key], existing.pid == params.holderPid {
-            let specs = (try? await mergedSpecs(project: params.project))?.specs ?? []
+            /** Throws for the same reason the first acquire does. Reaching here
+                with an unreadable config means the config broke during the hold,
+                since the first acquire would already have refused it, and a
+                state path resolved from no specs at all is a worse answer than
+                saying the config is now unreadable. */
+            let merged = try await mergedSpecs(project: params.project)
             return LockResult(
                 live: existing.live, paused: existing.paused,
                 statePath: try LockResource.statePath(
-                    project: params.project, resource: params.resource, specs: specs))
+                    project: params.project, resource: params.resource, specs: merged.specs))
         }
         var live: [String] = []
         var paused: [String] = []
