@@ -9,6 +9,10 @@ import Foundation
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
     --flood                write lines as fast as possible
+    --print-file PATH      print `config: <first line>` of PATH once at startup,
+                           which is how a watch test proves the RESTARTED process
+                           read the new file rather than only that a pid changed
+    --touch-file PATH      rewrite PATH every 300ms (self-write loop fixture)
     Default behavior: print a heartbeat line every 200ms. */
 
 var listenPort: UInt16?
@@ -19,6 +23,8 @@ var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
 var flood = false
+var printFile: String?
+var touchFile: String?
 
 var argIterator = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = argIterator.next() {
@@ -37,6 +43,10 @@ while let arg = argIterator.next() {
         emitBinary = true
     case "--err-lines":
         errLines = argIterator.next().flatMap { Int($0) } ?? 0
+    case "--print-file":
+        printFile = argIterator.next()
+    case "--touch-file":
+        touchFile = argIterator.next()
     case "--flood":
         flood = true
     default:
@@ -62,6 +72,21 @@ if spawnGrandchild {
 if emitBinary {
     let junk: [UInt8] = [0xFF, 0xFE, 0x00, 0x80, 0x0A]
     FileHandle.standardOutput.write(Data(junk))
+}
+
+/** Read once at startup, like a real server reading its config, so a watch test
+    can tell "the process restarted" from "the restarted process read the new
+    file", which is the difference the feature exists for. */
+if let printFile {
+    let contents = (try? String(contentsOfFile: printFile, encoding: .utf8)) ?? ""
+    print("config: \(contents.split(separator: "\n").first.map(String.init) ?? "")")
+}
+
+if let touchFile {
+    Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+        try? Data("\(Date().timeIntervalSince1970)\n".utf8).write(
+            to: URL(fileURLWithPath: touchFile))
+    }
 }
 
 /** A distinctive token so a test can assert the raw child bytes never leak into

@@ -13,7 +13,8 @@ struct DevCtl: AsyncParsableCommand {
         version: DevCtlVersion.version,
         subcommands: [
             ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
-            HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self, Start.self,
+            HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self,
+            Restart.self, Start.self,
             Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self, Unregister.self, Up.self,
             Wait.self, Why.self, XURL.self, DaemonCommand.self,
         ]
@@ -350,6 +351,55 @@ struct Status: AsyncParsableCommand {
                 return "no servers registered for this project (hint: devctl register --name myproj --cmd …)"
             }
             return list.servers.map(CLIRunner.describe).joined(separator: "\n")
+        }
+    }
+}
+
+/** One daemon-side transition rather than a client-side stop then ensure: that
+    pair leaves a window for another session's ensure, and a refusal arrives only
+    after the server is already down. */
+struct Restart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Stop and re-ensure a server as one transition.")
+
+    @Flag(help: "Restart every server in the project.")
+    var all = false
+
+    @OptionGroup var global: GlobalOptions
+
+    @Argument(help: "Server name (omit with --all).")
+    var name: String?
+
+    @Option(help: "Override the declared port for this run.")
+    var port: Int?
+
+    @Option(help: "Per-server seconds to wait for health.")
+    var timeout: Double = 60
+
+    func run() async throws {
+        /** A bare `restart` is far likelier to be typed by reflex than `down`
+            is, and bouncing a whole project by accident is expensive. */
+        if (name == nil) == !all {
+            CLIRunner.fail(
+                WireError(
+                    code: .usage,
+                    hint: "run: devctl restart --all",
+                    message: name == nil
+                        ? "devctl restart needs a server name, or --all for the whole project"
+                        : "pass a server name or --all, not both"),
+                json: global.json)
+        }
+        let params = RestartParams(
+            names: name.map { [$0] }, port: port, project: global.resolvedProject(),
+            timeoutSeconds: timeout)
+        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.serverRestart, params: params, expecting: GroupResult.self)
+        }
+        CLIRunner.emit(result, json: global.json) { r in
+            r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")
+        }
+        if result.results.contains(where: { $0.reason != nil }) {
+            Foundation.exit(1)
         }
     }
 }

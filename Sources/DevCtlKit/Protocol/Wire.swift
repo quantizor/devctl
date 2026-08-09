@@ -186,6 +186,7 @@ public enum WireMethod: String, Sendable {
     case projectWriteConfig = "project.writeConfig"
     case serverEnsure = "server.ensure"
     case serverRegister = "server.register"
+    case serverRestart = "server.restart"
     case serverStart = "server.start"
     case serverStatus = "server.status"
     case serverStop = "server.stop"
@@ -274,6 +275,27 @@ public struct ServerListResult: Codable, Equatable, Sendable {
     public init(servers: [ServerStatus], trusted: Bool? = nil) {
         self.servers = servers
         self.trusted = trusted
+    }
+}
+
+/** A stop and a re-ensure as one daemon-side transition. Doing it from a client
+    leaves a window where another session's ensure lands between the two, and a
+    refusal (a held resource, a broken config) arrives after the server is
+    already down. `names` nil restarts every server in the project. */
+public struct RestartParams: Codable, Equatable, Sendable {
+    public var names: [String]?
+    /** One-shot port override, same pipeline as ensure and start. */
+    public var port: Int?
+    public var project: String
+    public var timeoutSeconds: Double
+
+    public init(
+        names: [String]? = nil, port: Int? = nil, project: String, timeoutSeconds: Double = 60
+    ) {
+        self.names = names
+        self.port = port
+        self.project = project
+        self.timeoutSeconds = timeoutSeconds
     }
 }
 

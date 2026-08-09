@@ -16,8 +16,16 @@ public actor Router {
         a daemon crash mid-hold can still resume the paused servers when the
         holder is gone. Stale holders (dead pids) evaporate on access. */
     private var resourceLocks: [String: LockHolder] = [:]
+    /** Machine kill switch for the watch sweep, for the moment someone wants
+        their server to stop bouncing right now. An init parameter so tests can
+        set it without touching the environment. */
+    private let watchEnabled: Bool
 
-    public init(launcher: any ProcessLauncher, paths: DevCtlPaths, registry: Registry) {
+    public init(
+        launcher: any ProcessLauncher, paths: DevCtlPaths, registry: Registry,
+        watchEnabled: Bool = ProcessInfo.processInfo.environment["DEVCTL_NO_WATCH"] != "1"
+    ) {
+        self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
         self.paths = paths
@@ -213,6 +221,11 @@ public actor Router {
                 let stopped = await supervisor.stop()
                 DevCtlLog.daemon.info("stop \(target.name)@\(target.project)")
                 return try respond(id: head.id, result: ServerResult(server: stopped))
+            case .serverRestart:
+                let request = try decoder.decode(WireRequest<RestartParams>.self, from: line)
+                var params = request.params
+                params.project = canonicalProjectPath(params.project)
+                return try respond(id: head.id, result: try await restartServers(params))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(
@@ -1335,6 +1348,112 @@ public actor Router {
     /** Wave-parallel group start honoring the dependency graph: a wave holds
         servers whose dependencies all settled in earlier waves. waitFor .started
         launches without blocking on health; the default blocks until healthy. */
+    /** The one restart path. Every refusal happens before anything stops: a
+        client-side `stop && ensure` takes the server down and only then discovers
+        a held resource or a broken config, leaving it down. The stop is
+        non-retiring because the server is coming straight back, so resume-on-boot
+        survives what `stop` would otherwise clear. */
+    private func restartServers(_ params: RestartParams) async throws -> GroupResult {
+        let merged = try await mergedSpecs(project: params.project)
+        var wanted = merged.specs
+        if let names = params.names {
+            for name in names where !merged.specs.contains(where: { $0.name == name }) {
+                throw WireError(
+                    code: .notFound,
+                    hint: "run: devctl status --json",
+                    message: "no server named '\(name)' in \(params.project)")
+            }
+            wanted = merged.specs.filter { names.contains($0.name) }
+        }
+        var prepared: [(spec: ServerSpec, supervisor: ServerSupervisor)] = []
+        for spec in wanted {
+            await recordTrustIfNeeded(
+                project: params.project, name: spec.name, fileNames: merged.fileNames)
+            try await lockGate(project: params.project, spec: spec)
+            try await refuseIfPaused(project: params.project, spec: spec)
+            prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
+        }
+        var results: [EnsureResult] = []
+        for entry in prepared {
+            await entry.supervisor.rearmWatch()
+            _ = await entry.supervisor.stop(deliberate: false)
+            let target = ServerTargetParams(
+                name: entry.spec.name, port: params.port, project: params.project)
+            try await prepareSpawn(
+                target: target, supervisor: entry.supervisor, portOverride: params.port)
+            results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
+            DevCtlLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
+        }
+        return GroupResult(results: results.sorted { $0.server.server < $1.server.server })
+    }
+
+    /** One watch sweep over the resident supervisors. `now` is a parameter and
+        the restarted ids come back, so tests drive sweeps with a synthetic clock
+        instead of sleeping on the daemon's timer. */
+    public func sweepWatches(now: Date = Date()) async -> [String] {
+        guard watchEnabled else { return [] }
+        var restarted: [String] = []
+        for (id, supervisor) in supervisors {
+            guard let changed = await supervisor.evaluateWatch(now: now), !changed.isEmpty else {
+                continue
+            }
+            guard let split = Self.splitServerID(id) else { continue }
+            /** The daemon never acts on a project's config before trust is
+                recorded. A running server implies trust was recorded, so this is
+                belt and braces rather than the only guard. */
+            guard await registry.isTrusted(project: split.project) else { continue }
+            let relative = changed.map {
+                $0.replacingOccurrences(of: split.project + "/", with: "")
+            }
+            do {
+                _ = try await restartServers(
+                    RestartParams(
+                        names: [split.name], project: split.project, timeoutSeconds: 60))
+                await supervisor.recordWatchRestart(now)
+                restarted.append(id)
+                DevCtlLog.daemon.info(
+                    "watch restart \(split.name)@\(split.project): \(relative.joined(separator: ", "))")
+            } catch {
+                /** A held resource or a held port: keep the pending change so the
+                    edit fires once the refusal clears rather than being dropped.
+                    Logged rather than swallowed, because a watch that silently
+                    never fires is indistinguishable from one that is not armed. */
+                DevCtlLog.daemon.info(
+                    "watch restart refused for \(split.name)@\(split.project): \(String(describing: error))")
+                await supervisor.deferWatchRestart(now: now)
+            }
+        }
+        return restarted.sorted()
+    }
+
+    static func splitServerID(_ id: String) -> (name: String, project: String)? {
+        guard let separator = id.range(of: "::", options: .backwards) else { return nil }
+        return (
+            name: String(id[separator.upperBound...]),
+            project: String(id[id.startIndex..<separator.lowerBound])
+        )
+    }
+
+    /** A server sitting in a live holder's paused set must not be resurrected
+        behind the lock's back. lockGate covers an external holder of a resource
+        this server declares; this covers the case where the hold already stopped
+        it. */
+    private func refuseIfPaused(project: String, spec: ServerSpec) async throws {
+        for declaration in spec.locks ?? [] {
+            let key = Self.lockKey(project: project, resource: declaration.name)
+            await releaseOrphanedLock(key: key)
+            guard let holder = resourceLocks[key], holder.paused.contains(spec.name) else {
+                continue
+            }
+            throw WireError(
+                code: .resourceLocked,
+                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
+                message:
+                    "'\(spec.name)' is paused by the hold on '\(declaration.name)' (pid \(holder.pid)); it comes back when that run releases"
+            )
+        }
+    }
+
     private func groupUp(_ params: GroupParams) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs

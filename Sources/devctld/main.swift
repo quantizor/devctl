@@ -181,6 +181,27 @@ Task {
                 "devctld \(DevCtlVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
                     .utf8))
     }
+    /** The watch sweep starts only after restore, so a boot-time spawn is never
+        mistaken for a config change. Polling rather than an fd-based watcher:
+        nearly every editor and build tool saves by writing a temp file and
+        renaming it over the target, after which a held fd names an unlinked
+        inode and goes deaf to the path it was watching. */
+    Task {
+        DevCtlLog.daemon.info("watch sweep started")
+        /** Exits on cancellation rather than looping on `while true`. Nothing
+            cancels this today, but `try?` over a sleep turns a cancelled task
+            into a tight spin that sweeps the process table as fast as the CPU
+            allows, and the guard costs one comparison per half second. */
+        while !Task.isCancelled {
+            _ = await router.sweepWatches()
+            do {
+                try await Task.sleep(for: .milliseconds(500))
+            } catch {
+                break
+            }
+        }
+        DevCtlLog.daemon.info("watch sweep stopped")
+    }
 }
 
 dispatchMain()
