@@ -181,6 +181,13 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
             center: a second copy of the same bundle doubles every menu bar item,
             poll and crash notification the user sees. */
         guard !SetupPerformer.quitIfTwinIsRunning() else { return }
+        /** The volume copy is a headless installer: no menu bar item, no deep
+            links or notifications, just the setup window shown here (its
+            MenuBarExtra is not inserted, so the label-hosted opener never runs). */
+        if SetupPerformer.runningFromMountedVolume() {
+            InstallerWindowController.shared.present()
+            return
+        }
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         /** MenuBarExtra / LSUIElement apps do not always receive
@@ -267,16 +274,26 @@ struct DevCtlApp: App {
     @State private var model = DaemonModel()
     @State private var setupSession = SetupSession()
 
+    /** The DMG/volume copy runs as a pure installer: it draws no menu bar item
+        (the MenuBarExtra below is not inserted for it) and presents its setup
+        window through the app delegate instead, so an upgrade never shows the
+        volume copy and the installed copy on the menu bar at once. */
+    private let isVolumeInstaller = SetupPerformer.runningFromMountedVolume()
+
     /** Polling starts at launch, not first popover open: the collapsed label's
-        presence dots must be live from the first frame. */
+        presence dots must be live from the first frame. The installer copy has no
+        menu bar UI to feed and exits after handing off, so it never polls. */
     init() {
         let launched = DaemonModel()
-        launched.start()
+        if !SetupPerformer.runningFromMountedVolume() { launched.start() }
         _model = State(initialValue: launched)
     }
 
     var body: some Scene {
-        MenuBarExtra {
+        /** SceneBuilder has no conditional, so the scene set is fixed and the
+            installer copy hides its item via `isInserted` rather than by omitting
+            the MenuBarExtra. */
+        MenuBarExtra(isInserted: .constant(!isVolumeInstaller)) {
             MenuContent(model: model)
         } label: {
             /** A real child View, not inline scene content: App.body scene
@@ -314,6 +331,88 @@ struct DevCtlApp: App {
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 460, height: 420)
+    }
+}
+
+/** Hosts the volume copy's installer window. That copy draws no menu bar item, so
+    its MenuBarExtra label never renders and the label-hosted window opener never
+    fires; the delegate presents the setup UI here directly instead. */
+@MainActor
+final class InstallerWindowController: NSObject, NSWindowDelegate {
+    static let shared = InstallerWindowController()
+    private var window: NSWindow?
+    private let session = SetupSession()
+
+    func present() {
+        guard window == nil else { return }
+        let hosting = NSHostingController(rootView: InstallerRootView(session: session))
+        let win = NSWindow(contentViewController: hosting)
+        win.title = "devctl"
+        win.styleMask = [.titled, .closable]
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.center()
+        window = win
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /** Closing the installer window quits the volume copy, so it stops running
+        from (and pinning) the mounted DMG whether the user finished setup or
+        dismissed it. Without this the accessory app would keep running invisibly
+        after its only window closed, and the volume would still refuse to eject. */
+    func windowWillClose(_ notification: Notification) {
+        NSApp.terminate(nil)
+    }
+}
+
+/** The volume copy's only UI. Evaluates setup on appear, shows the panel, and
+    quits when there is nothing to do. It draws no menu bar item, so an upgrade
+    never shows the volume copy and the installed copy on the menu bar at once;
+    the installed copy, launched at the end of the handoff, is the only one with a
+    tally. */
+struct InstallerRootView: View {
+    var session: SetupSession
+    @State private var didStart = false
+
+    var body: some View {
+        Group {
+            if session.shouldPresent {
+                SetupPanel(
+                    cliOwnedByBrew: session.cliOwnedByBrew,
+                    installAppToApplications: session.installAppToApplications,
+                    migration: session.migration,
+                    offers: session.offers,
+                    pathWarning: session.pathWarning,
+                    replacingApplicationsApp: session.replacingApplicationsApp
+                ) {
+                    /** The panel only reaches its non-relaunching finish when there
+                        was nothing to relocate; the installer copy has no reason to
+                        linger. The relocating path hands off and quits itself. */
+                    NSApp.terminate(nil)
+                }
+            } else {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Preparing devctl…").foregroundStyle(.secondary)
+                }
+                .frame(width: 460)
+                .padding(32)
+            }
+        }
+        .task {
+            guard !didStart else { return }
+            didStart = true
+            await session.evaluate()
+            if session.shouldPresent {
+                NSApp.activate(ignoringOtherApps: true)
+                await session.refreshPathWarning()
+            } else {
+                /** Double-clicked from the volume but already current: do not
+                    linger as a windowed, dock-less process with nothing to do. */
+                NSApp.terminate(nil)
+            }
+        }
     }
 }
 

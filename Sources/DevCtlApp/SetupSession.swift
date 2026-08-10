@@ -52,6 +52,11 @@ struct SetupWindowOpener: View {
             .onAppear {
                 guard !didStart else { return }
                 didStart = true
+                /** The volume/DMG copy hides its menu bar item but the label
+                    still renders, so this opener still runs. It presents setup
+                    through its own delegate-hosted window instead, so opening the
+                    SwiftUI setup window here too would show two dialogs. */
+                guard !SetupPerformer.runningFromMountedVolume() else { return }
                 Task { @MainActor in
                     await session.evaluate()
                     guard session.shouldPresent else { return }

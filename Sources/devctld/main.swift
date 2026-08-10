@@ -3,10 +3,26 @@ import DevCtlKit
 import Foundation
 import IOKit
 import IOKit.pwr_mgt
+import MachO
 
 /** devctld: the daemon. Runs identically under launchd and --foreground; the only
     difference is who started it. Exits nonzero on startup failure so launchd's
     KeepAlive={SuccessfulExit:false} relaunches crashes but honors clean exits. */
+
+/** The absolute path of the running executable image, symlinks resolved. Reads
+    the image the kernel actually mapped via `_NSGetExecutablePath` rather than
+    argv[0], which a launcher can set to anything. */
+func currentExecutablePath() -> String? {
+    var size: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &size)
+    guard size > 0 else { return nil }
+    var buffer = [CChar](repeating: 0, count: Int(size))
+    guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
+    let bytes = buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }
+    guard !bytes.isEmpty else { return nil }
+    return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self))
+        .resolvingSymlinksInPath().path
+}
 
 var socketOverride: String?
 var dataDirOverride: String?
@@ -30,6 +46,41 @@ while let arg = argIterator.next() {
     default:
         FileHandle.standardError.write(Data("devctld: unknown argument \(arg)\n".utf8))
         exit(2)
+    }
+}
+
+/** Never keep the daemon's process image on a mounted volume. A DMG shares the
+    installed app's bundle id, so Launch Services can spawn the daemon from the
+    volume copy and pin the volume open (see DaemonImagePolicy). Re-exec the
+    canonical installed binary before any lock or socket work, so the volume
+    process never takes the single-instance lock. */
+if let selfExecutable = currentExecutablePath() {
+    let candidates = [
+        "/Applications/devctl.app/Contents/Helpers/devctld",
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/devctld").path,
+    ]
+    let decision = DaemonImagePolicy.decide(
+        currentExecutable: selfExecutable,
+        candidates: candidates,
+        alreadyReexeced: ProcessInfo.processInfo.environment["DEVCTL_DAEMON_REEXECED"] == "1",
+        fileExists: { FileManager.default.fileExists(atPath: $0) })
+    if case .reexec(let target) = decision {
+        FileHandle.standardError.write(
+            Data(
+                "devctld: image is on a mounted volume (\(selfExecutable)); re-exec from \(target)\n"
+                    .utf8))
+        setenv("DEVCTL_DAEMON_REEXECED", "1", 1)
+        var argv = CommandLine.arguments
+        argv[0] = target
+        let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+        execv(target, cArgs)
+        /** execv only returns on failure; fall through and run in place rather
+            than exit into a KeepAlive respawn of the same volume image. */
+        FileHandle.standardError.write(
+            Data(
+                "devctld: execv(\(target)) failed: \(String(cString: strerror(errno))); continuing in place\n"
+                    .utf8))
     }
 }
 

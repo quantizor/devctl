@@ -237,6 +237,16 @@ enum SetupPerformer: Sendable {
         url?.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
+    /** True when this copy is running from a mounted volume (a DMG). Such a copy
+        acts as a headless installer: it draws no menu bar item, presents only the
+        setup window, and hands off to /Applications, so an upgrade never shows the
+        volume copy and the installed copy on the menu bar at once. Uses the same
+        discriminator the daemon uses to keep its own image off the volume. */
+    nonisolated static func runningFromMountedVolume(bundle: Bundle = .main) -> Bool {
+        guard let path = canonicalPath(bundle.bundleURL) else { return false }
+        return DaemonImagePolicy.isUnderMountedVolume(path)
+    }
+
     /** Quit at launch when an older copy of this same bundle is already running.
         Returns whether this process is on its way out, so the caller can skip the
         rest of launch.
