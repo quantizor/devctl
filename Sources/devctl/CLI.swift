@@ -1447,6 +1447,17 @@ struct Doctor: AsyncParsableCommand {
                         kind: "harness-hook", severity: "info"))
             }
         }
+        /** Shadowed install: a second devctl copy (a `make install` in
+            ~/.local/bin, or a foreign /Applications app Homebrew could not
+            replace) shadowing the Homebrew one, so a bare `devctl` or the daemon
+            can keep running an old version after an upgrade. Report-only, with
+            the exact cleanup command. */
+        for shadow in InstallShadow.scan() {
+            findings.append(
+                Finding(
+                    detail: "\(shadow.detail) (run: \(shadow.remedy))",
+                    kind: "install-shadow", severity: "warning"))
+        }
         if global.json {
             struct Report: Codable {
                 var findings: [Finding]
