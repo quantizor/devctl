@@ -111,12 +111,23 @@ public actor DaemonClient {
 
     /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
         fails with `EAGAIN` once no data arrives within the window. */
+    /** Clamp a response deadline into a range safe to convert to `timeval`:
+        `Int(Double)` and `Int32(Double)` trap on a non-finite or out-of-range
+        value, and this deadline ultimately derives from a caller-supplied
+        `--timeout`, so `--timeout inf` must degrade to the default rather than
+        crash the process. One day is far above any real deadline and well inside
+        Int range. */
+    static func clampedResponseTimeout(_ seconds: Double) -> Double {
+        seconds.isFinite ? min(max(seconds, 0), 86_400) : defaultResponseTimeout
+    }
+
     private func setResponseTimeout(_ seconds: Double) {
         guard fd >= 0 else { return }
-        let whole = seconds.rounded(.down)
+        let clamped = Self.clampedResponseTimeout(seconds)
+        let whole = clamped.rounded(.down)
         var tv = timeval(
             tv_sec: Int(whole),
-            tv_usec: Int32((seconds - whole) * 1_000_000))
+            tv_usec: Int32((clamped - whole) * 1_000_000))
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
     }
 
