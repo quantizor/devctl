@@ -1,6 +1,6 @@
 {
   "name": "devctl",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "private": true,
   "description": "Version and changelog source of truth for GitHub releases (Swift product; not published to npm).",
   "repository": {
