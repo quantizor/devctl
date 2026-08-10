@@ -62,6 +62,18 @@ cask "devctl" do
   ]
 
   caveats <<~EOS
+    devctl is a menu bar app with a small background agent that supervises your
+    dev servers. Homebrew installed it but does not start it; open the app once
+    to start the agent:
+
+        open -a devctl
+
+    macOS asks you to confirm the first launch (it is notarized, so this is a
+    one-time click). After that the agent starts at login and the menu bar icon
+    shows your servers. Then wire up your coding agents:
+
+        devctl hook install
+
     To remove devctl's agent hooks and CLI state as well, run `devctl uninstall`
     before uninstalling this cask.
   EOS
