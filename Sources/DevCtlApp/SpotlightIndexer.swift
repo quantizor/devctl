@@ -135,11 +135,11 @@ enum SpotlightIndexer {
     }
 
     static func noteOpened(identifier: String) {
-        guard var entry = loadEntries()[identifier] else { return }
+        var map = loadEntries()
+        guard var entry = map[identifier] else { return }
         let now = Date()
         entry.lastUsed = now
         if entry.firstSeen == nil { entry.firstSeen = now }
-        var map = loadEntries()
         map[identifier] = entry
         if let data = try? JSONCoding.encoder().encode(map) {
             UserDefaults.standard.set(data, forKey: entriesKey)

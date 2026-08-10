@@ -581,8 +581,12 @@ public actor Router {
             descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
             signal: SIGTERM)
         /** Poll with identity, not kill(pid,0): a recycled number must end the
-            wait as "gone" rather than escalate into the new process. */
-        let graceDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            wait as "gone" rather than escalate into the new process. A shorter
+            grace than an ordinary stop's 7s default: an orphan bounce runs during
+            boot restore, where a prior daemon's leftover child should yield
+            quickly so the fresh supervisor can claim the port. */
+        let orphanBounceGraceSeconds = 2.0
+        let graceDeadline = ContinuousClock.now.advanced(by: .seconds(orphanBounceGraceSeconds))
         while ContinuousClock.now < graceDeadline,
             ProcessTree.shouldSignal(
                 snapshotted: root, live: ProcessTree.identity(of: pid))
@@ -850,20 +854,21 @@ public actor Router {
 
     /** Resolve effective port, apply overlay/worktree host/materialization, and
         either auto-rebind a sibling conflict or refuse with port-held. Every
-        start-shaped path routes through here.
+        start-shaped path funnels through here, which is also why the trust gate
+        lives here rather than at each call site.
 
         `force` resolves and validates even for a server that is currently up,
         which is what lets `restart` raise every refusal before it stops
         anything. The port pre-check treats a listener the target itself owns as
-        free, so a running server does not report its own port as held. */
-    /** Every start-shaped path funnels through here, which is why the trust gate
-        lives here rather than at each call site. `userInitiated` is the security
-        boundary: an explicit command (ensure, start, up, restart) acting on a
-        server declared in the committed devservers.json IS the user's approval,
-        so it records trust and proceeds. An autonomous path (boot restore, the
-        watch sweep) must not act on a project's committed config until that
-        approval was given, so it refuses. A spec that came from `register`
-        rather than the file carries its own approval and is never gated. */
+        free, so a running server does not report its own port as held.
+
+        `userInitiated` is the security boundary: an explicit command (ensure,
+        start, up, restart) acting on a server declared in the committed
+        devservers.json IS the user's approval, so it records trust and proceeds.
+        An autonomous path (boot restore, the watch sweep) must not act on a
+        project's committed config until that approval was given, so it refuses.
+        A spec that came from `register` rather than the file carries its own
+        approval and is never gated. */
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
         force: Bool = false, userInitiated: Bool = false
@@ -887,7 +892,18 @@ public actor Router {
         if merged.fileNames.contains(target.name) {
             let trusted = await registry.isTrusted(project: target.project)
             if userInitiated {
-                if !trusted { try? await registry.setTrusted(project: target.project) }
+                if !trusted {
+                    do {
+                        try await registry.setTrusted(project: target.project)
+                    } catch {
+                        /** The command still proceeds, but a dropped trust write
+                            means a later autonomous restore of this project will
+                            refuse it with nothing pointing back here; surface it
+                            so a drifted trust state is diagnosable. */
+                        DevCtlLog.daemon.error(
+                            "failed to record trust for \(target.project): \(error)")
+                    }
+                }
             } else if !trusted {
                 throw WireError(
                     code: .notTrusted,

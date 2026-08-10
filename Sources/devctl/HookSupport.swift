@@ -66,9 +66,6 @@ enum HookContext {
     }
 }
 
-/** A harness adapter owns one agent harness's settings format and injection
-    mechanism. Adding a harness = one new conformer + a registry entry (see
-    CONTRIBUTING.md). The context payload itself is harness-agnostic. */
 /** What `devctl doctor` found about one harness's hook. Reporting only: doctor
     names the fix but never edits a file the user owns. */
 enum HarnessHookState: Equatable, Sendable {
@@ -81,6 +78,9 @@ enum HarnessHookState: Equatable, Sendable {
     case notInstalled
 }
 
+/** A harness adapter owns one agent harness's settings format and injection
+    mechanism. Adding a harness = one new conformer + a registry entry (see
+    CONTRIBUTING.md). The context payload itself is harness-agnostic. */
 protocol HarnessAdapter: Sendable {
     /** Idempotently wires the session hook into the harness's settings. Returns
         a human summary of what changed. */

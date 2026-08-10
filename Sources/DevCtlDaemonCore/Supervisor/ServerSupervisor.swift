@@ -440,12 +440,20 @@ public actor ServerSupervisor {
     private func startHealthMonitor() {
         healthTask?.cancel()
         let check = EffectiveHealthcheck.resolve(spec: spec)
-        let intervalMs = spec.healthcheck?.intervalMs ?? 2000
+        /** Default cadence when the spec sets no interval: probe every 2s. */
+        let defaultHealthcheckIntervalMs = 2000
+        let intervalMs = spec.healthcheck?.intervalMs ?? defaultHealthcheckIntervalMs
+        /** With a real healthcheck, wait a short beat before the first probe so a
+            server that binds immediately is not marked unhealthy on a startup
+            blip; with no healthcheck, the resolved stabilization window is the
+            delay instead. Unrelated to descendantWatchIntervalMs, which happens
+            to share the value but paces the process-snapshot sweep. */
+        let defaultInitialProbeDelayMs = 200
         let initialDelayMs: Int
         if case .none(let stabilizationMs) = check {
             initialDelayMs = stabilizationMs
         } else {
-            initialDelayMs = 200
+            initialDelayMs = defaultInitialProbeDelayMs
         }
         healthTask = Task { [prober, weak self] in
             try? await Task.sleep(for: .milliseconds(initialDelayMs))

@@ -64,12 +64,15 @@ public enum LogQuery {
     }
 
     /** True when an unbounded quantifier (`*`, `+`, `{n,}`) is applied to a group
-        whose body already contains an unbounded quantifier: the exponential
-        backtracking family. A lexical scan rather than a full parser, tuned to
-        reject that shape while leaving common safe patterns alone: a bounded
-        outer repeat (`(a+){2}`), disjoint alternation (`(foo|bar)+`), a class
-        (`[a-z]+`), and any top-level quantifier (`error.*failed`) are all fine
-        because none nests an unbounded repeat inside a repeated group. */
+        whose body already contains an unbounded quantifier: the nested-quantifier
+        form of catastrophic backtracking, e.g. `(a+)+`. A lexical scan rather
+        than a full parser, tuned to reject that shape while leaving common safe
+        patterns alone: a bounded outer repeat (`(a+){2}`), disjoint alternation
+        (`(foo|bar)+`), a class (`[a-z]+`), and any top-level quantifier
+        (`error.*failed`) are all fine because none nests an unbounded repeat
+        inside a repeated group. This does not catch alternation-overlap
+        backtracking (`(a|a)*`), the other exponential family the same engine is
+        vulnerable to; the client response deadline is the backstop for that. */
     static func nestsUnboundedQuantifier(_ pattern: String) -> Bool {
         let chars = Array(pattern)
         /** One flag per open group: does its body hold an unbounded quantifier. */

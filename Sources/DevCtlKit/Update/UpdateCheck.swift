@@ -111,8 +111,7 @@ public enum UpdateCheck {
             else { return cachedFallback() }
             let cache = Cache(
                 checkedAt: now,
-                etag: (http.value(forHTTPHeaderField: "Etag")
-                    ?? http.value(forHTTPHeaderField: "ETag")),
+                etag: http.value(forHTTPHeaderField: "ETag"),
                 latestVersion: normalize(tag))
             persist(cache, paths: paths)
             return status(from: cache, currentVersion: currentVersion)
