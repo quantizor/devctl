@@ -113,10 +113,11 @@ import Testing
             try Data(#"{"model":"opus"}"#.utf8).write(to: settings)
             let adapter = ClaudeCodeAdapter(settingsURLOverride: settings)
 
-            _ = try adapter.install(devctlPath: "/opt/homebrew/bin/devctl")
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            _ = try adapter.install(devctlPath: devctlPath)
             if case .installed(let path, let exists) = adapter.hookState() {
-                #expect(path == "/opt/homebrew/bin/devctl")
-                #expect(!exists)  // that path is not on this machine
+                #expect(path == devctlPath)
+                #expect(!exists)  // a path under the scratch dir that we never create
             } else {
                 Issue.record("expected the hook to read as installed")
             }
@@ -176,9 +177,10 @@ import Testing
         try inScratchDir { dir in
             let settings = dir.appending(path: "hooks.json")
             let adapter = CursorAdapter(settingsURLOverride: settings)
-            _ = try adapter.install(devctlPath: "/opt/homebrew/bin/devctl")
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            _ = try adapter.install(devctlPath: devctlPath)
             if case .installed(let path, _) = adapter.hookState() {
-                #expect(path == "/opt/homebrew/bin/devctl")
+                #expect(path == devctlPath)
             } else {
                 Issue.record("expected the cursor hook to read as installed")
             }
