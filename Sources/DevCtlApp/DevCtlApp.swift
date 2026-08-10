@@ -182,8 +182,10 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
             poll and crash notification the user sees. */
         guard !SetupPerformer.quitIfTwinIsRunning() else { return }
         /** The volume copy is a headless installer: no menu bar item, no deep
-            links or notifications, just the setup window shown here (its
-            MenuBarExtra is not inserted, so the label-hosted opener never runs). */
+            links or notifications, just the setup window shown here. SwiftUI still
+            renders the MenuBarExtra label view even with the item hidden, so the
+            label-hosted opener would also fire; it guards itself against the volume
+            copy (SetupWindowOpener) so setup is not presented twice. */
         if SetupPerformer.runningFromMountedVolume() {
             InstallerWindowController.shared.present()
             return
@@ -285,7 +287,7 @@ struct DevCtlApp: App {
         menu bar UI to feed and exits after handing off, so it never polls. */
     init() {
         let launched = DaemonModel()
-        if !SetupPerformer.runningFromMountedVolume() { launched.start() }
+        if !isVolumeInstaller { launched.start() }
         _model = State(initialValue: launched)
     }
 
@@ -334,9 +336,10 @@ struct DevCtlApp: App {
     }
 }
 
-/** Hosts the volume copy's installer window. That copy draws no menu bar item, so
-    its MenuBarExtra label never renders and the label-hosted window opener never
-    fires; the delegate presents the setup UI here directly instead. */
+/** Hosts the volume copy's installer window. That copy draws no menu bar item, but
+    SwiftUI still renders its MenuBarExtra label view, so the label-hosted window
+    opener would also fire; that opener guards itself against the volume copy, and
+    the delegate presents the setup UI here directly instead. */
 @MainActor
 final class InstallerWindowController: NSObject, NSWindowDelegate {
     static let shared = InstallerWindowController()

@@ -109,8 +109,6 @@ public actor DaemonClient {
         pending = []
     }
 
-    /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
-        fails with `EAGAIN` once no data arrives within the window. */
     /** Clamp a response deadline into a range safe to convert to `timeval`:
         `Int(Double)` and `Int32(Double)` trap on a non-finite or out-of-range
         value, and this deadline ultimately derives from a caller-supplied
@@ -121,6 +119,8 @@ public actor DaemonClient {
         seconds.isFinite ? min(max(seconds, 0), 86_400) : defaultResponseTimeout
     }
 
+    /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
+        fails with `EAGAIN` once no data arrives within the window. */
     private func setResponseTimeout(_ seconds: Double) {
         guard fd >= 0 else { return }
         let clamped = Self.clampedResponseTimeout(seconds)

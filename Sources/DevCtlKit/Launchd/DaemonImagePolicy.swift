@@ -47,9 +47,7 @@ public enum DaemonImagePolicy {
         guard !alreadyReexeced else { return .runHere }
         guard isUnderMountedVolume(currentExecutable) else { return .runHere }
         for candidate in candidates
-        where candidate != currentExecutable
-            && !isUnderMountedVolume(candidate)
-            && fileExists(candidate) {
+        where !isUnderMountedVolume(candidate) && fileExists(candidate) {
             return .reexec(path: candidate)
         }
         return .runHere

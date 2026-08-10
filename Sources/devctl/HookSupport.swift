@@ -8,7 +8,7 @@ import Foundation
     project directory). */
 enum CLISelf {
     static var path: String {
-        if let raw = dyldExecutablePath() {
+        if let raw = mainExecutablePath() {
             return URL(fileURLWithPath: raw).resolvingSymlinksInPath().path
         }
         return fallbackPath()
@@ -20,17 +20,11 @@ enum CLISelf {
         URL(fileURLWithPath: path).deletingLastPathComponent().appending(path: "devctld")
     }
 
-    /** Standard 2-call `_NSGetExecutablePath`: query size, then fill. */
-    private static func dyldExecutablePath() -> String? {
-        var size: UInt32 = 0
-        _ = _NSGetExecutablePath(nil, &size)
-        guard size > 1 else { return nil }
-        var buf = [CChar](repeating: 0, count: Int(size))
-        guard _NSGetExecutablePath(&buf, &size) == 0 else { return nil }
-        let end = buf.firstIndex(of: 0) ?? buf.endIndex
-        let bytes = buf[..<end].map { UInt8(bitPattern: $0) }
-        let raw = String(decoding: bytes, as: UTF8.self)
-        return raw.isEmpty ? nil : raw
+    /** The running binary's image path from `Bundle.main.executableURL` (the
+        kernel image, not argv[0]); the `path` accessor resolves any symlink. Nil
+        only when the bundle has no executable URL, when `fallbackPath` takes over. */
+    private static func mainExecutablePath() -> String? {
+        Bundle.main.executableURL?.path
     }
 
     /** Last resort when dyld refuses: absolute arg0, else first PATH hit. */
