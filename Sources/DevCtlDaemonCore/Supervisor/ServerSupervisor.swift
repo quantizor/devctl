@@ -308,10 +308,21 @@ public actor ServerSupervisor {
         return EnsureResult(reason: outcome, server: status())
     }
 
+    /** Clamp a wire-supplied timeout to a range `Duration.seconds` can represent
+        without trapping: it fatally traps on a non-finite value and overflows on
+        an astronomically large one. The wire is an untrusted surface, so the
+        daemon guards this itself rather than trusting the client to have validated
+        `--timeout`. A non-finite value means "wait as long as possible" and maps
+        to the one-day ceiling. */
+    nonisolated static func boundedTimeoutSeconds(_ seconds: Double) -> Double {
+        seconds.isFinite ? min(max(seconds, 0), 86_400) : 86_400
+    }
+
     /** Blocks until the condition holds. Rides through non-terminal transitions
         (another session's restart) and fails fast on crashed/failed/stopped. */
     public func wait(for condition: WaitCondition, timeoutSeconds: Double) async -> EnsureReason? {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+        let deadline = ContinuousClock.now.advanced(
+            by: .seconds(Self.boundedTimeoutSeconds(timeoutSeconds)))
         while true {
             switch condition {
             case .healthy:

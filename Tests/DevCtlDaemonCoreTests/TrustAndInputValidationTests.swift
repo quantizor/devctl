@@ -37,6 +37,20 @@ import Testing
         return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
     }
 
+    /** A non-finite or astronomically large timeout arriving over the wire is
+        clamped before it reaches `Duration.seconds`, which traps on such a value.
+        The clamp keeps a crafted `ensure`/`wait`/lock request from taking the
+        daemon down (and respawning it under KeepAlive). */
+    @Test func wireTimeoutIsClampedBeforeDurationConversion() {
+        #expect(ServerSupervisor.boundedTimeoutSeconds(.infinity) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(-.infinity) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(.nan) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(1e30) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(-5) == 0)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(0) == 0)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(60) == 60)
+    }
+
     @Test func registerRefusesAnInvalidSpec() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
