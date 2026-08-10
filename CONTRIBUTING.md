@@ -21,19 +21,17 @@ A separate macOS workflow (`.github/workflows/release-dmg.yml`) builds a Develop
 
 The release DMG build runs with `DEVCTL_REQUIRE_SIGNING=1`, so a runner missing the certificate fails the build rather than shipping an ad-hoc image Gatekeeper would disable.
 
-Local path: `SIGN_IDENTITY="Developer ID Application: …" make dmg` then `scripts/notarize.sh`, then `gh release upload vX.Y.Z dist/devctl-X.Y.Z.dmg`.
+Local path: `make release-dmg` (Developer ID signed, notarized, and stapled; fails loudly if signing or notary credentials are missing), then `gh release upload vX.Y.Z dist/devctl-X.Y.Z.dmg`.
 
 ## Homebrew tap
 
 devctl is distributed as a cask through the self-owned tap `quantizor/homebrew-tap` (installed as `brew install --cask quantizor/tap/devctl`). A tap is required rather than optional: the official `homebrew/cask` needs 225 stars and a 30-day-old repo, and a tapless cask can never be upgraded (brew re-reads the definition saved at install time, so the version always compares equal).
 
-The cask's structure has one home: `packaging/homebrew/devctl.rb` in this repo. The release workflow `.github/workflows/bump-homebrew-cask.yml` reads that template, injects the published release's `version` and `sha256`, and pushes the result to the tap. `Release DMG` dispatches it after the DMG is uploaded (the same explicit-dispatch pattern the Release job uses for the DMG). One additional repository secret:
+The release workflow bumps the tap automatically on publish. The cask's structure (`packaging/homebrew/devctl.rb`), the `bump-homebrew-cask` workflow that injects each release's `version` and `sha256`, and the `scripts/smoke-cask.sh` gate are all documented in docs/releasing.md. One additional repository secret drives the bump:
 
 - `HOMEBREW_TAP_TOKEN`: a fine-grained PAT with `contents: write` on `quantizor/homebrew-tap` (the default `GITHUB_TOKEN` cannot push across repos). A GitHub App token via `actions/create-github-app-token` is the equivalent alternative.
 
 Anything in the cask's `uninstall` runs on every `brew upgrade`, not only on uninstall, so it is limited to unregistering the background agent (the app re-registers it when brew relaunches). It must never remove hooks or data: nothing restores those automatically. Full removal is `devctl uninstall`.
-
-`scripts/smoke-cask.sh` is the cask gate. Its default tier is non-destructive (a throwaway local tap via `brew tap-new --no-git`, a file:// DMG, style/audit/dry-run/fetch); `DEVCTL_CASK_DESTRUCTIVE=1 scripts/smoke-cask.sh --install` runs a real install into a temp `--appdir` and asserts the Caskroom backlink and the CLI symlink.
 
 ## Adding an agent-harness adapter
 
