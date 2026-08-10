@@ -5,7 +5,7 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test app dmg install clean
+.PHONY: build test app dmg release-dmg install clean
 
 build:
 	swift build -c release
@@ -18,6 +18,16 @@ app: build
 
 dmg: app
 	scripts/make-dmg.sh "$(SIGN_IDENTITY)"
+
+# Maintainer release image: always Developer ID signed, notarized, and stapled.
+# DEVCTL_REQUIRE_SIGNING=1 fails the app build if no Developer ID cert is present
+# (never a silent ad-hoc fallback) and implies notarization, which then fails
+# loudly if the notary credentials are unreachable rather than shipping a test
+# image. Re-invokes `make dmg` so both the app build and the DMG step see the
+# environment. This is the path for anything a user will install or launch;
+# contributors use `make dmg` for the unsigned/test image.
+release-dmg:
+	DEVCTL_REQUIRE_SIGNING=1 DEVCTL_NOTARIZE=1 $(MAKE) dmg
 
 install: build app
 	mkdir -p $(PREFIX)/bin
