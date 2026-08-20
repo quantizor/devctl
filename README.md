@@ -22,7 +22,7 @@ brew install --cask quantizor/tap/devctl
 
 The fully qualified `quantizor/tap/devctl` trusts only this cask. `brew upgrade` keeps it current, and the in-app footer offers a one-click upgrade when a new version ships. To remove it later: `devctl uninstall` (or `brew uninstall --cask --zap quantizor/tap/devctl`).
 
-Prefer a direct download? Grab the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Either way nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Antigravity, Claude Code, and Cursor (checked by default when needed).
+Prefer a direct download? Grab the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Either way nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Antigravity, Claude Code, Cursor, and Grok Build (checked by default when needed).
 
 Or build from source (your agent can do this for you):
 
@@ -35,6 +35,7 @@ devctl why myproj     # root cause when something breaks
 devctl hook install --harness antigravity # Antigravity sessions rediscover servers automatically
 devctl hook install --harness claude      # same for Claude Code (default harness)
 devctl hook install --harness cursor      # same for Cursor
+devctl hook install --harness grok        # Grok Build: home rule plus session hook
 ```
 
 Name each server after the project (`myproj`, not a generic `web`) so it is easy to spot in Spotlight and search, and give it a `<project>.localhost` host rather than bare `localhost`: the per-project subdomain keeps browser cookies, storage, and service workers isolated between projects.

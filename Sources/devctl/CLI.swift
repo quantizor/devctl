@@ -746,7 +746,7 @@ struct HookCommand: AsyncParsableCommand {
         abstract: "Agent-harness session hooks.",
         subcommands: [
             HookInstall.self, HookUninstall.self, HookAntigravitySessionStart.self,
-            HookClaudeSessionStart.self, HookCursorSessionStart.self,
+            HookClaudeSessionStart.self, HookCursorSessionStart.self, HookGrokSessionStart.self,
         ]
     )
 }
@@ -925,6 +925,32 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         let project = GlobalOptions.resolveProject(from: cwd)
         guard let text = await HookContext.render(project: project) else { return }
         let output: [String: Any] = ["additional_context": text]
+        if let data = try? JSONSerialization.data(withJSONObject: output) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+}
+
+/** Invoked by Grok Build's SessionStart hook. Emits
+    hookSpecificOutput.additionalContext (Grok currently ignores stdout on
+    passive events; the standing instruction lives in ~/.grok/rules/devctl.md).
+    Same silence / exit-0 guarantees as the Claude hook. */
+struct HookGrokSessionStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "grok-session-start", shouldDisplay: false)
+
+    func run() async throws {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let cwd = HookSessionCwd.resolve(stdin: stdin)
+        FileManager.default.changeCurrentDirectoryPath(cwd)
+        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let text = await HookContext.render(project: project) else { return }
+        let output: [String: Any] = [
+            "hookSpecificOutput": [
+                "additionalContext": text,
+                "hookEventName": "SessionStart",
+            ]
+        ]
         if let data = try? JSONSerialization.data(withJSONObject: output) {
             FileHandle.standardOutput.write(data)
         }
