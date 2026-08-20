@@ -161,6 +161,18 @@ public enum SetupPlanner {
         installedCLIPath: String
     ) -> [HarnessOffer] {
         var offers: [HarnessOffer] = []
+        let antigravityDir = home.appending(path: ".gemini")
+        if FileManager.default.fileExists(atPath: antigravityDir.path) {
+            let installed = HookPresence.antigravityHookInstalled(
+                settingsURL: antigravityDir.appending(path: "config/hooks.json"),
+                expectedCLIPath: installedCLIPath)
+            offers.append(
+                HarnessOffer(
+                    alreadyInstalled: installed,
+                    defaultChecked: !installed,
+                    displayName: "Antigravity",
+                    harness: "antigravity"))
+        }
         let claudeDir = home.appending(path: ".claude")
         if FileManager.default.fileExists(atPath: claudeDir.path) {
             let installed = HookPresence.claudeHookInstalled(
@@ -184,6 +196,18 @@ public enum SetupPlanner {
                     defaultChecked: !installed,
                     displayName: "Cursor",
                     harness: "cursor"))
+        }
+        let grokDir = home.appending(path: ".grok")
+        if FileManager.default.fileExists(atPath: grokDir.path) {
+            let installed = HookPresence.grokHookInstalled(
+                settingsURL: grokDir.appending(path: "hooks/devctl.json"),
+                expectedCLIPath: installedCLIPath)
+            offers.append(
+                HarnessOffer(
+                    alreadyInstalled: installed,
+                    defaultChecked: !installed,
+                    displayName: "Grok Build",
+                    harness: "grok"))
         }
         return offers.sorted { $0.harness < $1.harness }
     }
@@ -350,6 +374,25 @@ public struct HarnessOffer: Equatable, Sendable {
 /** Lightweight read of harness settings to decide checkbox defaults. Mirrors the
     CLI adapters' "already installed" checks without writing. */
 enum HookPresence {
+    static func antigravityHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
+        guard let data = try? Data(contentsOf: settingsURL),
+            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        let expected = "\(expectedCLIPath) hook antigravity-session-start"
+        for (_, value) in settings {
+            guard let hookGroup = value as? [String: Any],
+                let preInvocation = hookGroup["PreInvocation"] as? [[String: Any]]
+            else { continue }
+            for handler in preInvocation {
+                let command = handler["command"] as? String ?? ""
+                if command == expected || command.contains("devctl hook antigravity-session-start") {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     static func claudeHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
         guard let data = try? Data(contentsOf: settingsURL),
             let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -376,5 +419,25 @@ enum HookPresence {
             let command = entry["command"] as? String ?? ""
             return command == expected || command.contains("devctl hook cursor-session-start")
         }
+    }
+
+    static func grokHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
+        guard let data = try? Data(contentsOf: settingsURL),
+            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let hooks = settings["hooks"] as? [String: Any]
+        else { return false }
+        let expected = "\(expectedCLIPath) hook grok-session-start"
+        for (_, value) in hooks {
+            guard let groups = value as? [[String: Any]] else { continue }
+            for group in groups {
+                for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
+                    let command = hook["command"] as? String ?? ""
+                    if command == expected || command.contains("devctl hook grok-session-start") {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 }
