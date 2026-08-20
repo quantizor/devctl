@@ -187,10 +187,12 @@ struct SetupPlannerTests {
             at: home.appending(path: ".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
             at: home.appending(path: ".cursor"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: home.appending(path: ".grok"), withIntermediateDirectories: true)
 
         let cliPath = home.appending(path: ".local/bin/devctl").path
         let offersFresh = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersFresh.map(\.harness) == ["antigravity", "claude", "cursor"])
+        #expect(offersFresh.map(\.harness) == ["antigravity", "claude", "cursor", "grok"])
         #expect(offersFresh.allSatisfy { $0.defaultChecked && !$0.alreadyInstalled })
 
         let antigravitySettings = """
@@ -209,9 +211,15 @@ struct SetupPlannerTests {
             {"hooks":{"sessionStart":[{"command":"\(cliPath) hook cursor-session-start"}]},"version":1}
             """
         try Data(cursorSettings.utf8).write(to: home.appending(path: ".cursor/hooks.json"))
+        let grokSettings = """
+            {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
+            """
+        try FileManager.default.createDirectory(
+            at: home.appending(path: ".grok/hooks"), withIntermediateDirectories: true)
+        try Data(grokSettings.utf8).write(to: home.appending(path: ".grok/hooks/devctl.json"))
 
         let offersInstalled = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersInstalled.count == 3)
+        #expect(offersInstalled.count == 4)
         #expect(offersInstalled.allSatisfy { $0.alreadyInstalled && !$0.defaultChecked })
     }
 

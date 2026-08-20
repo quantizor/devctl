@@ -197,6 +197,18 @@ public enum SetupPlanner {
                     displayName: "Cursor",
                     harness: "cursor"))
         }
+        let grokDir = home.appending(path: ".grok")
+        if FileManager.default.fileExists(atPath: grokDir.path) {
+            let installed = HookPresence.grokHookInstalled(
+                settingsURL: grokDir.appending(path: "hooks/devctl.json"),
+                expectedCLIPath: installedCLIPath)
+            offers.append(
+                HarnessOffer(
+                    alreadyInstalled: installed,
+                    defaultChecked: !installed,
+                    displayName: "Grok Build",
+                    harness: "grok"))
+        }
         return offers.sorted { $0.harness < $1.harness }
     }
 
@@ -407,5 +419,25 @@ enum HookPresence {
             let command = entry["command"] as? String ?? ""
             return command == expected || command.contains("devctl hook cursor-session-start")
         }
+    }
+
+    static func grokHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
+        guard let data = try? Data(contentsOf: settingsURL),
+            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let hooks = settings["hooks"] as? [String: Any]
+        else { return false }
+        let expected = "\(expectedCLIPath) hook grok-session-start"
+        for (_, value) in hooks {
+            guard let groups = value as? [[String: Any]] else { continue }
+            for group in groups {
+                for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
+                    let command = hook["command"] as? String ?? ""
+                    if command == expected || command.contains("devctl hook grok-session-start") {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 }

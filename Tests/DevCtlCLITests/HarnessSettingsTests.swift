@@ -270,6 +270,182 @@ import Testing
         }
     }
 
+    @Test func grokInstallThenUninstallRestoresAndKeepsOtherSettings() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(#"{"keep":true}"#.utf8).write(to: settings)
+            let sibling = dir.appending(path: "rules/other.md")
+            try FileManager.default.createDirectory(
+                at: sibling.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("leave me\n".utf8).write(to: sibling)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            _ = try adapter.install(devctlPath: devctlPath)
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == devctlPath)
+                #expect(!exists)
+            } else {
+                Issue.record("expected the grok hook to read as installed")
+            }
+            let afterInstall = try adapter.loadSettings()
+            #expect(afterInstall["keep"] as? Bool == true)
+            let hooks = afterInstall["hooks"] as? [String: Any]
+            let sessionStart = hooks?["SessionStart"] as? [[String: Any]]
+            #expect(sessionStart?.count == 1)
+            #expect(sessionStart?.first?["matcher"] == nil)
+            let handlers = sessionStart?.first?["hooks"] as? [[String: Any]]
+            #expect(handlers?.first?["timeout"] as? Int == 10)
+            #expect(hooks?["SessionEnd"] == nil)
+            #expect(hooks?["PostCompact"] == nil)
+            let rules = try String(contentsOf: adapter.rulesURL, encoding: .utf8)
+            #expect(rules.contains("devctl ensure"))
+            #expect(rules.contains("`devctl context`"))
+            #expect(!rules.contains("<devctl-servers>"))
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("removed"))
+            #expect(adapter.hookState() == .notInstalled)
+            #expect(!FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+            let afterUninstall = try adapter.loadSettings()
+            #expect(afterUninstall["keep"] as? Bool == true)
+            #expect(afterUninstall["hooks"] == nil)
+            let siblingAfter = try String(contentsOf: sibling, encoding: .utf8)
+            #expect(siblingAfter == "leave me\n")
+        }
+    }
+
+    @Test func grokUninstallWithoutAHookIsANoOp() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(#"{"keep":true}"#.utf8).write(to: settings)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            try FileManager.default.createDirectory(
+                at: adapter.rulesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("user rule\n".utf8).write(to: adapter.rulesURL)
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("not present"))
+            #expect(try adapter.loadSettings()["keep"] as? Bool == true)
+            let leftover = try String(contentsOf: adapter.rulesURL, encoding: .utf8)
+            #expect(leftover == "user rule\n")
+        }
+    }
+
+    @Test func grokUninstallKeepsAForeignHookInTheSameEntry() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "hooks": [
+                    "SessionStart": [
+                        [
+                            "hooks": [
+                                ["command": "/x/devctl hook grok-session-start", "type": "command"],
+                                ["command": "/other/tool run", "type": "command"],
+                            ]
+                        ]
+                    ]
+                ]
+            ])
+            _ = try adapter.uninstall()
+            let loaded = try adapter.loadSettings()
+            let entries = (loaded["hooks"] as? [String: Any])?["SessionStart"] as? [[String: Any]]
+            let commands =
+                (entries?.first?["hooks"] as? [[String: Any]])?.compactMap { $0["command"] as? String }
+                ?? []
+            #expect(commands == ["/other/tool run"])
+        }
+    }
+
+    @Test func grokRepairHookPath() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "hooks": [
+                    "SessionStart": [
+                        [
+                            "hooks": [
+                                [
+                                    "command": "/old/path/devctl hook grok-session-start",
+                                    "type": "command",
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ])
+            let newPath = dir.appending(path: "bin/devctl").path
+            let summary = try adapter.install(devctlPath: newPath)
+            #expect(summary.contains("repaired"))
+            if case .installed(let path, _) = adapter.hookState() {
+                #expect(path == newPath)
+            } else {
+                Issue.record("expected the repaired hook to read as installed")
+            }
+        }
+    }
+
+    @Test func grokRulesFileWriteIsStaticInstructionOnly() throws {
+        try inScratchDir { dir in
+            let url = dir.appending(path: "rules/devctl.md")
+            try GrokRulesFile.write(to: url)
+            let body = try String(contentsOf: url, encoding: .utf8)
+            #expect(body.contains(GrokRulesFile.preamble))
+            #expect(!body.contains("<devctl-servers>"))
+            try GrokRulesFile.remove(at: url)
+            #expect(!FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
+    @Test func grokUninstallDeletesAFileThatHeldOnlyDevctlHooks() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            _ = try adapter.install(devctlPath: dir.appending(path: "bin/devctl").path)
+            #expect(FileManager.default.fileExists(atPath: settings.path))
+            _ = try adapter.uninstall()
+            #expect(!FileManager.default.fileExists(atPath: settings.path))
+            #expect(!FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+        }
+    }
+
+    @Test func grokInstallIsIdempotentWhenSessionStartAlreadyMatches() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            try adapter.writeSettings([
+                "hooks": [
+                    "SessionStart": [
+                        [
+                            "hooks": [
+                                ["command": "\(devctlPath) hook grok-session-start", "type": "command"]
+                            ]
+                        ]
+                    ]
+                ]
+            ])
+            let summary = try adapter.install(devctlPath: devctlPath)
+            #expect(summary.contains("already installed"))
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            #expect((hooks?["SessionStart"] as? [[String: Any]])?.count == 1)
+            #expect(FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+        }
+    }
+
     @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
         let missing = FileManager.default.temporaryDirectory
             .appending(path: "devctl-absent-\(UUID().uuidString)/settings.json")
@@ -279,6 +455,10 @@ import Testing
             .appending(path: "devctl-ag-absent-\(UUID().uuidString)/config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: antigravityMissing)
         #expect(agAdapter.hookState() == .harnessAbsent)
+        let grokMissing = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-grok-absent-\(UUID().uuidString)/hooks/devctl.json")
+        let grokAdapter = GrokAdapter(settingsURLOverride: grokMissing)
+        #expect(grokAdapter.hookState() == .harnessAbsent)
     }
 
     @Test func hookStateReportsNotInstalledWhenAntigravityHomeDirectoryExists() throws {
@@ -289,6 +469,16 @@ import Testing
         let settings = dir.appending(path: "config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: settings)
         #expect(agAdapter.hookState() == .notInstalled)
+    }
+
+    @Test func hookStateReportsNotInstalledWhenGrokHomeDirectoryExists() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-grok-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = dir.appending(path: "hooks/devctl.json")
+        let grokAdapter = GrokAdapter(settingsURLOverride: settings)
+        #expect(grokAdapter.hookState() == .notInstalled)
     }
 
     @Test func sessionCwdResolvesAntigravityWorkspacePaths() {
@@ -307,5 +497,17 @@ import Testing
         let json = #"{"workspace_roots":["/my/cursor/root"]}"#
         let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
         #expect(resolved == "/my/cursor/root")
+    }
+
+    @Test func sessionCwdResolvesGrokWorkspaceRoot() {
+        let json = #"{"workspaceRoot":"/my/grok/root"}"#
+        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
+        #expect(resolved == "/my/grok/root")
+    }
+
+    @Test func sessionCwdPrefersGrokCwdOverWorkspaceRoot() {
+        let json = #"{"cwd":"/my/grok/cwd","workspaceRoot":"/my/grok/root"}"#
+        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
+        #expect(resolved == "/my/grok/cwd")
     }
 }
