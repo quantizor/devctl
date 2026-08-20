@@ -161,6 +161,18 @@ public enum SetupPlanner {
         installedCLIPath: String
     ) -> [HarnessOffer] {
         var offers: [HarnessOffer] = []
+        let antigravityDir = home.appending(path: ".gemini")
+        if FileManager.default.fileExists(atPath: antigravityDir.path) {
+            let installed = HookPresence.antigravityHookInstalled(
+                settingsURL: antigravityDir.appending(path: "config/hooks.json"),
+                expectedCLIPath: installedCLIPath)
+            offers.append(
+                HarnessOffer(
+                    alreadyInstalled: installed,
+                    defaultChecked: !installed,
+                    displayName: "Antigravity",
+                    harness: "antigravity"))
+        }
         let claudeDir = home.appending(path: ".claude")
         if FileManager.default.fileExists(atPath: claudeDir.path) {
             let installed = HookPresence.claudeHookInstalled(
@@ -350,6 +362,25 @@ public struct HarnessOffer: Equatable, Sendable {
 /** Lightweight read of harness settings to decide checkbox defaults. Mirrors the
     CLI adapters' "already installed" checks without writing. */
 enum HookPresence {
+    static func antigravityHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
+        guard let data = try? Data(contentsOf: settingsURL),
+            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        let expected = "\(expectedCLIPath) hook antigravity-session-start"
+        for (_, value) in settings {
+            guard let hookGroup = value as? [String: Any],
+                let preInvocation = hookGroup["PreInvocation"] as? [[String: Any]]
+            else { continue }
+            for handler in preInvocation {
+                let command = handler["command"] as? String ?? ""
+                if command == expected || command.contains("devctl hook antigravity-session-start") {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     static func claudeHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
         guard let data = try? Data(contentsOf: settingsURL),
             let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

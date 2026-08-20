@@ -182,15 +182,24 @@ struct SetupPlannerTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let home = root.appending(path: "home")
         try FileManager.default.createDirectory(
+            at: home.appending(path: ".gemini"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
             at: home.appending(path: ".claude"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
             at: home.appending(path: ".cursor"), withIntermediateDirectories: true)
 
         let cliPath = home.appending(path: ".local/bin/devctl").path
         let offersFresh = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersFresh.map(\.harness) == ["claude", "cursor"])
+        #expect(offersFresh.map(\.harness) == ["antigravity", "claude", "cursor"])
         #expect(offersFresh.allSatisfy { $0.defaultChecked && !$0.alreadyInstalled })
 
+        let antigravitySettings = """
+            {"devctl":{"PreInvocation":[{"command":"\(cliPath) hook antigravity-session-start","type":"command"}]}}
+            """
+        try FileManager.default.createDirectory(
+            at: home.appending(path: ".gemini/config"), withIntermediateDirectories: true)
+        try Data(antigravitySettings.utf8).write(
+            to: home.appending(path: ".gemini/config/hooks.json"))
         let claudeSettings = """
             {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook claude-session-start","type":"command"}],"matcher":"startup|resume|clear|compact"}]}}
             """
@@ -202,7 +211,7 @@ struct SetupPlannerTests {
         try Data(cursorSettings.utf8).write(to: home.appending(path: ".cursor/hooks.json"))
 
         let offersInstalled = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersInstalled.count == 2)
+        #expect(offersInstalled.count == 3)
         #expect(offersInstalled.allSatisfy { $0.alreadyInstalled && !$0.defaultChecked })
     }
 

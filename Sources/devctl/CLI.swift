@@ -745,8 +745,8 @@ struct HookCommand: AsyncParsableCommand {
         commandName: "hook",
         abstract: "Agent-harness session hooks.",
         subcommands: [
-            HookInstall.self, HookUninstall.self, HookClaudeSessionStart.self,
-            HookCursorSessionStart.self,
+            HookInstall.self, HookUninstall.self, HookAntigravitySessionStart.self,
+            HookClaudeSessionStart.self, HookCursorSessionStart.self,
         ]
     )
 }
@@ -852,6 +852,36 @@ struct HookUninstall: AsyncParsableCommand {
             }
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in summaries.joined(separator: "\n") }
+    }
+}
+
+/** Invoked by Antigravity's PreInvocation hook. Reads the hook's stdin JSON for
+    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]},
+    and always exits 0 quickly. */
+struct HookAntigravitySessionStart: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "antigravity-session-start", shouldDisplay: false)
+
+    func run() async throws {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let cwd = HookSessionCwd.resolve(stdin: stdin)
+        FileManager.default.changeCurrentDirectoryPath(cwd)
+        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let text = await HookContext.render(project: project) else {
+            let empty: [String: Any] = ["injectSteps": []]
+            if let data = try? JSONSerialization.data(withJSONObject: empty) {
+                FileHandle.standardOutput.write(data)
+            }
+            return
+        }
+        let output: [String: Any] = [
+            "injectSteps": [
+                ["ephemeralMessage": text]
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: output) {
+            FileHandle.standardOutput.write(data)
+        }
     }
 }
 

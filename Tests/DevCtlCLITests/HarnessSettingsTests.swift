@@ -189,10 +189,123 @@ import Testing
         }
     }
 
+    @Test func antigravityInstallThenUninstallRestoresAndKeepsOtherSettings() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks.json")
+            try Data(#"{"other-tool":{"PostToolUse":[]}}"#.utf8).write(to: settings)
+            let adapter = AntigravityAdapter(settingsURLOverride: settings)
+
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            _ = try adapter.install(devctlPath: devctlPath)
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == devctlPath)
+                #expect(!exists)
+            } else {
+                Issue.record("expected the antigravity hook to read as installed")
+            }
+            let afterInstall = try adapter.loadSettings()
+            #expect(afterInstall["other-tool"] != nil)
+            #expect(afterInstall["devctl"] != nil)
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("removed"))
+            #expect(adapter.hookState() == .notInstalled)
+            let afterUninstall = try adapter.loadSettings()
+            #expect(afterUninstall["other-tool"] != nil)
+            #expect(afterUninstall["devctl"] == nil)
+        }
+    }
+
+    @Test func antigravityUninstallWithoutAHookIsANoOp() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks.json")
+            try Data(#"{"other-tool":{"PostToolUse":[]}}"#.utf8).write(to: settings)
+            let adapter = AntigravityAdapter(settingsURLOverride: settings)
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("not present"))
+            #expect(try adapter.loadSettings()["other-tool"] != nil)
+        }
+    }
+
+    @Test func antigravityUninstallKeepsAForeignHookInSameGroup() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks.json")
+            let adapter = AntigravityAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "devctl": [
+                    "PreInvocation": [
+                        ["command": "/x/devctl hook antigravity-session-start", "type": "command"],
+                        ["command": "/other/tool run", "type": "command"],
+                    ]
+                ]
+            ])
+            _ = try adapter.uninstall()
+            let loaded = try adapter.loadSettings()
+            let devctl = loaded["devctl"] as? [String: Any]
+            let entries = devctl?["PreInvocation"] as? [[String: Any]]
+            let commands = entries?.compactMap { $0["command"] as? String } ?? []
+            #expect(commands == ["/other/tool run"])
+        }
+    }
+
+    @Test func antigravityRepairHookPath() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks.json")
+            let adapter = AntigravityAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "devctl": [
+                    "PreInvocation": [
+                        ["command": "/old/path/devctl hook antigravity-session-start", "type": "command"]
+                    ]
+                ]
+            ])
+            let newPath = dir.appending(path: "bin/devctl").path
+            let summary = try adapter.install(devctlPath: newPath)
+            #expect(summary.contains("repaired"))
+            if case .installed(let path, _) = adapter.hookState() {
+                #expect(path == newPath)
+            } else {
+                Issue.record("expected the repaired hook to read as installed")
+            }
+        }
+    }
+
     @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
         let missing = FileManager.default.temporaryDirectory
             .appending(path: "devctl-absent-\(UUID().uuidString)/settings.json")
         let adapter = ClaudeCodeAdapter(settingsURLOverride: missing)
         #expect(adapter.hookState() == .harnessAbsent)
+        let antigravityMissing = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-ag-absent-\(UUID().uuidString)/config/hooks.json")
+        let agAdapter = AntigravityAdapter(settingsURLOverride: antigravityMissing)
+        #expect(agAdapter.hookState() == .harnessAbsent)
+    }
+
+    @Test func hookStateReportsNotInstalledWhenAntigravityHomeDirectoryExists() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-ag-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = dir.appending(path: "config/hooks.json")
+        let agAdapter = AntigravityAdapter(settingsURLOverride: settings)
+        #expect(agAdapter.hookState() == .notInstalled)
+    }
+
+    @Test func sessionCwdResolvesAntigravityWorkspacePaths() {
+        let json = #"{"workspacePaths":["/my/workspace/path"]}"#
+        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
+        #expect(resolved == "/my/workspace/path")
+    }
+
+    @Test func sessionCwdResolvesClaudeCwd() {
+        let json = #"{"cwd":"/my/claude/cwd"}"#
+        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
+        #expect(resolved == "/my/claude/cwd")
+    }
+
+    @Test func sessionCwdResolvesCursorWorkspaceRoots() {
+        let json = #"{"workspace_roots":["/my/cursor/root"]}"#
+        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
+        #expect(resolved == "/my/cursor/root")
     }
 }
