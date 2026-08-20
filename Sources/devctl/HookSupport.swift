@@ -157,15 +157,23 @@ extension HarnessAdapter {
     }
 }
 
-let harnessAdapters: [any HarnessAdapter] = [ClaudeCodeAdapter(), CursorAdapter()]
+let harnessAdapters: [any HarnessAdapter] = [
+    AntigravityAdapter(), ClaudeCodeAdapter(), CursorAdapter(),
+]
 
-/** Resolve the project directory a session-start hook should introspect. Cursor
-    hooks carry workspace_roots (and CURSOR_PROJECT_DIR); Claude Code carries cwd.
-    Fall back to the process cwd when the payload is empty or malformed. */
+/** Resolve the project directory a session-start hook should introspect. Antigravity
+    carries workspacePaths; Cursor carries workspace_roots (and CURSOR_PROJECT_DIR);
+    Claude Code carries cwd. Fall back to the process cwd when the payload is empty
+    or malformed. */
 enum HookSessionCwd {
     static func resolve(stdin: Data) -> String {
         if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
             if let roots = payload["workspace_roots"] as? [String], let first = roots.first,
+                !first.isEmpty
+            {
+                return first
+            }
+            if let paths = payload["workspacePaths"] as? [String], let first = paths.first,
                 !first.isEmpty
             {
                 return first
@@ -176,6 +184,116 @@ enum HookSessionCwd {
             return env
         }
         return FileManager.default.currentDirectoryPath
+    }
+}
+
+/** Antigravity: PreInvocation hook merged into ~/.gemini/config/hooks.json without
+    clobbering existing entries. Emits {"injectSteps": [{"ephemeralMessage": ...}]}. */
+struct AntigravityAdapter: HarnessAdapter {
+    let name = "antigravity"
+    /** Overridable so tests can point at a scratch file; nil means the real
+        `~/.gemini/config/hooks.json`. */
+    var settingsURLOverride: URL?
+
+    var settingsURL: URL {
+        settingsURLOverride
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(
+                path: ".gemini/config/hooks.json")
+    }
+
+    var harnessPresent: Bool {
+        let parent = settingsURL.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: parent.path) { return true }
+        let grandparent = parent.deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: grandparent.path)
+    }
+
+    func install(devctlPath: String) throws -> String {
+        let command = "\(devctlPath) hook antigravity-session-start"
+        var settings = try loadSettings()
+        var devctlGroup = settings["devctl"] as? [String: Any] ?? [:]
+        var preInvocation = devctlGroup["PreInvocation"] as? [[String: Any]] ?? []
+        if let repaired = repairAntigravityPreInvocation(
+            preInvocation: &preInvocation, command: command)
+        {
+            devctlGroup["PreInvocation"] = preInvocation
+            settings["devctl"] = devctlGroup
+            try writeSettings(settings)
+            return repaired
+        }
+        let alreadyInstalled = preInvocation.contains { entry in
+            (entry["command"] as? String) == command
+        }
+        if alreadyInstalled {
+            return "Antigravity PreInvocation hook already installed (\(settingsURL.path))"
+        }
+        preInvocation.append(["command": command, "type": "command"])
+        devctlGroup["PreInvocation"] = preInvocation
+        settings["devctl"] = devctlGroup
+        try writeSettings(settings)
+        return "Antigravity PreInvocation hook installed in \(settingsURL.path)"
+    }
+
+    func uninstall() throws -> String {
+        var settings = try loadSettings()
+        guard var devctlGroup = settings["devctl"] as? [String: Any],
+            var preInvocation = devctlGroup["PreInvocation"] as? [[String: Any]]
+        else {
+            return "Antigravity hook not present (\(settingsURL.path))"
+        }
+        let before = preInvocation.count
+        preInvocation.removeAll { entry in
+            ((entry["command"] as? String) ?? "").contains("devctl hook antigravity-session-start")
+        }
+        guard preInvocation.count != before else {
+            return "Antigravity hook not present (\(settingsURL.path))"
+        }
+        if preInvocation.isEmpty {
+            devctlGroup.removeValue(forKey: "PreInvocation")
+        } else {
+            devctlGroup["PreInvocation"] = preInvocation
+        }
+        if devctlGroup.isEmpty {
+            settings.removeValue(forKey: "devctl")
+        } else {
+            settings["devctl"] = devctlGroup
+        }
+        try writeSettings(settings)
+        return "Antigravity hook removed from \(settingsURL.path)"
+    }
+
+    func hookState() -> HarnessHookState {
+        guard harnessPresent else { return .harnessAbsent }
+        let suffix = " hook antigravity-session-start"
+        guard let settings = try? loadSettings(),
+            let devctlGroup = settings["devctl"] as? [String: Any],
+            let preInvocation = devctlGroup["PreInvocation"] as? [[String: Any]]
+        else { return .notInstalled }
+        for entry in preInvocation {
+            if let command = entry["command"] as? String,
+                let path = recordedPath(from: command, suffix: suffix)
+            {
+                return .installed(
+                    path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+            }
+        }
+        return .notInstalled
+    }
+
+    private func repairAntigravityPreInvocation(
+        preInvocation: inout [[String: Any]], command: String
+    ) -> String? {
+        var changed = false
+        for i in preInvocation.indices {
+            guard let existing = preInvocation[i]["command"] as? String,
+                existing.contains("devctl hook antigravity-session-start"),
+                existing != command
+            else { continue }
+            preInvocation[i]["command"] = command
+            changed = true
+        }
+        return changed
+            ? "Antigravity PreInvocation hook path repaired in \(settingsURL.path)" : nil
     }
 }
 
