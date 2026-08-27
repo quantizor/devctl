@@ -29,6 +29,17 @@ import Testing
         try body(StubAdapter(settingsURL: dir.appending(path: "settings.json")))
     }
 
+    /** Stands in for a harness whose settings file devctl must refuse. */
+    private struct FailingAdapter: HarnessAdapter {
+        let name = "failing"
+        let settingsURL: URL
+        func install(devctlPath: String) throws -> String { "" }
+        func uninstall() throws -> String {
+            throw WireError(code: .configInvalid, hint: "h", message: "nope")
+        }
+        func hookState() -> HarnessHookState { .harnessAbsent }
+    }
+
     @Test func aMissingFileSeedsAnEmptyMerge() throws {
         try inScratch { adapter in
             let loaded = try adapter.loadSettings()
@@ -394,14 +405,14 @@ import Testing
         }
     }
 
-    @Test func grokRulesFileWriteIsStaticInstructionOnly() throws {
+    @Test func standingInstructionWriteIsStaticInstructionOnly() throws {
         try inScratchDir { dir in
             let url = dir.appending(path: "rules/devctl.md")
-            try GrokRulesFile.write(to: url)
+            try HarnessStandingInstruction.write(to: url)
             let body = try String(contentsOf: url, encoding: .utf8)
-            #expect(body.contains(GrokRulesFile.preamble))
+            #expect(body.contains(HarnessStandingInstruction.preamble))
             #expect(!body.contains("<devctl-servers>"))
-            try GrokRulesFile.remove(at: url)
+            try HarnessStandingInstruction.remove(at: url)
             #expect(!FileManager.default.fileExists(atPath: url.path))
         }
     }
@@ -446,6 +457,343 @@ import Testing
         }
     }
 
+    /** OpenCode merges opencode.json and opencode.jsonc with a later file's
+        `instructions` array replacing an earlier file's, so the round trip has
+        to preserve foreign entries and never touch the file that loses. */
+    @Test func opencodeInstallThenUninstallRestoresAndKeepsOtherSettings() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            try Data(
+                #"{"$schema":"https://opencode.ai/config.json","model":"claude-sonnet-4-5"}"#
+                    .utf8
+            ).write(to: settings)
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+
+            _ = try adapter.install(devctlPath: "")
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == adapter.instructionsFileURL.path)
+                #expect(exists)
+            } else {
+                Issue.record("expected the opencode wiring to read as installed")
+            }
+            let afterInstall = try adapter.loadSettings()
+            #expect(afterInstall["model"] as? String == "claude-sonnet-4-5")
+            #expect(afterInstall["instructions"] as? [String] == [adapter.instructionsEntry])
+            let managed = try String(contentsOf: adapter.instructionsFileURL, encoding: .utf8)
+            #expect(managed.contains("`devctl context`"))
+            #expect(!managed.contains("<devctl-servers>"))
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("removed"))
+            #expect(adapter.hookState() == .notInstalled)
+            #expect(!FileManager.default.fileExists(atPath: adapter.instructionsFileURL.path))
+            let afterUninstall = try adapter.loadSettings()
+            #expect(afterUninstall["model"] as? String == "claude-sonnet-4-5")
+            #expect(afterUninstall["instructions"] == nil)
+        }
+    }
+
+    @Test func opencodeInstallIsIdempotentAndRefreshesTheManagedFile() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings(["instructions": [adapter.instructionsEntry]])
+            try HarnessStandingInstruction.write(to: adapter.instructionsFileURL)
+            try Data("stale\n".utf8).write(to: adapter.instructionsFileURL)
+
+            let summary = try adapter.install(devctlPath: "")
+            #expect(summary.contains("already installed"))
+            #expect(
+                try adapter.loadSettings()["instructions"] as? [String]
+                    == [adapter.instructionsEntry])
+            let managed = try String(contentsOf: adapter.instructionsFileURL, encoding: .utf8)
+            #expect(managed == HarnessStandingInstruction.preamble + "\n")
+        }
+    }
+
+    @Test func opencodeInstallKeepsForeignInstructions() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings(["instructions": ["CONTRIBUTING.md", "docs/*.md"]])
+            _ = try adapter.install(devctlPath: "")
+            #expect(
+                try adapter.loadSettings()["instructions"] as? [String]
+                    == ["CONTRIBUTING.md", "docs/*.md", adapter.instructionsEntry])
+        }
+    }
+
+    @Test func opencodeInstallRefusesANonArrayInstructionsAndLeavesItAlone() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            let contents = #"{"instructions":"CONTRIBUTING.md"}"#
+            try Data(contents.utf8).write(to: settings)
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            let error = #expect(throws: WireError.self) { try adapter.install(devctlPath: "") }
+            #expect(error?.code == .configInvalid)
+            #expect(error?.message.contains("not an array of paths") == true)
+            let after = try String(contentsOf: settings, encoding: .utf8)
+            #expect(after == contents)
+            #expect(!FileManager.default.fileExists(atPath: adapter.instructionsFileURL.path))
+        }
+    }
+
+    /** A comment-bearing opencode.jsonc is legal for OpenCode and unreadable
+        for JSONSerialization, so the install refuses instead of rewriting the
+        file without its comments. */
+    @Test func opencodeInstallRefusesACommentedJsoncAndLeavesItAlone() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            let contents = """
+                {
+                  // the user's own note
+                  "model": "claude-sonnet-4-5",
+                }
+                """
+            try Data(contents.utf8).write(to: settings)
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            let error = #expect(throws: WireError.self) { try adapter.install(devctlPath: "") }
+            #expect(error?.code == .configInvalid)
+            #expect(error?.message.contains("JSONC") == true)
+            #expect(error?.message.contains("devctl.md") == true)
+            let after = try String(contentsOf: settings, encoding: .utf8)
+            #expect(after == contents)
+            #expect(!FileManager.default.fileExists(atPath: adapter.instructionsFileURL.path))
+        }
+    }
+
+    /** The winner's `instructions` array replaces the losing file's on merge,
+        so entries effective from opencode.json must move into the array the
+        jsonc write carries, or landing the entry would deactivate them. */
+    @Test func opencodeInstallCarriesShadowedEntriesIntoTheWinner() throws {
+        try inScratchDir { dir in
+            let winner = dir.appending(path: "opencode.jsonc")
+            let loser = dir.appending(path: "opencode.json")
+            try Data(#"{"instructions":["CONTRIBUTING.md"]}"#.utf8).write(to: loser)
+            let adapter = OpenCodeAdapter(settingsURLOverride: winner)
+
+            _ = try adapter.install(devctlPath: "")
+            #expect(
+                try adapter.loadSettings()["instructions"] as? [String]
+                    == ["CONTRIBUTING.md", adapter.instructionsEntry])
+            let losingAfter = try String(contentsOf: loser, encoding: .utf8)
+            #expect(losingAfter == #"{"instructions":["CONTRIBUTING.md"]}"#)
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("removed"))
+            /** The carried entries stay; only devctl's entry goes. */
+            #expect(try adapter.loadSettings()["instructions"] as? [String] == ["CONTRIBUTING.md"])
+        }
+    }
+
+    @Test func opencodeUninstallDropsTheKeyAndAFileThatHeldOnlyDevctl() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            try adapter.writeSettings([
+                "instructions": ["CONTRIBUTING.md", adapter.instructionsEntry],
+                "model": "claude-sonnet-4-5",
+            ])
+            _ = try adapter.uninstall()
+            /** The foreign entry stays; only devctl's goes. */
+            #expect(
+                try adapter.loadSettings()["instructions"] as? [String] == ["CONTRIBUTING.md"])
+            #expect(try adapter.loadSettings()["model"] as? String == "claude-sonnet-4-5")
+
+            try adapter.writeSettings(["instructions": [adapter.instructionsEntry]])
+            _ = try adapter.uninstall()
+            /** The file held only devctl's entry, so it is devctl's litter. */
+            #expect(!FileManager.default.fileExists(atPath: settings.path))
+        }
+    }
+
+    @Test func opencodeUninstallWithoutAnEntryRemovesOnlyAStaleManagedFile() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "opencode.jsonc")
+            try Data(#"{"model":"claude-sonnet-4-5"}"#.utf8).write(to: settings)
+            let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+            try HarnessStandingInstruction.write(to: adapter.instructionsFileURL)
+
+            let summary = try adapter.uninstall()
+            #expect(summary.contains("not present"))
+            #expect(summary.contains("stale managed instructions file"))
+            #expect(!FileManager.default.fileExists(atPath: adapter.instructionsFileURL.path))
+            #expect(try adapter.loadSettings()["model"] as? String == "claude-sonnet-4-5")
+
+            let again = try adapter.uninstall()
+            #expect(again.contains("not present"))
+        }
+    }
+
+    @Test func opencodeHookStateFollowsTheArrayThatWinsTheMerge() throws {
+        try inScratchDir { dir in
+            let winner = dir.appending(path: "opencode.jsonc")
+            let loser = dir.appending(path: "opencode.json")
+            let adapter = OpenCodeAdapter(settingsURLOverride: winner)
+
+            /** The winner's array replaces the losing file's on merge: an
+                entry in opencode.json is invisible once opencode.jsonc holds a
+                key. */
+            try Data(#"{"instructions":["other.md"]}"#.utf8).write(to: winner)
+            try Data("{\"instructions\":[\"\(adapter.instructionsEntry)\"]}".utf8)
+                .write(to: loser)
+            #expect(adapter.hookState() == .notInstalled)
+
+            /** With no key in the winner, the losing file's array is the
+                effective one, so ours there reads as installed (broken, since
+                the managed file is absent). */
+            try FileManager.default.removeItem(at: winner)
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == adapter.instructionsFileURL.path)
+                #expect(!exists)
+            } else {
+                Issue.record("expected the opencode wiring to read as installed")
+            }
+
+            /** The winner carrying ours decides, with the managed file present. */
+            try Data(
+                "{\"instructions\":[\"\(adapter.instructionsEntry)\",\"other.md\"]}".utf8
+            ).write(to: winner)
+            try HarnessStandingInstruction.write(to: adapter.instructionsFileURL)
+            if case .installed(let path, let exists) = adapter.hookState() {
+                #expect(path == adapter.instructionsFileURL.path)
+                #expect(exists)
+            } else {
+                Issue.record("expected the opencode wiring to read as installed")
+            }
+
+            /** The managed file going missing reads as a broken install, the
+                same signal every other adapter reports. */
+            try HarnessStandingInstruction.remove(at: adapter.instructionsFileURL)
+            if case .installed(_, let exists) = adapter.hookState() {
+                #expect(!exists)
+            } else {
+                Issue.record("expected the opencode wiring to read as installed")
+            }
+        }
+    }
+
+    @Test func opencodeHookStateReportsNotInstalledWhenTheConfigDirectoryExists() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-oc-home-\(UUID().uuidString)/.config/opencode")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = dir.appending(path: "opencode.jsonc")
+        let adapter = OpenCodeAdapter(settingsURLOverride: settings)
+        #expect(adapter.harnessPresent)
+        #expect(adapter.hookState() == .notInstalled)
+    }
+
+    /** The entry references the managed file tilde-relative under the home so
+        it never collides with a same-named project file and survives a synced
+        config; anywhere else keeps the absolute form. */
+    @Test func opencodeInstructionsEntryIsTildeRelativeUnderHome() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let managed = OpenCodeWiring.managedFileURL(inHome: home)
+        #expect(
+            OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
+                == "~/.config/opencode/" + OpenCodeWiring.managedFileName)
+        let scratch = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-oc-entry-\(UUID().uuidString)/devctl.md")
+        #expect(OpenCodeWiring.instructionsEntry(forManagedFileAt: scratch) == scratch.path)
+    }
+
+    /** A set OPENCODE_CONFIG_DIR changes how OpenCode merges its globals, so
+        install refuses instead of silently wiring a surface the harness may
+        not honor. */
+    @Test func opencodeInstallRefusesWhenTheConfigDirectoryIsOverridden() {
+        #expect(OpenCodeAdapter.wiringRefusal(configDirectoryOverride: nil) == nil)
+        #expect(OpenCodeAdapter.wiringRefusal(configDirectoryOverride: "") == nil)
+        let refusal = OpenCodeAdapter.wiringRefusal(configDirectoryOverride: "/tmp/oc-config")
+        #expect(refusal?.code == .configInvalid)
+        #expect(refusal?.message.contains("OPENCODE_CONFIG_DIR") == true)
+        #expect(refusal?.message.contains("/tmp/oc-config/devctl.md") == true)
+    }
+
+    @Test func opencodeConfigDirectoryHonorsAnXDGOverride() {
+        let home = URL(fileURLWithPath: "/Users/test")
+        #expect(
+            OpenCodeWiring.configDirectory(home: home, xdgConfigHome: nil)
+                == home.appending(path: ".config/opencode"))
+        #expect(
+            OpenCodeWiring.configDirectory(home: home, xdgConfigHome: "")
+                == home.appending(path: ".config/opencode"))
+        #expect(
+            OpenCodeWiring.configDirectory(home: home, xdgConfigHome: "/xdg/config")
+                == URL(fileURLWithPath: "/xdg/config/opencode"))
+    }
+
+    /** The one merge rule both the adapter and the app share: the first
+        existing config file (winner first) holding the key decides, an
+        unparseable file is skipped (OpenCode reads the JSONC we cannot), and a
+        schema-invalid key leaves nothing effective. */
+    @Test func opencodeEffectiveInstructionsFollowsTheWinnerAndSkipsTheUnreadable() throws {
+        try inScratchDir { dir in
+            #expect(OpenCodeWiring.effectiveInstructions(inDirectory: dir) == nil)
+
+            try Data(#"{"instructions":["a"]}"#.utf8).write(
+                to: dir.appending(path: "opencode.json"))
+            let jsonOnly = OpenCodeWiring.effectiveInstructions(inDirectory: dir)
+            #expect(jsonOnly?.file == dir.appending(path: "opencode.json"))
+            #expect(jsonOnly?.entries == ["a"])
+
+            try Data(#"{"instructions":["b"]}"#.utf8).write(
+                to: dir.appending(path: "opencode.jsonc"))
+            #expect(OpenCodeWiring.effectiveInstructions(inDirectory: dir)?.entries == ["b"])
+
+            try Data(#"{"instructions":5}"#.utf8).write(
+                to: dir.appending(path: "opencode.jsonc"))
+            #expect(OpenCodeWiring.effectiveInstructions(inDirectory: dir) == nil)
+
+            try Data("{ // comment }".utf8).write(to: dir.appending(path: "opencode.jsonc"))
+            let skipped = OpenCodeWiring.effectiveInstructions(inDirectory: dir)
+            #expect(skipped?.entries == ["a"])
+        }
+    }
+
+    /** A refusal from one harness must not discard the others: their files are
+        already rewritten when the throw lands, so uninstallAll collects. */
+    @Test func uninstallAllCollectsFailuresInsteadOfAborting() throws {
+        try inScratchDir { dir in
+            let good = StubAdapter(settingsURL: dir.appending(path: "a.json"))
+            let bad = FailingAdapter(settingsURL: dir.appending(path: "b.json"))
+            let result = HookUninstall.uninstallAll([good, bad, good])
+            #expect(result.summaries.count == 2)
+            #expect(result.failures.count == 1)
+            #expect(result.failures.first?.name == "failing")
+            #expect(result.failures.first?.message == "nope")
+        }
+    }
+
+    /** OpenCode's own preference order decides which global config file wins:
+        jsonc over json over the legacy config.json, and opencode.jsonc is what
+        OpenCode seeds on a fresh machine. */
+    @Test func opencodeSettingsURLFollowsTheHarnessPreferenceOrder() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-oc-pref-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = root.appending(path: "home")
+        let dir = OpenCodeWiring.configDirectory(home: home)
+
+        #expect(
+            OpenCodeWiring.settingsURL(inHome: home) == dir.appending(path: "opencode.jsonc"))
+
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: dir.appending(path: "opencode.json"))
+        #expect(
+            OpenCodeWiring.settingsURL(inHome: home) == dir.appending(path: "opencode.json"))
+
+        try Data("{}".utf8).write(to: dir.appending(path: "opencode.jsonc"))
+        #expect(
+            OpenCodeWiring.settingsURL(inHome: home) == dir.appending(path: "opencode.jsonc"))
+
+        try FileManager.default.removeItem(at: dir.appending(path: "opencode.jsonc"))
+        try FileManager.default.removeItem(at: dir.appending(path: "opencode.json"))
+        try Data("{}".utf8).write(to: dir.appending(path: "config.json"))
+        #expect(
+            OpenCodeWiring.settingsURL(inHome: home) == dir.appending(path: "config.json"))
+    }
+
     @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
         let missing = FileManager.default.temporaryDirectory
             .appending(path: "devctl-absent-\(UUID().uuidString)/settings.json")
@@ -459,6 +807,10 @@ import Testing
             .appending(path: "devctl-grok-absent-\(UUID().uuidString)/hooks/devctl.json")
         let grokAdapter = GrokAdapter(settingsURLOverride: grokMissing)
         #expect(grokAdapter.hookState() == .harnessAbsent)
+        let opencodeMissing = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-oc-absent-\(UUID().uuidString)/.config/opencode/opencode.jsonc")
+        let ocAdapter = OpenCodeAdapter(settingsURLOverride: opencodeMissing)
+        #expect(ocAdapter.hookState() == .harnessAbsent)
     }
 
     @Test func hookStateReportsNotInstalledWhenAntigravityHomeDirectoryExists() throws {

@@ -209,6 +209,16 @@ public enum SetupPlanner {
                     displayName: "Grok Build",
                     harness: "grok"))
         }
+        let opencodeDir = OpenCodeWiring.configDirectory(home: home)
+        if FileManager.default.fileExists(atPath: opencodeDir.path) {
+            let installed = HookPresence.opencodeHookInstalled(home: home)
+            offers.append(
+                HarnessOffer(
+                    alreadyInstalled: installed,
+                    defaultChecked: !installed,
+                    displayName: "OpenCode",
+                    harness: "opencode"))
+        }
         return offers.sorted { $0.harness < $1.harness }
     }
 
@@ -439,5 +449,100 @@ enum HookPresence {
             }
         }
         return false
+    }
+
+    /** OpenCode's wiring is not a command in a hooks file: it is the managed
+        instructions file plus the `instructions` entry in the global config
+        that references it, so "installed" means both. Which array is effective
+        is OpenCodeWiring's merge rule, the same one the CLI adapter applies. */
+    static func opencodeHookInstalled(home: URL) -> Bool {
+        let managed = OpenCodeWiring.managedFileURL(inHome: home)
+        let entry = OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
+        guard FileManager.default.fileExists(atPath: managed.path),
+            let effective = OpenCodeWiring.effectiveInstructions(
+                inDirectory: OpenCodeWiring.configDirectory(home: home))
+        else { return false }
+        return effective.entries.contains(entry)
+    }
+}
+
+/** The on-disk contract OpenCode's own config loader defines, the one home for
+    the paths, the merge rule, and the entry form that the CLI adapter (devctl
+    target) and the presence check (here) must agree on. OpenCode merges every
+    global config file below, later files winning conflicting keys, and an
+    `instructions` array in a later file replaces an earlier file's whole
+    array. */
+public enum OpenCodeWiring {
+    public static let globalLoadOrder = ["config.json", "opencode.json", "opencode.jsonc"]
+
+    public static let managedFileName = "devctl.md"
+
+    /** OpenCode resolves its config root through the XDG convention, so a set
+        XDG_CONFIG_HOME moves the directory devctl must edit. */
+    public static func configDirectory(home: URL, xdgConfigHome: String?) -> URL {
+        guard let xdg = xdgConfigHome, !xdg.isEmpty else {
+            return home.appending(path: ".config/opencode")
+        }
+        return URL(fileURLWithPath: xdg).appending(path: "opencode")
+    }
+
+    public static func configDirectory(home: URL) -> URL {
+        configDirectory(
+            home: home, xdgConfigHome: ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"])
+    }
+
+    /** The `instructions` array OpenCode's merge actually applies: the first
+        existing config file in `directory` (winner first) that holds the key
+        decides, its array replacing every earlier file's. A file that exists
+        but cannot be parsed here is skipped, because OpenCode reads JSONC that
+        JSONSerialization cannot. A key that is present but not an array of
+        paths is schema-invalid for OpenCode, which fails the whole config
+        load, so nothing is effective. */
+    public static func effectiveInstructions(
+        inDirectory directory: URL
+    ) -> (file: URL, entries: [String])? {
+        for name in globalLoadOrder.reversed() {
+            let url = directory.appending(path: name)
+            guard let data = try? Data(contentsOf: url),
+                let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            guard settings["instructions"] != nil else { continue }
+            guard let entries = settings["instructions"] as? [String] else { return nil }
+            return (url, entries)
+        }
+        return nil
+    }
+
+    /** The `instructions` entry that references the managed file: tilde-relative
+        to the home directory when the file lives under it, so the entry
+        survives a synced config and never collides with a same-named file in a
+        project (OpenCode resolves a relative entry against the project
+        directory first); absolute otherwise, which OpenCode resolves in the
+        entry's own directory. OpenCode expands a leading `~/` against the
+        user's home at load time, so both forms reach the same file. */
+    public static func instructionsEntry(forManagedFileAt managedFileURL: URL) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = managedFileURL.path
+        if path.hasPrefix(home + "/") {
+            return "~" + String(path.dropFirst(home.count))
+        }
+        return path
+    }
+
+    public static func managedFileURL(inHome home: URL) -> URL {
+        configDirectory(home: home).appending(path: managedFileName)
+    }
+
+    /** The file OpenCode itself prefers to create and patch, so the file whose
+        `instructions` array wins the merge: the first existing name in reverse
+        load order, else opencode.jsonc, which is what OpenCode seeds on a
+        fresh machine. */
+    public static func settingsURL(inHome home: URL) -> URL {
+        let dir = configDirectory(home: home)
+        for name in globalLoadOrder.reversed() {
+            let url = dir.appending(path: name)
+            if FileManager.default.fileExists(atPath: url.path) { return url }
+        }
+        return dir.appending(path: "opencode.jsonc")
     }
 }

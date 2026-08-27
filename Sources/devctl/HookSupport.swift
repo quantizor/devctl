@@ -159,6 +159,7 @@ extension HarnessAdapter {
 
 let harnessAdapters: [any HarnessAdapter] = [
     AntigravityAdapter(), ClaudeCodeAdapter(), CursorAdapter(), GrokAdapter(),
+    OpenCodeAdapter(),
 ]
 
 /** Resolve the project directory a session-start hook should introspect. Antigravity
@@ -528,14 +529,14 @@ struct CursorAdapter: HarnessAdapter {
     }
 }
 
-/** Managed home-rule file Grok actually puts in model context. Grok discards
-    hook stdout on passive events, so SessionStart additionalContext never
-    reaches the model; markdown files in ~/.grok/rules do. The file is
-    static on purpose: a live server snapshot here would be global (every
-    Grok session on the machine) and last-writer-wins across projects.
-    Install writes it, uninstall deletes it, the session hook does not
-    rewrite it. */
-enum GrokRulesFile {
+/** The standing instruction shared by harnesses whose context surface is a home
+    file rather than hook stdout (Grok rules, OpenCode instructions): run
+    `devctl context` before touching a server, described for a reader who has
+    never heard of devctl. The text is static on purpose: a live server snapshot
+    here would be global (every session on the machine) and last-writer-wins
+    across projects. Install writes it, uninstall deletes it, session hooks
+    never rewrite it. */
+enum HarnessStandingInstruction {
     static let preamble =
         "This machine supervises local dev servers with devctl. At session start and after compaction, run `devctl context` (or `devctl status --json`) before starting, stopping, or curling a server. Prefer `devctl ensure <name>` / `devctl status` / `devctl logs <name>` over launching a server directly. If a `devservers.json` exists, do not start an unmanaged process. In a git worktree, the live URL comes from status or context (it may be a `worktree-*` host on another port)."
 
@@ -554,11 +555,11 @@ enum GrokRulesFile {
 
     Grok discards hook stdout on passive events (SessionStart included), so
     additionalContext never reaches the model. Home rules under ~/.grok/rules
-    do, and they apply to every project, so the rule is a standing instruction
-    to run `devctl context` rather than a live snapshot of one project. The
-    hook still emits the Claude-shaped JSON in case Grok starts honoring it.
-    No matcher: Grok's SessionStart source on a new session is `new`, which
-    would miss Claude's `startup|resume|clear|compact`. */
+    do, and they apply to every project, so the rule is the shared standing
+    instruction (HarnessStandingInstruction) rather than a live snapshot of one
+    project. The hook still emits the Claude-shaped JSON in case Grok starts
+    honoring it. No matcher: Grok's SessionStart source on a new session is
+    `new`, which would miss Claude's `startup|resume|clear|compact`. */
 struct GrokAdapter: HarnessAdapter {
     let name = "grok"
     /** Overridable so tests can point at a scratch file; nil means the real
@@ -605,7 +606,7 @@ struct GrokAdapter: HarnessAdapter {
             settings["hooks"] = hooks
             try writeSettings(settings)
         }
-        try GrokRulesFile.write(to: rulesURL)
+        try HarnessStandingInstruction.write(to: rulesURL)
         if let repaired {
             return repaired
         }
@@ -644,7 +645,7 @@ struct GrokAdapter: HarnessAdapter {
         guard removed else {
             return "Grok Build hook not present (\(settingsURL.path))"
         }
-        try GrokRulesFile.remove(at: rulesURL)
+        try HarnessStandingInstruction.remove(at: rulesURL)
         if hooks.isEmpty {
             settings.removeValue(forKey: "hooks")
         } else {
@@ -702,5 +703,189 @@ struct GrokAdapter: HarnessAdapter {
             if changed { hooks[event] = groups }
         }
         return changed ? "Grok Build hook path repaired in \(settingsURL.path)" : nil
+    }
+}
+
+/** OpenCode: a managed ~/.config/opencode/devctl.md standing instruction, wired
+    in through the `instructions` array of the harness's global config.
+
+    OpenCode has no session-start injection point: it defines no hook config,
+    and plugin events carry no stdout-to-context path (the context-pushing
+    plugin hooks, `session.compacting` and `chat.system.transform`, are
+    experimental). What OpenCode does load into every session is the config's
+    `instructions` array, snapshotted at session start, so the managed file
+    holds the shared standing instruction (HarnessStandingInstruction) rather
+    than a live snapshot of one project. The entry references the managed file
+    tilde-relative to the home directory, so it never collides with a
+    same-named file in a project (a relative entry resolves against the project
+    first) and survives a synced config.
+
+    OpenCode merges every global config file it finds and a later file's
+    `instructions` array replaces an earlier file's, so the entry is written to
+    the file that wins (opencode.jsonc when it exists, else opencode.json), and
+    entries already effective from a losing file move into the array the winner
+    carries: without that, landing the entry would switch which array is
+    effective and silently deactivate the user's own instruction files.
+    Uninstall needs no mirror step because the losing file is never touched.
+    Which array is effective is OpenCodeWiring's rule, shared with the app's
+    presence check.
+
+    ~/.config/opencode/AGENTS.md is deliberately never written: it would shadow
+    ~/.claude/CLAUDE.md, the Claude compatibility file OpenCode reads when no
+    global AGENTS.md exists. */
+struct OpenCodeAdapter: HarnessAdapter {
+    let name = "opencode"
+    /** Overridable so tests can point at a scratch file standing in for one of
+        the real global config names (OpenCodeWiring.globalLoadOrder); nil means
+        the real global config (OpenCodeWiring.settingsURL(inHome:)). */
+    var settingsURLOverride: URL?
+
+    var settingsURL: URL {
+        settingsURLOverride
+            ?? OpenCodeWiring.settingsURL(inHome: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    /** Sibling of the config file: `…/opencode.jsonc` → `…/devctl.md`. */
+    var instructionsFileURL: URL {
+        settingsURL.deletingLastPathComponent()
+            .appending(path: OpenCodeWiring.managedFileName)
+    }
+
+    /** The `instructions` entry that references the managed file, derived from
+        its location so override (tests) and the real install always agree. */
+    var instructionsEntry: String {
+        OpenCodeWiring.instructionsEntry(forManagedFileAt: instructionsFileURL)
+    }
+
+    /** The install refusal when OPENCODE_CONFIG_DIR moves the surface: that
+        override does not merely relocate the directory, OpenCode re-loads the
+        default global files alongside it with a concatenating merge, so the
+        replace-on-merge model devctl relies on does not hold there. Nil means
+        the default location is in play. */
+    static func wiringRefusal(configDirectoryOverride: String?) -> WireError? {
+        guard let overridden = configDirectoryOverride, !overridden.isEmpty else { return nil }
+        let managed = URL(fileURLWithPath: overridden)
+            .appending(path: OpenCodeWiring.managedFileName)
+        let entry = OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
+        return WireError(
+            code: .configInvalid,
+            hint: "devctl hook install",
+            message:
+                "OpenCode's config directory is overridden by OPENCODE_CONFIG_DIR "
+                + "(\(overridden)), which changes how OpenCode merges its global config, so "
+                + "devctl wires only the default location. Unset OPENCODE_CONFIG_DIR and "
+                + "rerun, or wire it by hand: put the standing instruction in \(managed.path) "
+                + "and add \"\(entry)\" to the instructions array of the config OpenCode loads"
+        )
+    }
+
+    func install(devctlPath: String) throws -> String {
+        if let refusal = Self.wiringRefusal(
+            configDirectoryOverride: ProcessInfo.processInfo.environment["OPENCODE_CONFIG_DIR"])
+        {
+            throw refusal
+        }
+        var settings = try loadEditableSettings()
+        let entries: [String]
+        if settings["instructions"] == nil {
+            entries = shadowedEntries()
+        } else if let carried = settings["instructions"] as? [String] {
+            entries = carried
+        } else {
+            throw WireError(
+                code: .configInvalid,
+                hint: "devctl hook install",
+                message:
+                    "devctl left \(settingsURL.path) alone: its instructions value is not an "
+                    + "array of paths. Fix or remove the instructions key, then rerun")
+        }
+        try HarnessStandingInstruction.write(to: instructionsFileURL)
+        if entries.contains(instructionsEntry) {
+            return "OpenCode instructions entry already installed (\(settingsURL.path))"
+        }
+        settings["instructions"] = entries + [instructionsEntry]
+        try writeSettings(settings)
+        return "OpenCode instructions entry installed in \(settingsURL.path)"
+    }
+
+    func uninstall() throws -> String {
+        var settings = try loadEditableSettings()
+        guard let carried = settings["instructions"] as? [String],
+            carried.contains(instructionsEntry)
+        else {
+            /** No entry to remove. A managed file left behind by a hand edit or
+                a partial install is inert but stale, so it still goes. */
+            if FileManager.default.fileExists(atPath: instructionsFileURL.path) {
+                try HarnessStandingInstruction.remove(at: instructionsFileURL)
+                return
+                    "OpenCode instructions entry not present; removed the stale managed instructions file (\(instructionsFileURL.path))"
+            }
+            return "OpenCode instructions entry not present (\(settingsURL.path))"
+        }
+        let remaining = carried.filter { $0 != instructionsEntry }
+        if remaining.isEmpty {
+            settings.removeValue(forKey: "instructions")
+        } else {
+            settings["instructions"] = remaining
+        }
+        try HarnessStandingInstruction.remove(at: instructionsFileURL)
+        if settings.isEmpty, FileManager.default.fileExists(atPath: settingsURL.path) {
+            /** A file that held only devctl's entry is devctl's litter; a file
+                holding anything else stays. */
+            try FileManager.default.removeItem(at: settingsURL)
+        } else {
+            try writeSettings(settings)
+        }
+        return "OpenCode instructions entry removed from \(settingsURL.path)"
+    }
+
+    func hookState() -> HarnessHookState {
+        guard harnessPresent else { return .harnessAbsent }
+        guard effectiveEntryPresent() else { return .notInstalled }
+        let managedExists = FileManager.default.fileExists(atPath: instructionsFileURL.path)
+        return .installed(path: instructionsFileURL.path, pathExists: managedExists)
+    }
+
+    private var configDirectory: URL {
+        settingsURL.deletingLastPathComponent()
+    }
+
+    private func effectiveEntryPresent() -> Bool {
+        guard
+            let effective = OpenCodeWiring.effectiveInstructions(inDirectory: configDirectory)
+        else { return false }
+        return effective.entries.contains(instructionsEntry)
+    }
+
+    /** Entries live today from a file other than the one devctl edits: the
+        winner's array replaces them on merge, so install moves them into the
+        array it writes. */
+    private func shadowedEntries() -> [String] {
+        guard
+            let effective = OpenCodeWiring.effectiveInstructions(inDirectory: configDirectory),
+            effective.file != settingsURL
+        else { return [] }
+        return effective.entries
+    }
+
+    /** loadSettings with a refusal that tells the OpenCode truth: comments and
+        trailing commas are legal JSONC for OpenCode and unreadable for
+        JSONSerialization, and devctl cannot preserve them on rewrite. */
+    private func loadEditableSettings() throws -> [String: Any] {
+        do {
+            return try loadSettings()
+        } catch is WireError {
+            throw WireError(
+                code: .configInvalid,
+                hint: "devctl hook install",
+                message:
+                    "devctl could not read \(settingsURL.path) as JSON, so it left the file "
+                    + "alone. For OpenCode this most often means JSONC comments or trailing "
+                    + "commas, which are legal for OpenCode but which devctl cannot preserve "
+                    + "when it rewrites the file; a file missing read permission reads the "
+                    + "same. Move the settings to pure JSON (and check the file is readable), "
+                    + "or edit the instructions key by hand (devctl's entry is \""
+                    + "\(instructionsEntry)\"), then rerun")
+        }
     }
 }
