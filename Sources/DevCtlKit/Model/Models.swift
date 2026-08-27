@@ -178,7 +178,7 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         serving several surfaces on one port): display name -> URL. */
     public var heads: [String: String]?
     public var healthcheck: HealthCheckSpec?
-    /** Resolved server host (committed, worktree-derived, or overlay). Kept on
+    /** Resolved server host (committed or overlay). Kept on
         the spec so port materialization can rebuild urls without re-reading
         the project file. Optional so older ad-hoc registry entries keep parsing. */
     public var host: String?
@@ -348,6 +348,11 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var terminalEvidence: [String]?
     public var uptimeSec: Int?
     public var url: String?
+    /** Sanitized checkout-directory name when the server runs from a linked
+        git worktree; nil for a main checkout. Display only: the host stays
+        the project's declared one, so auth configs pinned to one origin keep
+        working in a worktree. */
+    public var worktree: String?
 
     public init(
         declaredPort: Int? = nil,
@@ -372,7 +377,8 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         specStale: Bool? = nil,
         terminalEvidence: [String]? = nil,
         uptimeSec: Int? = nil,
-        url: String? = nil
+        url: String? = nil,
+        worktree: String? = nil
     ) {
         self.declaredPort = declaredPort
         self.effectivePort = effectivePort
@@ -397,6 +403,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.terminalEvidence = terminalEvidence
         self.uptimeSec = uptimeSec
         self.url = url
+        self.worktree = worktree
     }
 }
 

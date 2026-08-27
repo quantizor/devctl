@@ -1,8 +1,8 @@
 import Foundation
 
-/** Git checkout identity helpers for sibling port rebind and ephemeral worktree
-    hosts. Shells out to `git`; failures return nil so non-git projects keep the
-    pre-coexistence path. */
+/** Git checkout identity helpers for sibling port rebind and the worktree
+    display label. Shells out to `git`; failures return nil so non-git
+    projects keep the pre-coexistence path. */
 public enum CheckoutIdentity {
     /** Absolute path to the shared git directory, or nil if not a git checkout. */
     public static func gitCommonDir(project: String) -> String? {
@@ -27,35 +27,17 @@ public enum CheckoutIdentity {
         return common != gitDir
     }
 
-    /** Preferred subdomain for the project family: committed host without
-        `.localhost`, else the main worktree path's slug, else this path's slug. */
-    public static func preferredSubdomain(project: String, committedHost: String?) -> String {
-        if let committedHost {
-            let trimmed = committedHost.hasSuffix(".localhost")
-                ? String(committedHost.dropLast(".localhost".count))
-                : committedHost
-            let leaf = trimmed.split(separator: ".").last.map(String.init) ?? trimmed
-            if !leaf.isEmpty { return sanitizeLabel(leaf) }
-        }
-        if let main = mainWorktreePath(project: project) {
-            return ProjectConfigLoader.defaultSlug(project: main)
-        }
-        return ProjectConfigLoader.defaultSlug(project: project)
-    }
-
-    /** Ephemeral host for a linked worktree: `worktree-<label>.<preferred>.localhost`.
-        Main checkouts return nil so the caller keeps the stable preferred host. */
-    public static func worktreeHost(
-        project: String, preferred: String, takenHosts: Set<String> = []
-    ) -> String? {
+    /** Display label for a linked worktree: the sanitized checkout directory
+        name, shown in status and session context so a reader can tell which
+        checkout a server belongs to. The label never touches the host: every
+        `*.localhost` name resolves to loopback, so the host disambiguated
+        nothing, and a third-level subdomain breaks apps whose auth config
+        (callback allow lists, cookie domains, trusted origins) pins one
+        origin. Sibling checkouts are told apart by the rebound port instead.
+        Main checkouts and non-git trees return nil. */
+    public static func worktreeLabel(project: String) -> String? {
         guard isLinkedWorktree(project: project) else { return nil }
-        let label = sanitizeLabel((project as NSString).lastPathComponent)
-        var host = "worktree-\(label).\(preferred).localhost"
-        if takenHosts.contains(host) {
-            let hash = DevCtlPaths.hash8(project).prefix(4)
-            host = "worktree-\(label)-\(hash).\(preferred).localhost"
-        }
-        return host
+        return sanitizeLabel((project as NSString).lastPathComponent)
     }
 
     /** Stable free-port candidate near the declared port for sibling rebind. */
@@ -63,19 +45,6 @@ public enum CheckoutIdentity {
         let offset = (Int(DevCtlPaths.hash8(project).prefix(4), radix: 16) ?? 1) % 1000
         let base = declared + offset + 1
         return min(max(base, 1024), 65_000)
-    }
-
-    /** Absolute path of the primary worktree, when discoverable. */
-    public static func mainWorktreePath(project: String) -> String? {
-        guard let listing = git(project: project, args: ["worktree", "list", "--porcelain"])
-        else { return nil }
-        for line in listing.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("worktree ") {
-                let path = String(line.dropFirst("worktree ".count))
-                return canonicalProjectPath(path)
-            }
-        }
-        return nil
     }
 
     public static func sanitizeLabel(_ raw: String) -> String {

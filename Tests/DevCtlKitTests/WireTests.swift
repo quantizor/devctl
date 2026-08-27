@@ -100,6 +100,27 @@ import Testing
         )
     }
 
+    /** The worktree display label is a contract field like any other: its key
+        name and sort position are pinned here, and its absence (a main
+        checkout) is the golden above, which omits it. */
+    @Test func statusSchemaGoldenWithAWorktreeLabel() throws {
+        let status = ServerStatus(
+            declaredPort: 3000,
+            healthcheck: .none,
+            logPath: "/logs/web/current.log",
+            phase: .running,
+            project: "/tmp/proj",
+            server: "web",
+            url: "http://proj.localhost:3000/",
+            worktree: "review"
+        )
+        let json = String(data: try JSONCoding.encoder().encode(status), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"declaredPort":3000,"healthcheck":"none","logPath":"/logs/web/current.log","phase":"running","project":"/tmp/proj","server":"web","url":"http://proj.localhost:3000/","worktree":"review"}"#
+        )
+    }
+
     /** `daemon.info` is what every other command's hint points at, so its shape
         is a contract like any other and had no golden until it grew a field. A
         serving daemon encodes exactly what it always did: `restoring` is omitted
@@ -141,24 +162,36 @@ import Testing
         )
     }
 
-    @Test func checkResultSchemaGoldenWithAWorktreeHost() throws {
+    @Test func checkResultSchemaGoldenWithAnOverlayHostAndAWorktreeLabel() throws {
         let result = CheckResult(
-            effectiveHost: "worktree-review.app.localhost",
-            effectiveHostReason: .linkedWorktree,
+            effectiveHost: "pinned.localhost",
+            effectiveHostReason: .localOverlay,
             errors: [],
             host: "app.localhost",
             serverHosts: [
                 EffectiveHost(
-                    declared: "api.app.localhost", effective: "api.app.localhost",
-                    reason: .serverOverride, server: "api")
+                    declared: "app.localhost", effective: "pinned.localhost",
+                    reason: .localOverlay, server: "api")
             ],
             servers: ["api", "web"],
-            warnings: [])
+            warnings: [],
+            worktree: "review")
         let json = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)!
         #expect(
             json
-                == #"{"effectiveHost":"worktree-review.app.localhost","effectiveHostReason":"linked-worktree","errors":[],"host":"app.localhost","serverHosts":[{"declared":"api.app.localhost","effective":"api.app.localhost","reason":"server-override","server":"api"}],"servers":["api","web"],"warnings":[]}"#
+                == #"{"effectiveHost":"pinned.localhost","effectiveHostReason":"local-overlay","errors":[],"host":"app.localhost","serverHosts":[{"declared":"app.localhost","effective":"pinned.localhost","reason":"local-overlay","server":"api"}],"servers":["api","web"],"warnings":[],"worktree":"review"}"#
         )
+    }
+
+    /** Append-only is a wire promise: a reason the current daemon never
+        produces (the worktree label host was removed) must still decode, so an
+        older daemon on the socket does not break a newer CLI. */
+    @Test func legacyWorktreeReasonStillDecodes() throws {
+        let json =
+            #"{"effectiveHost":"worktree-review.app.localhost","effectiveHostReason":"linked-worktree","errors":[],"host":"app.localhost","servers":["web"],"warnings":[]}"#
+        let result = try JSONCoding.decoder().decode(CheckResult.self, from: Data(json.utf8))
+        #expect(result.effectiveHost == "worktree-review.app.localhost")
+        #expect(result.effectiveHostReason == .linkedWorktree)
     }
 }
 

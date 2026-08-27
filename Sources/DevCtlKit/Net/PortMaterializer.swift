@@ -6,9 +6,9 @@ import Foundation
 public enum PortMaterializer {
     /** Apply `effectivePort` (and optional `effectiveHost`) to a committed/ad-hoc
         spec. `declaredPort` on status remains the pre-materialization `spec.port`.
-        `matchHost` is the host already printed in committed urls/heads/healthcheck;
-        when omitted, `spec.host` is used. Pass the pre-worktree host when the
-        spawn path has already swapped `spec.host` to an ephemeral label. */
+        `matchHost` gates URL host replacement to URLs already printed with that
+        host; when omitted, `spec.host` gates it. A head like
+        `admin.app.localhost` keeps its subdomain when only the port moves. */
     public static func materialize(
         spec: ServerSpec, effectivePort: Int?, effectiveHost: String? = nil,
         matchHost: String? = nil
@@ -91,7 +91,7 @@ public enum PortMaterializer {
     }
 
     /** Resolve a root-relative value (`/admin`) against the server's own base URL,
-        which is the only reading that survives a rebind or a worktree host swap.
+        which is the only reading that survives a rebind moving the port.
         Nil when the value is not root-relative or there is no base to resolve
         against, so the caller falls through to token substitution. */
     public static func resolveRelative(_ raw: String, base: String?) -> String? {

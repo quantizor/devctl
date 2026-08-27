@@ -546,7 +546,7 @@ enum GrokSessionHook {
     never rewrite it. */
 enum HarnessStandingInstruction {
     static let preamble =
-        "This machine supervises local dev servers with devctl. At session start and after compaction, run `devctl context` (or `devctl status --json`) before starting, stopping, or curling a server. Prefer `devctl ensure <name>` / `devctl status` / `devctl logs <name>` over launching a server directly. If a `devservers.json` exists, do not start an unmanaged process. In a git worktree, the live URL comes from status or context (it may be a `worktree-*` host on another port)."
+        "This machine supervises local dev servers with devctl. At session start and after compaction, run `devctl context` (or `devctl status --json`) before starting, stopping, or curling a server. Prefer `devctl ensure <name>` / `devctl status` / `devctl logs <name>` over launching a server directly. If a `devservers.json` exists, do not start an unmanaged process. In a git worktree, the live URL comes from status or context (same host as the main checkout; the port may be rebound)."
 
     static func write(to url: URL) throws {
         try AtomicFile.write(Data((preamble + "\n").utf8), to: url)

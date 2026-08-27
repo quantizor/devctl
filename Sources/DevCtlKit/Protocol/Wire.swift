@@ -478,11 +478,12 @@ public struct WriteConfigParams: Codable, Equatable, Sendable {
 }
 
 public struct CheckResult: Codable, Equatable, Sendable {
-    /** The host a spawn from this directory would actually use, when it differs
-        from `host`. A linked worktree gets an ephemeral label, so any config the
-        app itself pins to an origin (an auth callback, a CORS allow list, an API
-        key referrer) is wrong before anything starts; nothing said so until
-        `ensure`. Omitted when it matches. */
+    /** The host a start from this directory would actually use, when it differs
+        from `host`. Produced for a `devctl.local.json` overlay; a linked
+        worktree is deliberately absent, because the declared host is used
+        unchanged there so any origin the app itself pins (an auth callback, a
+        CORS allow list, an API key referrer) keeps working. Omitted when it
+        matches. */
     public var effectiveHost: String?
     public var effectiveHostReason: EffectiveHostReason?
     public var errors: [String]
@@ -492,11 +493,16 @@ public struct CheckResult: Codable, Equatable, Sendable {
     public var serverHosts: [EffectiveHost]?
     public var servers: [String]
     public var warnings: [String]
+    /** Sanitized checkout-directory name when this directory is a linked git
+        worktree; nil for a main checkout. Display only: the declared host is
+        used unchanged, and the worktree name surfaces here and in
+        status.worktree instead. */
+    public var worktree: String?
 
     public init(
         effectiveHost: String? = nil, effectiveHostReason: EffectiveHostReason? = nil,
         errors: [String] = [], host: String? = nil, serverHosts: [EffectiveHost]? = nil,
-        servers: [String] = [], warnings: [String] = []
+        servers: [String] = [], warnings: [String] = [], worktree: String? = nil
     ) {
         self.effectiveHost = effectiveHost
         self.effectiveHostReason = effectiveHostReason
@@ -505,6 +511,7 @@ public struct CheckResult: Codable, Equatable, Sendable {
         self.serverHosts = serverHosts
         self.servers = servers
         self.warnings = warnings
+        self.worktree = worktree
     }
 }
 

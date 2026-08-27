@@ -201,14 +201,12 @@ public actor Router {
                     return try respond(
                         id: head.id,
                         result: CheckResult(
-                            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
-                            effectiveHostReason: hosts.project.differs
-                                ? hosts.project.reason : nil,
                             errors: view.errors,
                             host: view.host,
-                            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
+                            serverHosts: hosts.isEmpty ? nil : hosts,
                             servers: view.specs.map(\.name),
-                            warnings: view.warnings))
+                            warnings: view.warnings,
+                            worktree: CheckoutIdentity.worktreeLabel(project: project)))
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
@@ -808,13 +806,12 @@ public actor Router {
         let content = String(decoding: data, as: UTF8.self) + "\n"
         let hosts = await effectiveHosts(project: project, view: view)
         let check = CheckResult(
-            effectiveHost: hosts.project.differs ? hosts.project.effective : nil,
-            effectiveHostReason: hosts.project.differs ? hosts.project.reason : nil,
             errors: view.errors,
             host: view.host,
-            serverHosts: hosts.servers.isEmpty ? nil : hosts.servers,
+            serverHosts: hosts.isEmpty ? nil : hosts,
             servers: view.specs.map(\.name),
-            warnings: view.warnings)
+            warnings: view.warnings,
+            worktree: CheckoutIdentity.worktreeLabel(project: project))
         guard params.dryRun != true else {
             return InitConfigResult(
                 check: check, content: content,
@@ -828,31 +825,25 @@ public actor Router {
             notRecovered: notRecovered.isEmpty ? nil : notRecovered, path: url.path, written: true)
     }
 
-    /** The hosts a spawn from this directory would use, answered before anything
-        starts. Same resolver the spawn path runs, so `config check` can report a
-        worktree's ephemeral origin rather than leaving it to be discovered as a
-        broken app. Only servers that differ from the project are returned. */
-    private func effectiveHosts(project: String, view: ProjectConfigView) async -> (
-        project: EffectiveHost, servers: [EffectiveHost]
-    ) {
+    /** The servers whose effective host differs from the project's, answered
+        before anything starts. Same resolver the spawn path runs, so `config
+        check` can answer before a start. A linked worktree changes nothing
+        about the host (its name surfaces as the `worktree` display value);
+        only a `devctl.local.json` overlay or a per-server override differs. */
+    private func effectiveHosts(project: String, view: ProjectConfigView) async -> [EffectiveHost] {
         let defaultSlugHost = "\(ProjectConfigLoader.defaultSlug(project: project)).localhost"
-        let preferred = CheckoutIdentity.preferredSubdomain(
-            project: project, committedHost: view.host)
-        let projectHost = EffectiveHostResolver.project(
-            declaredHost: view.host,
-            worktreeHost: CheckoutIdentity.worktreeHost(
-                project: project, preferred: preferred, takenHosts: await takenHosts()))
+        let declaredHost = view.host
         let overlay = LocalOverlay.load(project: project)
-        let servers = view.specs.compactMap { spec -> EffectiveHost? in
+        return view.specs.compactMap { spec -> EffectiveHost? in
             let resolved = EffectiveHostResolver.server(
-                defaultSlugHost: defaultSlugHost, overlayHost: overlay?.servers?[spec.name]?.host,
-                project: projectHost, server: spec.name, specHost: spec.host)
-            return resolved.effective == projectHost.effective ? nil : resolved
+                defaultSlugHost: defaultSlugHost, declaredHost: declaredHost,
+                overlayHost: overlay?.servers?[spec.name]?.host,
+                server: spec.name, specHost: spec.host)
+            return resolved.effective == declaredHost ? nil : resolved
         }
-        return (projectHost, servers)
     }
 
-    /** Resolve effective port, apply overlay/worktree host/materialization, and
+    /** Resolve effective port, apply overlay/materialization, and
         either auto-rebind a sibling conflict or refuse with port-held. Every
         start-shaped path funnels through here, which is also why the trust gate
         lives here rather than at each call site.
@@ -915,36 +906,9 @@ public actor Router {
         let overlay = LocalOverlay.load(project: target.project)
         let overlayServer = overlay?.servers?[target.name]
         spec = LocalOverlay.apply(spec: spec, overlay: overlayServer, project: target.project)
-        let committedHost = merged.host
-        let preferred = CheckoutIdentity.preferredSubdomain(
-            project: target.project, committedHost: committedHost)
-        let taken = await takenHosts()
-        let defaultSlugHost =
-            "\(ProjectConfigLoader.defaultSlug(project: target.project)).localhost"
-        /** Host printed in committed urls/heads before any worktree swap; materialize
-            matches against this so preferred-host URLs rewrite to the ephemeral
-            label even after `spec.host` already moved. */
-        let matchHost = spec.host ?? committedHost ?? defaultSlugHost
-        let projectHost = EffectiveHostResolver.project(
-            declaredHost: committedHost ?? defaultSlugHost,
-            worktreeHost: CheckoutIdentity.worktreeHost(
-                project: target.project, preferred: preferred, takenHosts: taken))
-        let serverHost = EffectiveHostResolver.server(
-            defaultSlugHost: defaultSlugHost, overlayHost: overlayServer?.host,
-            project: projectHost, server: target.name, specHost: spec.host)
-        /** Only a worktree swap rewrites the spec here: an overlay host is
-            already applied above, and a per-server override keeps its own host.
-            `config check` reads the same resolver, so the two cannot drift. */
-        if serverHost.reason == .linkedWorktree {
-            let worktreeHost = serverHost.effective
-            spec.host = worktreeHost
-            if let port = spec.port {
-                let urlHost = URL(string: spec.url ?? "")?.host
-                if spec.url == nil || urlHost == committedHost || urlHost == defaultSlugHost {
-                    spec.url = "http://\(worktreeHost):\(port)/"
-                }
-            }
-        }
+        /** The declared host stays the spawn host: a linked worktree keeps it
+            (its name surfaces as a display label, never a subdomain), so URLs
+            already carry the right host and only the port can differ. */
         let declaredPort = spec.port
         let id = serverID(project: target.project, name: target.name)
         let persistedBound = await registry.persistedState(serverID: id)?.boundPort
@@ -1011,8 +975,7 @@ public actor Router {
                 code: .portHeld,
                 message: "port \(busy.port) is still busy after rebind resolution")
         }
-        let materialized = PortMaterializer.materialize(
-            spec: spec, effectivePort: effective, effectiveHost: spec.host, matchHost: matchHost)
+        let materialized = PortMaterializer.materialize(spec: spec, effectivePort: effective)
         await supervisor.updateSpec(materialized)
         await supervisor.setPortMeta(
             claim: claim, declaredPort: declaredPort, effectivePort: effective,
@@ -1100,22 +1063,6 @@ public actor Router {
             if ContinuousClock.now >= deadline { return busy }
             try? await Task.sleep(for: .milliseconds(50))
         }
-    }
-
-    private func takenHosts() async -> Set<String> {
-        var hosts: Set<String> = []
-        for project in await registry.allProjects() {
-            if let view = try? loadConfig(project: project) {
-                hosts.insert(view.host)
-                for spec in view.specs {
-                    if let host = spec.host { hosts.insert(host) }
-                    if let url = spec.url, let host = URL(string: url)?.host {
-                        hosts.insert(host)
-                    }
-                }
-            }
-        }
-        return hosts
     }
 
     /** Which managed server holds `port`, if any. The resident supervisor pool
@@ -1650,9 +1597,9 @@ public actor Router {
             Hold the prepared supervisors rather than re-resolving them per wave.
             `supervisor(project:spec:)` re-applies the committed spec to anything
             not yet up, which would discard exactly what prepareSpawn just wrote:
-            the rebound port, the worktree host, the substituted argv, and the
-            injected env. A second lookup here spawned the child on the committed
-            port while status reported the rebind. */
+            the rebound port, the substituted argv, and the injected env. A second
+            lookup here spawned the child on the committed port while status
+            reported the rebind. */
         var prepared: [String: ServerSupervisor] = [:]
         for spec in wanted {
             let target = ServerTargetParams(
@@ -1738,10 +1685,11 @@ public actor Router {
         let project = canonicalProjectPath(project)
         let id = serverID(project: project, name: spec.name)
         if let existing = supervisors[id] {
-            /** A live run holds a materialized spawn spec (effective port, worktree
-                host, rewritten url). Re-resolving committed config for status must
-                not clobber that, or agents see the declared origin and a false
-                "config changed since start". */
+            /** A live run holds a materialized spawn spec (effective port, bound
+                secondary ports, rewritten url). Re-resolving committed config for
+                status must not clobber that, or agents see the committed port in
+                status while the child listens on the rebind, and a stale flag
+                fires for a config that matches what was actually spawned. */
             switch await existing.status().phase {
             case .running, .starting, .unhealthy, .stopping:
                 break

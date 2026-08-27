@@ -4,7 +4,7 @@ import Testing
 
 @Suite struct DiscoveryStanzaTests {
     private let tipSuffix =
-        " In a git worktree, ensure still manages the server: the live URL comes from `status` / session context (may be `worktree-*.<preferred>.localhost` on another port). If context warns about a port conflict, follow that URL or hint; do not edit `devservers.json` just to change ports; do not start an unmanaged `pnpm dev --port`."
+        " In a git worktree, ensure still manages the server: the host stays the project's usual one and the port may be rebound; the live URL comes from `status` / session context. If context warns about a port conflict, follow that URL or hint; do not edit `devservers.json` just to change ports; do not start an unmanaged `pnpm dev --port`."
 
     @Test func emptyUsesPlaceholder() {
         #expect(

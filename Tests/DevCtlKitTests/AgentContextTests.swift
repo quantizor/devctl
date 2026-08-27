@@ -19,7 +19,8 @@ import Testing
         server: String,
         spawnError: SpawnError? = nil,
         specStale: Bool? = nil,
-        url: String? = nil
+        url: String? = nil,
+        worktree: String? = nil
     ) -> ServerStatus {
         ServerStatus(
             declaredPort: port,
@@ -35,7 +36,8 @@ import Testing
             server: server,
             spawnError: spawnError,
             specStale: specStale,
-            url: url)
+            url: url,
+            worktree: worktree)
     }
 
     @Test func nilWhenUntrusted() {
@@ -48,6 +50,30 @@ import Testing
         #expect(AgentContext.render(list: ServerListResult(servers: [], trusted: true)) == nil)
         /** Absent trust (a machine-wide read) is also silence. */
         #expect(AgentContext.render(list: ServerListResult(servers: [])) == nil)
+    }
+
+    /** The worktree label comes from the status field, not a git call, so the
+        block stays pure over the fetched list. A main checkout (nil label)
+        adds no line, which the healthyProjectHasNoRunLines golden pins. */
+    @Test func worktreeCheckoutIsNamedWithItsLabel() throws {
+        let list = ServerListResult(
+            servers: [
+                status(
+                    phase: .running, port: 3000, server: "web",
+                    url: "http://proj.localhost:3000/", worktree: "review")
+            ],
+            trusted: true)
+        let text = try #require(AgentContext.render(list: list))
+        #expect(
+            text == """
+                <devctl-servers>
+                This project's dev servers are managed by devctl (daemon-supervised; they and their logs survive session compaction and restarts). Prefer devctl over launching servers directly.
+                This checkout is the git worktree "review"; the URLs below are this checkout's live servers, on the project's usual host (a sibling checkout may hold the declared port, so trust the port shown).
+                - web: running · http://proj.localhost:3000/ · port 3000 · log /logs/web/current.log
+                Useful: devctl ensure <name> (idempotent start) · devctl restart <name> (stop and re-ensure in one step; use it after editing a config the server reads at boot) · devctl wait <name> --healthy · devctl why <name> (root cause) · devctl logs <name> --since-mark <id> --json · devctl mark <name> "text" · devctl events --since 10m · devctl lock <resource> -- … (exclusive access to a resource a server holds; prefer it over stopping the server). All support --json.
+                While you work, monitor devctl itself: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/devctl/BACKLOG.md, or tell the user) rather than silently working around it. Report devctl's behavior and how to reproduce it generically, never this project's name, paths, hosts, ports, or log lines: that file lives outside this project.
+                </devctl-servers>
+                """)
     }
 
     @Test func healthyProjectHasNoRunLines() {

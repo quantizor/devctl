@@ -192,6 +192,7 @@ enum CLIRunner {
         var parts = ["\(status.server): \(status.phase.rawValue)"]
         if let pid = status.pid { parts.append("pid \(pid)") }
         if let port = status.declaredPort { parts.append("port \(port)") }
+        if let worktree = status.worktree { parts.append("worktree \(worktree)") }
         if let exit = status.lastExit {
             let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
             parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
@@ -1342,10 +1343,11 @@ struct ConfigCheck: AsyncParsableCommand {
         }
         CLIRunner.emit(result, json: global.json) { r in
             var lines: [String] = []
+            if let worktree = r.worktree {
+                lines.append(
+                    "worktree: \(worktree) (linked git worktree; the declared host is used unchanged, so origin-pinned app config keeps working)")
+            }
             if let host = r.host { lines.append("host: \(host)") }
-            /** Printed as its own line rather than a warning: an ephemeral
-                worktree host is correct behavior, and warning would take every
-                worktree checkout out of "config ok". */
             if let effective = r.effectiveHost, let declared = r.host {
                 lines.append(
                     "effective host: \(effective) (\(Self.explain(r.effectiveHostReason)); the file declares \(declared))")
@@ -1366,16 +1368,19 @@ struct ConfigCheck: AsyncParsableCommand {
     }
 
     /** Exhaustive so a new reason has to be given a sentence a reader can act
-        on, rather than printing a raw enum token. */
+        on, rather than printing a raw enum token. `linkedWorktree` and
+        `serverOverride` are no longer produced by the current daemon; the
+        sentences cover an older daemon on the socket so the pairing still
+        reads sensibly. */
     static func explain(_ reason: EffectiveHostReason?) -> String {
         guard let reason else { return "differs from the declared host" }
         switch reason {
         case .linkedWorktree:
-            return "this checkout is a linked git worktree, so a start prepends the worktree label"
+            return "the daemon is older than this CLI and still prepends a worktree label"
         case .localOverlay:
             return "devctl.local.json overrides the host for this checkout"
         case .serverOverride:
-            return "this server declares its own host, so the worktree label does not apply"
+            return "this server declares its own host"
         }
     }
 }

@@ -340,8 +340,10 @@ pass "stop hints toward lock in human mode and keeps --json stdout clean"
 # Deep-link and lock --no-pause coverage stay below; worktree coexistence first.
 
 # Sibling worktree coexistence: shared git common-dir auto-rebinds the linked
-# checkout onto a free port and a worktree-* host while main keeps the declared
-# origin. Fixture listens on {port} so materialization is load-bearing.
+# checkout onto a free port while main keeps the declared origin, and the host
+# stays the declared one everywhere (origin-pinned app config keeps working;
+# the worktree name surfaces as a display value). Fixture listens on {port} so
+# materialization is load-bearing.
 WT_ROOT="$WORK/wt-coexist"
 mkdir -p "$WT_ROOT/main"
 cd "$WT_ROOT/main"
@@ -383,11 +385,12 @@ WT_ENSURE="$("$DEVCTL" ensure web --timeout 15 --json 2>/tmp/devctl-smoke-wt-ens
 WT_ENSURE_EXIT=$?
 set -e
 [[ "$WT_ENSURE_EXIT" -eq 0 ]] || fail "linked worktree ensure exit $WT_ENSURE_EXIT: $WT_ENSURE $(cat /tmp/devctl-smoke-wt-ensure.err 2>/dev/null)"
-echo "$WT_ENSURE" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['server']; assert d['phase']=='running', d; assert d.get('effectivePort')!=$WT_PORT, d; assert d.get('portConflict',{}).get('state')=='rebound', d; assert 'worktree-review.smoke.localhost' in (d.get('url') or ''), d" || fail "linked worktree ensure: $WT_ENSURE"
-pass "linked worktree auto-rebinds with worktree-* host"
+echo "$WT_ENSURE" | /usr/bin/python3 -c "import json,sys; d=json.load(sys.stdin)['server']; assert d['phase']=='running', d; assert d.get('effectivePort')!=$WT_PORT, d; assert d.get('portConflict',{}).get('state')=='rebound', d; assert d.get('worktree')=='review', d; assert d.get('url')=='http://smoke.localhost:'+str(d.get('effectivePort'))+'/', d" || fail "linked worktree ensure: $WT_ENSURE"
+pass "linked worktree auto-rebinds and keeps the declared host"
 CTX="$("$DEVCTL" context)"
-echo "$CTX" | grep -q "worktree-review.smoke.localhost" || fail "context omitted worktree URL: $CTX"
-pass "worktree context advertises ephemeral URL"
+echo "$CTX" | grep -q 'worktree "review"' || fail "context omitted the worktree label: $CTX"
+echo "$CTX" | grep -q "smoke.localhost" || fail "context omitted the live URL: $CTX"
+pass "worktree context advertises the label and the live URL"
 "$DEVCTL" stop web --json > /dev/null
 cd "$WT_ROOT/main"
 "$DEVCTL" stop web --json > /dev/null

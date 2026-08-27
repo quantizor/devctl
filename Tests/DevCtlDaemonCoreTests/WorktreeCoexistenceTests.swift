@@ -5,7 +5,10 @@ import Testing
 @testable import DevCtlDaemonCore
 
 /** Sibling git worktrees of one repo share committed ports; ensure on the
-    linked tree must auto-rebind and advertise a worktree-* host. */
+    linked tree must auto-rebind to a free port while keeping the declared
+    host: every `*.localhost` name resolves to loopback, so the host never
+    disambiguated a bind, and a third-level subdomain breaks apps whose auth
+    config pins one origin. The worktree name surfaces as a display value. */
 @Suite(.serialized) struct WorktreeCoexistenceTests {
     private struct Env {
         let fixture: String
@@ -66,7 +69,7 @@ import Testing
         throw response.error ?? WireError(code: .internalError, message: "no result")
     }
 
-    @Test func siblingWorktreeEnsureRebindsAndGetsEphemeralHost() async throws {
+    @Test func siblingWorktreeEnsureRebindsAndKeepsTheDeclaredHost() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
@@ -80,6 +83,7 @@ import Testing
         #expect(mainResult.server.effectivePort == 45111)
         #expect(mainResult.server.url == "http://app.localhost:45111/")
         #expect(mainResult.server.portConflict == nil)
+        #expect(mainResult.server.worktree == nil)
 
         let wtResult = try await handle(
             router, .serverEnsure,
@@ -87,9 +91,10 @@ import Testing
         #expect(wtResult.server.phase == .running)
         #expect(wtResult.server.effectivePort != 45111)
         #expect(wtResult.server.portConflict?.state == .rebound)
+        #expect(wtResult.server.worktree == "review")
         let url = try #require(wtResult.server.url)
-        #expect(url.contains("worktree-review.app.localhost"))
-        #expect(url.contains(":\(wtResult.server.effectivePort ?? -1)"))
+        /** The declared host is used unchanged; only the port moves. */
+        #expect(url == "http://app.localhost:\(wtResult.server.effectivePort ?? -1)/")
 
         _ = try await handle(
             router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
@@ -99,10 +104,28 @@ import Testing
             ServerResult.self)
     }
 
-    /** The worktree host was invisible until a server started, so any config the
-        app itself pins to an origin was already wrong with nothing saying so.
-        `config check` answers it from the same resolver the spawn path uses. */
-    @Test func configCheckReportsTheWorktreeEffectiveHost() async throws {
+    /** The label is computed at supervisor creation, not at spawn: a worktree
+        project whose servers have never started in this daemon's lifetime (a
+        stopped checkout after a daemon restart, a status-only query) still
+        reports which checkout it is, and the session-context banner is
+        therefore never silently missing. */
+    @Test func statusNamesTheWorktreeBeforeAnythingStarts() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let listed = try await handle(
+            router, .serverStatus, ProjectParams(project: env.worktree), ServerListResult.self)
+        let web = try #require(listed.servers.first { $0.server == "web" })
+        #expect(web.phase == .stopped)
+        #expect(web.worktree == "review")
+        #expect(web.url == "http://app.localhost:45111/")
+    }
+
+    /** The worktree checkout is answerable before anything starts, so a reader
+        can tell which checkout a config describes. The host question is now
+        boring on purpose: the declared host is the spawn host everywhere. */
+    @Test func configCheckNamesTheWorktreeAndKeepsTheDeclaredHost() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
@@ -113,32 +136,34 @@ import Testing
         #expect(mainCheck.host == "app.localhost")
         #expect(mainCheck.effectiveHost == nil)
         #expect(mainCheck.effectiveHostReason == nil)
+        #expect(mainCheck.worktree == nil)
 
         let wtCheck = try await handle(
             router, .projectCheck, ProjectOnlyParams(project: env.worktree), CheckResult.self)
         #expect(wtCheck.errors.isEmpty)
         #expect(wtCheck.host == "app.localhost")
-        #expect(wtCheck.effectiveHost == "worktree-review.app.localhost")
-        #expect(wtCheck.effectiveHostReason == .linkedWorktree)
+        #expect(wtCheck.effectiveHost == nil)
+        #expect(wtCheck.effectiveHostReason == nil)
+        #expect(wtCheck.worktree == "review")
 
-        /** The reported host must be the one a start actually uses, which is the
-            whole point of answering before the start. */
+        /** The reported host must be the one a start actually uses, which is
+            the whole point of answering before the start. */
         try await registry.setTrusted(project: env.worktree)
         let started = try await handle(
             router, .serverEnsure,
             EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         let url = try #require(started.server.url)
-        #expect(url.contains(try #require(wtCheck.effectiveHost)))
+        #expect(url.contains(try #require(wtCheck.host)))
         _ = try await handle(
             router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
             ServerResult.self)
     }
 
     /** `up` prepares the spawn and then runs its waves. Re-resolving the
-        supervisor inside a wave re-applied the committed spec to anything not yet
-        running, discarding the rebound port, the worktree host, and the
-        substituted argv, so the child bound the committed port while status
-        reported the rebind. Group and single-server starts must agree. */
+        supervisor inside a wave re-applied the committed spec to anything not
+        yet running, discarding the rebound port and the substituted argv, so
+        the child bound the committed port while status reported the rebind.
+        Group and single-server starts must agree. */
     @Test func siblingWorktreeGroupUpKeepsTheMaterializedSpawnSpec() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
@@ -160,10 +185,11 @@ import Testing
         let effective = try #require(web.effectivePort)
         #expect(effective != 45111)
         #expect(web.portConflict?.state == .rebound)
+        #expect(web.worktree == "review")
         /** The url is the tell: it is built from the materialized spec, so the
             committed port here means the spawn spec was clobbered. */
         let url = try #require(web.url)
-        #expect(url == "http://worktree-review.app.localhost:\(effective)/")
+        #expect(url == "http://app.localhost:\(effective)/")
         /** The child was told `{port}`, so a clobbered spec listens on 45111. */
         #expect(web.observedPort == nil || web.observedPort == effective)
 

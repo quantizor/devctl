@@ -30,8 +30,9 @@ public enum ConfigProjection {
         project: String, projectHost: String, spec: ServerSpec
     ) -> ProjectFileServer {
         /** validate() fills every spec's host, so a value equal to the project's
-            is not an override the author wrote. A worktree label is this
-            machine's, never the file's. */
+            is not an override the author wrote. A worktree label host is this
+            machine's, never the file's; one can only appear here from state an
+            older build persisted, and it is still dropped. */
         let host: String? = {
             guard let specHost = spec.host, specHost != projectHost,
                 !specHost.hasPrefix("worktree-")
@@ -71,9 +72,10 @@ public enum ConfigProjection {
         return next
     }
 
-    /** The host a projected file should declare: never a worktree label, and
-        omitted when it is the `<slug>.localhost` the loader already defaults to,
-        so a recovered file stays as quiet as a hand-written one. */
+    /** The host a projected file should declare: never a worktree label (only
+        reachable from state an older build persisted), and omitted when it is
+        the `<slug>.localhost` the loader already defaults to, so a recovered
+        file stays as quiet as a hand-written one. */
     static func declarableHost(_ host: String?, project: String) -> String? {
         guard let host, !host.hasPrefix("worktree-"), host != defaultHost(project: project)
         else { return nil }
