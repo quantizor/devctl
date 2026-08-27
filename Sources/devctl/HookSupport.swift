@@ -529,6 +529,14 @@ struct CursorAdapter: HarnessAdapter {
     }
 }
 
+/** SessionStart is the only Grok event this adapter emits for. Stop
+    additionalContext is injected as a user message and continues the turn. */
+enum GrokSessionHook {
+    static func emits(forGrokHookEvent event: String?) -> Bool {
+        event != "stop"
+    }
+}
+
 /** The standing instruction shared by harnesses whose context surface is a home
     file rather than hook stdout (Grok rules, OpenCode instructions): run
     `devctl context` before touching a server, described for a reader who has
@@ -559,7 +567,9 @@ enum HarnessStandingInstruction {
     instruction (HarnessStandingInstruction) rather than a live snapshot of one
     project. The hook still emits the Claude-shaped JSON in case Grok starts
     honoring it. No matcher: Grok's SessionStart source on a new session is
-    `new`, which would miss Claude's `startup|resume|clear|compact`. */
+    `new`, which would miss Claude's `startup|resume|clear|compact`. Do not
+    register Stop: Stop additionalContext is injected as a user message and
+    continues the turn. */
 struct GrokAdapter: HarnessAdapter {
     let name = "grok"
     /** Overridable so tests can point at a scratch file; nil means the real
@@ -589,6 +599,7 @@ struct GrokAdapter: HarnessAdapter {
         let command = "\(devctlPath) hook grok-session-start"
         var settings = try loadSettings()
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
+        let strippedStop = stripLeftoverStopHooks(hooks: &hooks)
         let repaired = repairGrokHooks(hooks: &hooks, command: command)
         var added = false
         var groups = hooks["SessionStart"] as? [[String: Any]] ?? []
@@ -602,7 +613,7 @@ struct GrokAdapter: HarnessAdapter {
             hooks["SessionStart"] = groups
             added = true
         }
-        if repaired != nil || added {
+        if repaired != nil || added || strippedStop {
             settings["hooks"] = hooks
             try writeSettings(settings)
         }
@@ -612,6 +623,9 @@ struct GrokAdapter: HarnessAdapter {
         }
         if added {
             return "Grok Build SessionStart hook installed in \(settingsURL.path)"
+        }
+        if strippedStop {
+            return "Grok Build Stop hook removed from \(settingsURL.path)"
         }
         return "Grok Build SessionStart hook already installed (\(settingsURL.path))"
     }
@@ -703,6 +717,33 @@ struct GrokAdapter: HarnessAdapter {
             if changed { hooks[event] = groups }
         }
         return changed ? "Grok Build hook path repaired in \(settingsURL.path)" : nil
+    }
+
+    /** Drop a leftover Stop registration of this command. Stop additionalContext
+        continues the turn, so install never writes Stop and heals one that is
+        already there. Foreign Stop hooks stay. */
+    private func stripLeftoverStopHooks(hooks: inout [String: Any]) -> Bool {
+        guard var groups = hooks["Stop"] as? [[String: Any]] else { return false }
+        var removed = false
+        groups = groups.compactMap { group in
+            guard var entryHooks = group["hooks"] as? [[String: Any]] else { return group }
+            let before = entryHooks.count
+            entryHooks.removeAll { hook in
+                ((hook["command"] as? String) ?? "").contains("devctl hook grok-session-start")
+            }
+            if entryHooks.count != before { removed = true }
+            if entryHooks.isEmpty { return nil }
+            var updated = group
+            updated["hooks"] = entryHooks
+            return updated
+        }
+        guard removed else { return false }
+        if groups.isEmpty {
+            hooks.removeValue(forKey: "Stop")
+        } else {
+            hooks["Stop"] = groups
+        }
+        return true
     }
 }
 

@@ -311,6 +311,7 @@ import Testing
             #expect(handlers?.first?["timeout"] as? Int == 10)
             #expect(hooks?["SessionEnd"] == nil)
             #expect(hooks?["PostCompact"] == nil)
+            #expect(hooks?["Stop"] == nil)
             let rules = try String(contentsOf: adapter.rulesURL, encoding: .utf8)
             #expect(rules.contains("devctl ensure"))
             #expect(rules.contains("`devctl context`"))
@@ -453,7 +454,51 @@ import Testing
             #expect(summary.contains("already installed"))
             let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
             #expect((hooks?["SessionStart"] as? [[String: Any]])?.count == 1)
+            #expect(hooks?["Stop"] == nil)
             #expect(FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+        }
+    }
+
+    @Test func grokSessionHookDoesNotEmitOnStop() {
+        #expect(GrokSessionHook.emits(forGrokHookEvent: "stop") == false)
+        #expect(GrokSessionHook.emits(forGrokHookEvent: "session_start") == true)
+        #expect(GrokSessionHook.emits(forGrokHookEvent: nil) == true)
+    }
+
+    @Test func grokInstallStripsALeftoverStopHook() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            try adapter.writeSettings([
+                "hooks": [
+                    "SessionStart": [
+                        [
+                            "hooks": [
+                                ["command": "\(devctlPath) hook grok-session-start", "type": "command"]
+                            ]
+                        ]
+                    ],
+                    "Stop": [
+                        [
+                            "hooks": [
+                                ["command": "\(devctlPath) hook grok-session-start", "type": "command"],
+                                ["command": "/other/tool run", "type": "command"],
+                            ]
+                        ]
+                    ],
+                ]
+            ])
+            let summary = try adapter.install(devctlPath: devctlPath)
+            #expect(summary.contains("Stop hook removed"))
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            #expect((hooks?["SessionStart"] as? [[String: Any]])?.count == 1)
+            let stopCommands =
+                ((hooks?["Stop"] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?
+                .compactMap { $0["command"] as? String } ?? []
+            #expect(stopCommands == ["/other/tool run"])
         }
     }
 

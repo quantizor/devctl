@@ -964,12 +964,15 @@ struct HookCursorSessionStart: AsyncParsableCommand {
 /** Invoked by Grok Build's SessionStart hook. Emits
     hookSpecificOutput.additionalContext (Grok currently ignores stdout on
     passive events; the standing instruction lives in ~/.grok/rules/devctl.md).
-    Same silence / exit-0 guarantees as the Claude hook. */
+    Same silence / exit-0 guarantees as the Claude hook. Silent on Stop:
+    Stop additionalContext continues the turn. */
 struct HookGrokSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "grok-session-start", shouldDisplay: false)
 
     func run() async throws {
+        guard GrokSessionHook.emits(forGrokHookEvent: ProcessInfo.processInfo.environment["GROK_HOOK_EVENT"])
+        else { return }
         let stdin = FileHandle.standardInput.readDataToEndOfFile()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
