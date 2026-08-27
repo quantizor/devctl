@@ -29,12 +29,12 @@ import Testing
             url: "http://old.localhost:3000/"
         )
         let next = PortMaterializer.materialize(
-            spec: spec, effectivePort: 4000, effectiveHost: "worktree-x.app.localhost")
+            spec: spec, effectivePort: 4000, effectiveHost: "beta.app.localhost")
         #expect(next.env?["PUBLIC_PORT"] == "4000")
-        #expect(next.env?["DEVCTL_HOST"] == "worktree-x.app.localhost")
-        #expect(next.command == ["echo", "worktree-x.app.localhost:4000"])
-        #expect(next.url == "http://worktree-x.app.localhost:4000/")
-        #expect(next.host == "worktree-x.app.localhost")
+        #expect(next.env?["DEVCTL_HOST"] == "beta.app.localhost")
+        #expect(next.command == ["echo", "beta.app.localhost:4000"])
+        #expect(next.url == "http://beta.app.localhost:4000/")
+        #expect(next.host == "beta.app.localhost")
     }
 
     @Test func rewritesHeadsAndHealthcheck() {
@@ -70,19 +70,19 @@ import Testing
             url: "http://app.localhost:3000/"
         )
         let next = PortMaterializer.materialize(
-            spec: spec, effectivePort: 3100, effectiveHost: "worktree-x.app.localhost")
-        #expect(next.url == "http://worktree-x.app.localhost:3100/")
-        #expect(next.host == "worktree-x.app.localhost")
+            spec: spec, effectivePort: 3100, effectiveHost: "beta.app.localhost")
+        #expect(next.url == "http://beta.app.localhost:3100/")
+        #expect(next.host == "beta.app.localhost")
     }
 
-    /** Spawn path may already have swapped `spec.host` to the worktree label;
-        matchHost keeps committed URL hosts eligible for rewrite. */
-    @Test func matchHostRewritesAfterSpecHostAlreadySwapped() {
+    /** `spec.host` may already name a different subdomain than the committed
+        URLs do; matchHost keeps those URL hosts eligible for rewrite. */
+    @Test func matchHostRewritesAfterSpecHostAlreadyMoved() {
         let health = HealthCheckSpec(type: .http, url: "http://myproj.localhost:3000/api/health")
         let spec = ServerSpec(
             command: ["serve"],
             healthcheck: health,
-            host: "worktree-fix.myproj.localhost",
+            host: "beta.myproj.localhost",
             name: "myproj",
             port: 3000,
             url: "http://myproj.localhost:3000/"
@@ -90,8 +90,8 @@ import Testing
         let next = PortMaterializer.materialize(
             spec: spec, effectivePort: 3742, effectiveHost: spec.host,
             matchHost: "myproj.localhost")
-        #expect(next.url == "http://worktree-fix.myproj.localhost:3742/")
-        #expect(next.healthcheck?.url == "http://worktree-fix.myproj.localhost:3742/api/health")
+        #expect(next.url == "http://beta.myproj.localhost:3742/")
+        #expect(next.healthcheck?.url == "http://beta.myproj.localhost:3742/api/health")
     }
 
     @Test func relativeHeadResolvesAgainstTheServerBase() {
@@ -106,7 +106,7 @@ import Testing
         #expect(next.heads?["admin"] == "http://app.localhost:33334/admin")
     }
 
-    @Test func relativeHeadFollowsAReboundPortAndAWorktreeHost() {
+    @Test func relativeHeadFollowsAReboundPortAndAnEffectiveHost() {
         let spec = ServerSpec(
             command: ["serve"],
             heads: ["admin": "/admin", "docs": "/docs/index.html"],
@@ -116,10 +116,10 @@ import Testing
             url: "http://app.localhost:3000/"
         )
         let next = PortMaterializer.materialize(
-            spec: spec, effectivePort: 3742, effectiveHost: "worktree-x.app.localhost",
+            spec: spec, effectivePort: 3742, effectiveHost: "beta.app.localhost",
             matchHost: "app.localhost")
-        #expect(next.heads?["admin"] == "http://worktree-x.app.localhost:3742/admin")
-        #expect(next.heads?["docs"] == "http://worktree-x.app.localhost:3742/docs/index.html")
+        #expect(next.heads?["admin"] == "http://beta.app.localhost:3742/admin")
+        #expect(next.heads?["docs"] == "http://beta.app.localhost:3742/docs/index.html")
     }
 
     @Test func relativeHeadKeepsItsQueryAndFragment() {
@@ -193,14 +193,5 @@ import Testing
         #expect(port >= 1024)
         #expect(port <= 65_000)
         #expect(port != 3000)
-    }
-
-    @Test func preferredSubdomainFromCommittedHost() {
-        #expect(
-            CheckoutIdentity.preferredSubdomain(
-                project: "/tmp/whatever", committedHost: "myproj.localhost") == "myproj")
-        #expect(
-            CheckoutIdentity.preferredSubdomain(
-                project: "/tmp/whatever", committedHost: "api.myproj.localhost") == "myproj")
     }
 }

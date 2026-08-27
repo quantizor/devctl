@@ -48,10 +48,11 @@ public enum AgentContext {
         var lines: [String] = ["<devctl-servers>"]
         lines.append(
             "This project's dev servers are managed by devctl (daemon-supervised; they and their logs survive session compaction and restarts). Prefer devctl over launching servers directly.")
-        if let project = ordered.first?.project, CheckoutIdentity.isLinkedWorktree(project: project) {
-            let preferred = CheckoutIdentity.preferredSubdomain(project: project, committedHost: nil)
+        if let worktree = ordered.compactMap(\.worktree).first {
+            /** Same status field the bullets carry, so the block never shells
+                out to git and stays pure over the fetched list. */
             lines.append(
-                "This checkout is a git worktree of \(preferred); use the URLs below, not the main checkout's host.")
+                "This checkout is the git worktree \"\(quoted(worktree))\"; the URLs below are this checkout's live servers, on the project's usual host (a sibling checkout may hold the declared port, so trust the port shown).")
         }
         for server in ordered {
             lines.append(bullet(for: server))
@@ -145,7 +146,7 @@ public enum AgentContext {
             parts.append("ports: \(rendered)")
         }
         if let conflict = server.portConflict, conflict.state == .rebound {
-            parts.append("rebinding: worktree checkout, not the main origin")
+            parts.append("rebinding: sibling worktree checkout holds the declared port")
         }
         switch server.phase {
         case .crashed:

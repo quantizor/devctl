@@ -2,7 +2,10 @@ import Foundation
 
 /** Why a server's effective host differs from the one its config declares.
     Append-only: the CLI switches exhaustively over this so a new case has to be
-    given a sentence a reader can act on. */
+    given a sentence a reader can act on. Only `localOverlay` is produced
+    today; `linkedWorktree` and `serverOverride` stay decodable so payloads
+    from older builds still parse, and `serverOverride` documents the shape a
+    future project-level host override would produce. */
 public enum EffectiveHostReason: String, Codable, Sendable {
     case linkedWorktree = "linked-worktree"
     case localOverlay = "local-overlay"
@@ -32,23 +35,14 @@ public struct EffectiveHost: Codable, Equatable, Sendable {
     public var differs: Bool { declared != effective }
 }
 
-/** One home for the host decision the spawn path makes, so `config check` can
-    answer it before a server starts without reimplementing the rule. Pure: the
-    caller computes `worktreeHost` (CheckoutIdentity shells out to git), which
-    keeps this testable with no repository on disk. */
+/** One home for the per-server host decision, so `config check` can answer it
+    before a server starts without reimplementing the rule. A linked worktree
+    is deliberately absent: the declared host is used unchanged there (the
+    worktree name surfaces as a display value instead), so the only host
+    difference left is a `devctl.local.json` overlay. Pure: nothing here
+    touches the filesystem, which keeps this testable with no repository on
+    disk. */
 public enum EffectiveHostResolver {
-    /** The project-level answer. A linked worktree swaps the whole project's
-        host unless a server opts out below. */
-    public static func project(
-        declaredHost: String, worktreeHost: String?
-    ) -> EffectiveHost {
-        guard let worktreeHost else {
-            return EffectiveHost(declared: declaredHost, effective: declaredHost)
-        }
-        return EffectiveHost(
-            declared: declaredHost, effective: worktreeHost, reason: .linkedWorktree)
-    }
-
     /** The per-server answer. The rule matches `prepareSpawn`: an overlay host
         wins outright, an explicit per-server host that is not simply the
         project's own host keeps its subdomain, and everything else follows the
@@ -56,24 +50,20 @@ public enum EffectiveHostResolver {
         `entry.host ?? projectHost`, so equality with a project-shaped host is
         what distinguishes "declared nothing" from "declared an override". */
     public static func server(
-        defaultSlugHost: String, overlayHost: String?, project: EffectiveHost, server: String,
+        defaultSlugHost: String, declaredHost: String, overlayHost: String?, server: String,
         specHost: String?
     ) -> EffectiveHost {
-        let declared = specHost ?? project.declared
+        let declared = specHost ?? declaredHost
         if let overlayHost {
             return EffectiveHost(
                 declared: declared, effective: overlayHost,
                 reason: overlayHost == declared ? nil : .localOverlay, server: server)
         }
         let followsProject =
-            specHost == nil || specHost == project.declared || specHost == defaultSlugHost
+            specHost == nil || specHost == declaredHost || specHost == defaultSlugHost
         guard followsProject else {
-            return EffectiveHost(
-                declared: declared, effective: declared,
-                reason: project.differs ? .serverOverride : nil, server: server)
+            return EffectiveHost(declared: declared, effective: declared, server: server)
         }
-        return EffectiveHost(
-            declared: declared, effective: project.effective, reason: project.reason,
-            server: server)
+        return EffectiveHost(declared: declared, effective: declaredHost, server: server)
     }
 }
