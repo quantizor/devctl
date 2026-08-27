@@ -1903,6 +1903,19 @@ struct Switch: AsyncParsableCommand {
                     message: "the branch's devservers.json is invalid, so its lifecycle was not run: \(view.errors.joined(separator: "; "))"),
                 json: global.json)
         }
+        /** The explicit invocation is the approval, the same bargain an explicit
+            ensure makes. Recording it before the lifecycle runs keeps the state
+            coherent from the moment the branch's committed argv executes, so a
+            crash mid-switch still leaves the project approved for a later
+            autonomous boot restore rather than half-trusted. */
+        do {
+            try await CLIRunner.client().request(
+                .projectTrust, params: ProjectOnlyParams(project: project),
+                expecting: WireEmpty.self)
+        } catch {
+            print(
+                "warning: trust was not recorded for this project (\(error)); run: devctl trust")
+        }
         let playbook =
             validated == nil
             ? []

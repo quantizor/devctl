@@ -23,12 +23,14 @@ public enum SpotlightLabel {
     }
 
     /** Alternate titles Spotlight can match against without stuffing keywords.
-        Host leaf and head name are the tokens people type after the project. */
-    public static func alternateNames(project: String, server: String, head: String?, url: String)
-        -> [String]
-    {
+        Host leaf and head name are the tokens people type after the project;
+        `family` is the main checkout's slug for a worktree entry. */
+    public static func alternateNames(
+        project: String, server: String, head: String?, url: String, family: String? = nil
+    ) -> [String] {
         var names: Set<String> = [project, server]
         if let head { names.insert(head) }
+        if let family { names.insert(family) }
         if let host = URL(string: url)?.host {
             let leaf = host.split(separator: ".").first.map(String.init)
             if let leaf, !leaf.isEmpty, leaf != "localhost" {
@@ -50,16 +52,17 @@ public enum SpotlightLabel {
         }
     }
 
-    /** Keyword tokens: project, server, head, distinctive host/path parts, plus
-        the standing "devctl" / "dev server" anchors so a typed "devctl myproj"
-        still lands. */
-    public static func keywords(project: String, server: String, head: String?, url: String)
-        -> [String]
-    {
+    /** Keyword tokens: project, server, head, the main checkout's slug for a
+        worktree entry, distinctive host/path parts, plus the standing "devctl"
+        / "dev server" anchors so a typed "devctl myproj" still lands. */
+    public static func keywords(
+        project: String, server: String, head: String?, url: String, family: String? = nil
+    ) -> [String] {
         var tokens: Set<String> = ["devctl", "dev server"]
         tokens.insert(project)
         tokens.insert(server)
         if let head { tokens.insert(head) }
+        if let family { tokens.insert(family) }
         if let parsed = URL(string: url) {
             if let host = parsed.host {
                 for part in host.split(separator: ".") where part != "localhost" && !part.isEmpty {

@@ -206,7 +206,7 @@ public actor Router {
                             serverHosts: hosts.isEmpty ? nil : hosts,
                             servers: view.specs.map(\.name),
                             warnings: view.warnings,
-                            worktree: CheckoutIdentity.worktreeLabel(project: project)))
+                            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label))
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
@@ -811,7 +811,7 @@ public actor Router {
             serverHosts: hosts.isEmpty ? nil : hosts,
             servers: view.specs.map(\.name),
             warnings: view.warnings,
-            worktree: CheckoutIdentity.worktreeLabel(project: project))
+            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label)
         guard params.dryRun != true else {
             return InitConfigResult(
                 check: check, content: content,

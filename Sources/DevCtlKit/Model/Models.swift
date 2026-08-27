@@ -333,6 +333,11 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         server is the heavier way to the same place. */
     public var locks: [String]?
     public var logPath: String
+    /** Slug of the main checkout when this server runs from a linked git
+        worktree; nil for a main checkout. Display only: the app composes it
+        with `worktree` ("myproj · review") so family relation survives
+        Spotlight and the menu bar. */
+    public var mainProject: String?
     public var observedPort: Int?
     public var phase: ServerPhase
     public var pid: Int?
@@ -365,6 +370,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         lastHealthAt: Date? = nil,
         locks: [String]? = nil,
         logPath: String,
+        mainProject: String? = nil,
         observedPort: Int? = nil,
         phase: ServerPhase,
         pid: Int? = nil,
@@ -390,6 +396,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.lastHealthAt = lastHealthAt
         self.locks = locks
         self.logPath = logPath
+        self.mainProject = mainProject
         self.observedPort = observedPort
         self.phase = phase
         self.pid = pid

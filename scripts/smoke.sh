@@ -399,6 +399,31 @@ cd "$WT_ROOT/worktrees/review"
 "$DEVCTL" unregister web --json > /dev/null || true
 pass "worktree coexistence cleaned up"
 
+# switch trust: the explicit invocation is the approval, recorded before the
+# branch's lifecycle argv runs. The project has no servers, so nothing but the
+# pre-lifecycle record could have marked it trusted, and the marker file proves
+# the playbook ran at all.
+SWITCH_ROOT="$WORK/switch-project"
+mkdir -p "$SWITCH_ROOT"
+cd "$SWITCH_ROOT"
+git init -b main >/dev/null
+git config user.email "[EMAIL]"
+git config user.name "devctl-smoke"
+cat > devservers.json <<'CFG'
+{
+  "version": 1,
+  "host": "switchtest.localhost",
+  "servers": {},
+  "lifecycle": { "switch": [["/usr/bin/touch", ".devctl-switch-ran"]] }
+}
+CFG
+git add devservers.json
+git commit -m init >/dev/null
+"$DEVCTL" switch main > "$WORK/switch.out" 2>&1 || fail "switch exit: $(cat "$WORK/switch.out")"
+[[ -f .devctl-switch-ran ]] || fail "switch lifecycle playbook did not run: $(cat "$WORK/switch.out")"
+"$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("trusted") is True, d' || fail "switch did not record trust before running lifecycle"
+pass "switch records trust before lifecycle runs"
+
 # lock --no-pause: holder stays up while the lock is held.
 cd "$PROJECT3"
 "$DEVCTL" up --timeout 15 --json > /dev/null || fail "up before --no-pause"

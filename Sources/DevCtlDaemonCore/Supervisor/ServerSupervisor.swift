@@ -74,9 +74,11 @@ public actor ServerSupervisor {
     private var stopWasDeliberate = true
     /** Durable why evidence across ensure truncate / daemon rehydrate. */
     private var terminalEvidence: [String]?
-    /** Linked-worktree display label, computed once at creation (status.worktree).
-        Nil for a main checkout; never alters the host. */
+    /** Linked-worktree display identity, computed once at creation:
+        status.worktree and status.mainProject. Nil for a main checkout; the
+        pair never alters the host. */
     private var worktreeLabel: String?
+    private var mainProjectSlug: String?
 
     public init(
         events: EventStore? = nil,
@@ -100,7 +102,10 @@ public actor ServerSupervisor {
         /** Computed once at creation, not per status read (it shells out to git)
             and not per spawn: a worktree project whose servers are stopped or
             restored still reports its label. */
-        self.worktreeLabel = CheckoutIdentity.worktreeLabel(project: project)
+        if let display = CheckoutIdentity.worktreeDisplay(project: project) {
+            self.worktreeLabel = display.label
+            self.mainProjectSlug = display.mainProject
+        }
         let id = serverID(project: project, name: spec.name)
         if let persisted = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile)?
             .servers[id] {
@@ -436,6 +441,7 @@ public actor ServerSupervisor {
             lastHealthAt: lastHealthAt,
             locks: spec.locks.map { $0.map(\.name) },
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
+            mainProject: mainProjectSlug,
             observedPort: observedPort,
             phase: phase,
             pid: pid.map(Int.init),

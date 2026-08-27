@@ -92,6 +92,7 @@ import Testing
         #expect(wtResult.server.effectivePort != 45111)
         #expect(wtResult.server.portConflict?.state == .rebound)
         #expect(wtResult.server.worktree == "review")
+        #expect(wtResult.server.mainProject == "main")
         let url = try #require(wtResult.server.url)
         /** The declared host is used unchanged; only the port moves. */
         #expect(url == "http://app.localhost:\(wtResult.server.effectivePort ?? -1)/")
@@ -119,6 +120,7 @@ import Testing
         let web = try #require(listed.servers.first { $0.server == "web" })
         #expect(web.phase == .stopped)
         #expect(web.worktree == "review")
+        #expect(web.mainProject == "main")
         #expect(web.url == "http://app.localhost:45111/")
     }
 
