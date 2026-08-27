@@ -850,7 +850,6 @@ public actor ServerSupervisor {
 
     private func recordSpawnFailure(_ error: SpawnError, id: String) async {
         spawnError = error
-        phase = .failed
         await logStore.append(stream: .sys, text: "spawn failed: \(error.message)")
         await events?.post(kind: .failed, project: projectPath, server: spec.name, detail: error.message)
         pid = nil
@@ -868,6 +867,7 @@ public actor ServerSupervisor {
             entry.startedAt = nil
             entry.terminalEvidence = evidence
         }
+        phase = .failed
         settleSpawnWaiters()
     }
 
@@ -920,9 +920,8 @@ public actor ServerSupervisor {
         pid = nil
         startedAt = nil
         observedPort = nil
-        phase = stopRequested ? .stopped : .crashed
+        let finalPhase: ServerPhase = stopRequested ? .stopped : .crashed
         stopRequested = false
-        let finalPhase = phase
         let exit = lastExit
         /** A deliberate stop retires the boot intent; a drain (or a crash) keeps
             whatever was recorded at start so the next boot restores it. */
@@ -944,6 +943,7 @@ public actor ServerSupervisor {
             entry.startedAt = nil
             entry.terminalEvidence = evidence
         }
+        phase = finalPhase
         settleSpawnWaiters()
     }
 
