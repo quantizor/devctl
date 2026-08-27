@@ -167,12 +167,21 @@ public enum ProcessTree {
         setpgid/setsid took them out of the group. No single source is enough
         (see the note on ServerSupervisor.startDescendantWatch), so both the
         deliberate-stop and crash paths union all three and revalidate each pid
-        at signal time. A failed sweep contributes nothing rather than throwing:
-        teardown proceeds with whatever the other sources found. */
+        at signal time. A failed sweep contributes nothing rather than throwing.
+
+        `priorSignaled` carries the identities an earlier pass already signaled,
+        so an escalation pass can re-signal a descendant that answered that pass
+        by ignoring it (SIG_IGN is inherited across fork/exec when a root passes
+        it down) and then became invisible to every live source: setsid gave it
+        a session of its own, the dead root broke the parent chain, and it was
+        younger than the last snapshot refresh. Revalidation still applies, so a
+        recycled pid is never hit. */
     public static func liveDescendants(
-        rootPid: pid_t, sessionID: pid_t?, snapshot: [ProcessIdentity]
+        rootPid: pid_t, sessionID: pid_t?, snapshot: [ProcessIdentity],
+        priorSignaled: [ProcessIdentity] = []
     ) -> [ProcessIdentity] {
         var byPid: [pid_t: ProcessIdentity] = [:]
+        for identity in priorSignaled { byPid[identity.pid] = identity }
         for identity in snapshot { byPid[identity.pid] = identity }
         for identity in descendants(of: rootPid).identities { byPid[identity.pid] = identity }
         if let sessionID {

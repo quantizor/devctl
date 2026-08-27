@@ -54,7 +54,10 @@ enum WhyEngine {
                 ?? status.lastExit?.signal.map { "signal \($0)" } ?? "unknown cause"
             let when = status.lastExit.map { JSONCoding.formatISO8601($0.at) } ?? "unknown time"
             summary = "crashed (\(cause)) at \(when)"
-            if status.lastExit?.code == 0 {
+            if status.blockedOn != nil {
+                summary +=
+                    "; the last runs exited on their own without binding, which looks like an interactive credential prompt the daemon context cannot answer; start the server once in a terminal to surface the prompt, then: devctl ensure \(status.server)"
+            } else if status.lastExit?.code == 0 {
                 summary +=
                     "; exit 0 is often a controlled refusal (framework lock, bind failure), not a crash"
             }

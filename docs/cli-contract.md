@@ -14,6 +14,7 @@ Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 
 
 ```jsonc
 {
+  "blockedOn": "interactive-auth",  // present when the last runs died the way an interactive credential prompt blocks: self-exit, nonzero, bounded tens-of-seconds lifetime, repeatedly, without ever passing a healthcheck. Heuristic, in devctl's own words; clears when a run dies differently or a healthcheck passes
   "declaredPort": 3000,          // committed / ad-hoc declaration
   "effectivePort": 3742,         // what this run binds (override, overlay, sibling rebind, or declared)
   "errorSummary": { "count": 3, "firstAt": "…", "lastAt": "…" },  // stderr tally for the last run; present once it turns crashed/failed/unhealthy
@@ -44,8 +45,6 @@ Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 
   "mainProject": "myproj"       // with worktree: the main checkout's slug, so displays read "myproj · review"
 }
 ```
-
-## Commands
 
 Filled in per phase as each lands; golden tests reference the examples in this file.
 
