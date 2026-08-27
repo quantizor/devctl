@@ -56,13 +56,15 @@ enum SpotlightIndexer {
                     let identifier = "\(project.path)::\(server.server)"
                     let prior = previous[identifier]
                     let names = SpotlightLabel.alternateNames(
-                        project: project.name, server: server.server, head: nil, url: url)
+                        project: project.name, server: server.server, head: nil, url: url,
+                        family: server.mainProject)
                     let entry = SpotlightEntry(
                         alternateNames: names,
                         firstSeen: prior?.firstSeen ?? now,
                         icon: server.icon,
                         keywords: SpotlightLabel.keywords(
-                            project: project.name, server: server.server, head: nil, url: url),
+                            project: project.name, server: server.server, head: nil, url: url,
+                            family: server.mainProject),
                         lastUsed: prior?.lastUsed,
                         rankingHint: SpotlightLabel.rankingHint(phase: server.phase, pinned: false),
                         title: SpotlightLabel.title(
@@ -76,13 +78,15 @@ enum SpotlightIndexer {
                     let prior = previous[identifier]
                     let pinned = pins.isPinned(project: project.path, server: server.server, head: head)
                     let names = SpotlightLabel.alternateNames(
-                        project: project.name, server: server.server, head: head, url: url)
+                        project: project.name, server: server.server, head: head, url: url,
+                        family: server.mainProject)
                     let entry = SpotlightEntry(
                         alternateNames: names,
                         firstSeen: prior?.firstSeen ?? now,
                         icon: server.icon,
                         keywords: SpotlightLabel.keywords(
-                            project: project.name, server: server.server, head: head, url: url),
+                            project: project.name, server: server.server, head: head, url: url,
+                            family: server.mainProject),
                         lastUsed: prior?.lastUsed,
                         rankingHint: SpotlightLabel.rankingHint(phase: server.phase, pinned: pinned),
                         title: SpotlightLabel.title(

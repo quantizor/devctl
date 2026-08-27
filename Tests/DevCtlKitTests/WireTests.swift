@@ -100,14 +100,15 @@ import Testing
         )
     }
 
-    /** The worktree display label is a contract field like any other: its key
-        name and sort position are pinned here, and its absence (a main
-        checkout) is the golden above, which omits it. */
+    /** The worktree display fields are a contract like any other: their key
+        names and sort positions are pinned here, and their absence (a main
+        checkout) is the golden above, which omits both. */
     @Test func statusSchemaGoldenWithAWorktreeLabel() throws {
         let status = ServerStatus(
             declaredPort: 3000,
             healthcheck: .none,
             logPath: "/logs/web/current.log",
+            mainProject: "myproj",
             phase: .running,
             project: "/tmp/proj",
             server: "web",
@@ -117,7 +118,7 @@ import Testing
         let json = String(data: try JSONCoding.encoder().encode(status), encoding: .utf8)!
         #expect(
             json
-                == #"{"declaredPort":3000,"healthcheck":"none","logPath":"/logs/web/current.log","phase":"running","project":"/tmp/proj","server":"web","url":"http://proj.localhost:3000/","worktree":"review"}"#
+                == #"{"declaredPort":3000,"healthcheck":"none","logPath":"/logs/web/current.log","mainProject":"myproj","phase":"running","project":"/tmp/proj","server":"web","url":"http://proj.localhost:3000/","worktree":"review"}"#
         )
     }
 

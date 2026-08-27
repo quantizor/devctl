@@ -114,6 +114,18 @@ final class DaemonModel {
         let name: String
         let path: String
         let servers: [ServerStatus]
+
+        /** One home for the group's display name. A linked worktree reads as
+            "myproj · review" so its relation to the main project survives
+            everywhere the name flows: menu bar, dashboard, and Spotlight
+            titles. A main checkout keeps its directory name. */
+        static func displayName(path: String, servers: [ServerStatus]) -> String {
+            guard let status = servers.first,
+                let worktree = status.worktree,
+                let main = status.mainProject
+            else { return (path as NSString).lastPathComponent }
+            return "\(main) · \(worktree)"
+        }
     }
 
     /** Worst phase across every server, for the menu bar glyph. */
@@ -242,10 +254,11 @@ final class DaemonModel {
             daemonReachable = true
             let grouped = Dictionary(grouping: all.servers, by: \.project)
             projects = grouped.keys.sorted().map { path in
-                ProjectGroup(
-                    name: (path as NSString).lastPathComponent,
+                let servers = (grouped[path] ?? []).sorted { $0.server < $1.server }
+                return ProjectGroup(
+                    name: ProjectGroup.displayName(path: path, servers: servers),
                     path: path,
-                    servers: (grouped[path] ?? []).sorted { $0.server < $1.server })
+                    servers: servers)
             }
             SpotlightIndexer.sync(projects: projects)
             daemonRecoveryError = nil

@@ -27,17 +27,28 @@ public enum CheckoutIdentity {
         return common != gitDir
     }
 
-    /** Display label for a linked worktree: the sanitized checkout directory
-        name, shown in status and session context so a reader can tell which
-        checkout a server belongs to. The label never touches the host: every
+    /** Display identity of a linked worktree: its sanitized checkout-directory
+        label and the main checkout's slug, shown together ("myproj · review")
+        so a worktree server reads as part of the project family in status,
+        Spotlight, and the app. The label never touches the host: every
         `*.localhost` name resolves to loopback, so the host disambiguated
         nothing, and a third-level subdomain breaks apps whose auth config
         (callback allow lists, cookie domains, trusted origins) pins one
         origin. Sibling checkouts are told apart by the rebound port instead.
-        Main checkouts and non-git trees return nil. */
-    public static func worktreeLabel(project: String) -> String? {
-        guard isLinkedWorktree(project: project) else { return nil }
-        return sanitizeLabel((project as NSString).lastPathComponent)
+        Nil for main checkouts and non-git trees. */
+    public static func worktreeDisplay(project: String) -> (label: String, mainProject: String)? {
+        guard isLinkedWorktree(project: project),
+            let listing = git(project: project, args: ["worktree", "list", "--porcelain"])
+        else { return nil }
+        /** `git worktree list` names the primary worktree first. */
+        guard let line = listing.split(separator: "\n", omittingEmptySubsequences: false)
+            .first(where: { $0.hasPrefix("worktree ") })
+        else { return nil }
+        let main = canonicalProjectPath(String(line.dropFirst("worktree ".count)))
+        return (
+            label: sanitizeLabel((project as NSString).lastPathComponent),
+            mainProject: ProjectConfigLoader.defaultSlug(project: main)
+        )
     }
 
     /** Stable free-port candidate near the declared port for sibling rebind. */
