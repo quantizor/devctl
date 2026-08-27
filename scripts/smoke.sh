@@ -424,6 +424,19 @@ git commit -m init >/dev/null
 "$DEVCTL" status --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("trusted") is True, d' || fail "switch did not record trust before running lifecycle"
 pass "switch records trust before lifecycle runs"
 
+# --project takes a directory, not a project name: a name lands on a
+# nonexistent relative path, which used to answer an empty scoped view and let
+# a stop report success against a phantom project while the real server kept
+# running.
+cd "$SWITCH_ROOT"
+set +e
+"$DEVCTL" down --project devctl-no-such-project --json > "$WORK/phantom.json" 2>/dev/null
+PHANTOM_EXIT=$?
+set -e
+[[ "$PHANTOM_EXIT" -eq 2 ]] || fail "phantom --project exit $PHANTOM_EXIT (expected usage 2): $(cat "$WORK/phantom.json" 2>/dev/null)"
+/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] is False and d["error"]["code"]=="usage", d' "$WORK/phantom.json" || fail "phantom --project error shape: $(cat "$WORK/phantom.json")"
+pass "--project name-as-path is refused instead of phantom success"
+
 # lock --no-pause: holder stays up while the lock is held.
 cd "$PROJECT3"
 "$DEVCTL" up --timeout 15 --json > /dev/null || fail "up before --no-pause"

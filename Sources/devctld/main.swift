@@ -278,6 +278,25 @@ Task {
         }
         DevCtlLog.daemon.info("watch sweep stopped")
     }
+    /** The missing-project sweep: one stat per registered project per interval,
+        pruned only on the second consecutive miss. Also after restore for the
+        same reason: pruning is destructive on the registry rows recovery
+        replays, and the two must not race. */
+    Task {
+        DevCtlLog.daemon.info("missing-project sweep started")
+        while !Task.isCancelled {
+            let pruned = await router.sweepMissingProjects()
+            if pruned > 0 {
+                DevCtlLog.daemon.info("missing-project sweep pruned \(pruned)")
+            }
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch {
+                break
+            }
+        }
+        DevCtlLog.daemon.info("missing-project sweep stopped")
+    }
 }
 
 dispatchMain()

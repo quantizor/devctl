@@ -452,13 +452,45 @@ public actor Router {
     }
 
     /** Forget registered projects whose checkout path is gone: stop children,
-        bounce orphan pids, drop registry/state/locks/supervisors. Opportunistic
-        (boot + machine-wide status), not a watcher. */
+        bounce orphan pids, drop registry/state/locks/supervisors. Immediate at
+        boot and on machine-wide status; the timer sweep (`sweepMissingProjects`)
+        is the debounced variant. */
     public func pruneMissingProjects() async {
         for project in await registry.allProjects() {
             if FileManager.default.fileExists(atPath: project) { continue }
             await forgetMissingProject(project)
         }
+    }
+
+    /** Paths that failed the existence check on the previous sweep. A path must
+        be missing on two consecutive sweeps before teardown: a network mount or
+        a slow Finder move makes a path vanish for a moment, and a sweep that
+        runs unattended every 30 seconds must not tear down a live project on
+        one flaky stat. */
+    private var missingProjectStrikes: Set<String> = []
+
+    /** The timer-side sweep (devctld runs it every 30s after restore), so a
+        discarded worktree's servers stop within a minute of the checkout going
+        away instead of waiting for a machine-wide status or a reboot. */
+    @discardableResult
+    public func sweepMissingProjects() async -> Int {
+        var pruned = 0
+        let projects = await registry.allProjects()
+        missingProjectStrikes = missingProjectStrikes.filter { projects.contains($0) }
+        for project in projects {
+            if FileManager.default.fileExists(atPath: project) {
+                missingProjectStrikes.remove(project)
+                continue
+            }
+            if !missingProjectStrikes.contains(project) {
+                missingProjectStrikes.insert(project)
+                continue
+            }
+            missingProjectStrikes.remove(project)
+            await forgetMissingProject(project)
+            pruned += 1
+        }
+        return pruned
     }
 
     /** Startup recovery: prune vanished checkouts first, reconcile persisted

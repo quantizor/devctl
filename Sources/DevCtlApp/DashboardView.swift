@@ -270,7 +270,7 @@ struct LogsPane: View {
     }
 
     private func refresh() async {
-        let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+        let client = AppDaemon.client
         let streams: [LogStream]? = stream == "all" ? nil : LogStream(rawValue: stream).map { [$0] }
         let params = LogsQueryParams(
             grep: grep.isEmpty ? nil : grep,
@@ -339,7 +339,7 @@ struct TimelinePane: View {
         }
         .task(id: project) {
             while !Task.isCancelled {
-                let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+                let client = AppDaemon.client
                 if let result = try? await client.request(
                     .eventsQuery,
                     params: EventsQueryParams(project: project, since: Date().addingTimeInterval(-window)),
@@ -454,7 +454,7 @@ struct ConfigEditor: View {
 
     private func save() {
         Task {
-            let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+            let client = AppDaemon.client
             do {
                 let result = try await client.request(
                     .projectWriteConfig,

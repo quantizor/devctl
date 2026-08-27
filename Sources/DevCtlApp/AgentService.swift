@@ -255,7 +255,7 @@ enum AgentService {
         The test is the reported version, which does not move between rebuilds of
         the same version during development: use `devctl daemon restart` there. */
     nonisolated static func bounceStaleDaemon(paths: DevCtlPaths = DevCtlPaths()) async {
-        let client = DaemonClient(socketPath: paths.socketPath)
+        let client = AppDaemon.client
         guard
             let info = try? await client.request(
                 .daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self),

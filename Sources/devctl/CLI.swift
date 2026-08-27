@@ -37,7 +37,26 @@ struct GlobalOptions: ParsableArguments {
         distinct path and keeps its own project identity; canonicalization does
         not collapse sibling checkouts into one. */
     func resolvedProject() -> String {
-        if let project { return canonicalProjectPath(project) }
+        if let project {
+            /** An explicit `--project myproj` (a name, not a path) lands on a
+                nonexistent relative directory, and the daemon then answers an
+                empty scoped view: a stop reports success against a phantom
+                project while the real server keeps running. An explicitly
+                passed project must be an existing directory; the default
+                resolution is exempt because it is anchored to the cwd by
+                construction. */
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: project, isDirectory: &isDirectory)
+            guard exists, isDirectory.boolValue else {
+                CLIRunner.fail(
+                    WireError(
+                        code: .usage,
+                        hint: "run: devctl status --all --json to list projects; --project takes the checkout directory",
+                        message: "--project expects a directory path, but '\(project)' does not exist as a directory"),
+                    json: json)
+            }
+            return canonicalProjectPath(project)
+        }
         return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
     }
 
