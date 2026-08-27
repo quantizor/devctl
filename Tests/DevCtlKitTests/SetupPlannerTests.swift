@@ -189,10 +189,14 @@ struct SetupPlannerTests {
             at: home.appending(path: ".cursor"), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
             at: home.appending(path: ".grok"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: home.appending(path: ".config/opencode"), withIntermediateDirectories: true)
 
         let cliPath = home.appending(path: ".local/bin/devctl").path
         let offersFresh = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersFresh.map(\.harness) == ["antigravity", "claude", "cursor", "grok"])
+        #expect(
+            offersFresh.map(\.harness)
+                == ["antigravity", "claude", "cursor", "grok", "opencode"])
         #expect(offersFresh.allSatisfy { $0.defaultChecked && !$0.alreadyInstalled })
 
         let antigravitySettings = """
@@ -217,9 +221,18 @@ struct SetupPlannerTests {
         try FileManager.default.createDirectory(
             at: home.appending(path: ".grok/hooks"), withIntermediateDirectories: true)
         try Data(grokSettings.utf8).write(to: home.appending(path: ".grok/hooks/devctl.json"))
+        /** OpenCode reads as installed only with both halves: the entry in the
+            global config and the managed instructions file it references. The
+            fixture home is not the real one, so the entry is the absolute
+            managed path. */
+        let opencodeEntry = OpenCodeWiring.instructionsEntry(
+            forManagedFileAt: home.appending(path: ".config/opencode/devctl.md"))
+        try Data("{\"instructions\":[\"\(opencodeEntry)\"]}".utf8).write(
+            to: home.appending(path: ".config/opencode/opencode.json"))
+        try Data("x\n".utf8).write(to: home.appending(path: ".config/opencode/devctl.md"))
 
         let offersInstalled = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
-        #expect(offersInstalled.count == 4)
+        #expect(offersInstalled.count == 5)
         #expect(offersInstalled.allSatisfy { $0.alreadyInstalled && !$0.defaultChecked })
     }
 

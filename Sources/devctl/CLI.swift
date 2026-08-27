@@ -841,17 +841,47 @@ struct HookUninstall: AsyncParsableCommand {
         } else {
             adapters = harnessAdapters
         }
+        let result = Self.uninstallAll(adapters)
+        if !result.failures.isEmpty {
+            /** Every adapter before the first failure has already rewritten its
+                file, so the report names what succeeded rather than discarding
+                that work. */
+            let succeeded = adapters.map(\.name).filter { name in
+                !result.failures.contains { $0.name == name }
+            }
+            var message = "hook uninstall finished with errors"
+            if !succeeded.isEmpty {
+                message += "; removed from \(succeeded.joined(separator: ", "))"
+            }
+            message +=
+                ". Failed: "
+                + result.failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
+            message += " Fix each cause and rerun devctl hook uninstall."
+            CLIRunner.fail(
+                WireError(code: .internalError, hint: "devctl hook uninstall", message: message),
+                json: global.json)
+        }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in result.summaries.joined(separator: "\n") }
+    }
+
+    /** One uninstall pass over the adapters, collecting rather than aborting: a
+        refusal from one harness must not discard the others' summaries, because
+        their files are already rewritten by the time the throw lands. */
+    static func uninstallAll(_ adapters: [any HarnessAdapter]) -> (
+        summaries: [String], failures: [(name: String, message: String)]
+    ) {
         var summaries: [String] = []
+        var failures: [(name: String, message: String)] = []
         for adapter in adapters {
             do {
                 summaries.append(try adapter.uninstall())
+            } catch let error as WireError {
+                failures.append((adapter.name, error.message))
             } catch {
-                CLIRunner.fail(
-                    WireError(code: .internalError, message: "hook uninstall failed: \(error)"),
-                    json: global.json)
+                failures.append((adapter.name, String(describing: error)))
             }
         }
-        CLIRunner.emit(WireEmpty(), json: global.json) { _ in summaries.joined(separator: "\n") }
+        return (summaries, failures)
     }
 }
 
