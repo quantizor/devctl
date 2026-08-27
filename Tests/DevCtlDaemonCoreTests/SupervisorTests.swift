@@ -94,6 +94,107 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.resumeOnBoot == true)
     }
 
+    /** Two self-exits in the stall window (nonzero, bounded lifetime, never
+        healthy) are the crash-loop an interactive credential prompt produces:
+        surfaced as blockedOn, persisted across a daemon restart, and cleared
+        the first time a run dies differently. */
+    @Test func repeatedTimedSelfExitsSurfaceAsBlockedOnInteractiveAuth() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let fixture = try #require(fixtureServerExecutable())
+        let spec = ServerSpec(
+            command: [fixture, "--exit-after", "2.5", "--code", "1"], name: "auth-stall")
+        let bounds = (minSeconds: 1, maxSeconds: 300)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec, stallBounds: bounds)
+        let id = serverID(project: env.projectPath, name: "auth-stall")
+
+        func awaitCrashed() async throws -> ServerStatus {
+            var status = await supervisor.status()
+            for _ in 0..<80 where status.phase != .crashed {
+                try await Task.sleep(for: .milliseconds(100))
+                status = await supervisor.status()
+            }
+            return status
+        }
+
+        _ = await supervisor.start()
+        let first = try await awaitCrashed()
+        #expect(first.phase == .crashed)
+        #expect(first.blockedOn == nil)
+
+        _ = await supervisor.start()
+        let second = try await awaitCrashed()
+        #expect(second.phase == .crashed)
+        #expect(second.blockedOn == "interactive-auth")
+        #expect(await registry.persistedState(serverID: id)?.stallStreak == 2)
+
+        /** The classification survives a daemon restart through the state file. */
+        let rehydrated = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec, stallBounds: bounds)
+        #expect(await rehydrated.status().blockedOn == "interactive-auth")
+
+        /** A run that dies differently (instantly, here) breaks the pattern. */
+        await supervisor.updateSpec(
+            ServerSpec(
+                command: [fixture, "--exit-after", "0.1", "--code", "1"], name: "auth-stall"))
+        _ = await supervisor.start()
+        let third = try await awaitCrashed()
+        #expect(third.phase == .crashed)
+        #expect(third.blockedOn == nil)
+        #expect(await registry.persistedState(serverID: id)?.stallStreak == nil)
+    }
+
+    /** The crash path's descendants are escalated like a deliberate stop's: an
+        orphaned `sleep` inherits the root's SIG_IGN through the shell chain
+        (bash cannot reset a disposition ignored on entry, which is how a real
+        tree ignores the first pass wholesale), keeps the root's session after
+        reparenting, and answers the SIGTERM pass by ignoring it. Without an
+        escalation it holds its listeners past the crash while the next ensure
+        races it for the port. The Foundation-Process grandchild is not a valid
+        stand-in here: posix_spawn resets inherited dispositions, so that child
+        dies from the first pass and tests nothing. */
+    @Test func crashPathEscalatesDescendantsThatIgnoreTerm() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let fixture = try #require(fixtureServerExecutable())
+        let spec = ServerSpec(
+            command: [fixture, "--orphan-grandchild-ignterm", "--exit-after", "0.5", "--code", "1"],
+            name: "ignorer")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        var status = await supervisor.status()
+        for _ in 0..<50 where status.phase != .crashed {
+            try await Task.sleep(for: .milliseconds(100))
+            status = await supervisor.status()
+        }
+        #expect(status.phase == .crashed)
+
+        let spool = paths.spoolOutFile(project: env.projectPath, server: "ignorer")
+        var grandchildPid: pid_t?
+        for _ in 0..<30 {
+            let contents = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
+            if let line = contents.split(separator: "\n").first(where: { $0.contains("grandchild pid") }),
+                let pid = pid_t(line.split(separator: " ").last.map(String.init) ?? "")
+            {
+                grandchildPid = pid
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let pid = try #require(grandchildPid)
+        /** The escalation grace plus margin: a SIGTERM-obedient tree is already
+            gone by here; this one answered the first pass by ignoring it. */
+        try await Task.sleep(for: .milliseconds(2500))
+        #expect(kill(pid, 0) != 0)
+    }
+
     @Test func crashRecordsExitForensics() async throws {
         let env = try makeEnv()
         let paths = env.paths

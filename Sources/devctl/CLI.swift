@@ -197,6 +197,10 @@ enum CLIRunner {
             let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
             parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
         }
+        if status.blockedOn != nil {
+            parts.append(
+                "blocked on interactive auth (start once in a terminal, then: devctl ensure \(status.server))")
+        }
         if let spawn = status.spawnError {
             parts.append("spawn failed: \(spawn.message)")
         }

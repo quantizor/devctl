@@ -49,6 +49,11 @@ public struct PersistedServerState: Codable, Sendable {
     public var resumeOnBoot: Bool?
     public var spawnError: SpawnError?
     public var startedAt: Date?
+    /** Consecutive self-exits shaped like an interactive-auth stall (nonzero,
+        bounded lifetime, never health-verified a bind). Two or more is what
+        status surfaces as `blockedOn`. Optional so state files written before
+        this field existed keep parsing. */
+    public var stallStreak: Int?
     /** Last terminal spool lines for `why` after ensure truncate / rehydrate. */
     public var terminalEvidence: [String]?
 
@@ -61,6 +66,7 @@ public struct PersistedServerState: Codable, Sendable {
         resumeOnBoot: Bool? = nil,
         spawnError: SpawnError? = nil,
         startedAt: Date? = nil,
+        stallStreak: Int? = nil,
         terminalEvidence: [String]? = nil
     ) {
         self.boundPort = boundPort
@@ -71,6 +77,7 @@ public struct PersistedServerState: Codable, Sendable {
         self.resumeOnBoot = resumeOnBoot
         self.spawnError = spawnError
         self.startedAt = startedAt
+        self.stallStreak = stallStreak
         self.terminalEvidence = terminalEvidence
     }
 }

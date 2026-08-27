@@ -154,6 +154,10 @@ public enum AgentContext {
                 let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
                 parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
             }
+            if server.blockedOn != nil {
+                parts.append(
+                    "looks blocked on an interactive credential prompt: start it once in a terminal, then: devctl ensure \(quoted(server.server))")
+            }
         case .failed:
             /** strerror is devctl's own naming of the OS error, never the
                 spawnError message, which can echo the configured command. */

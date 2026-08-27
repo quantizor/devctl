@@ -58,6 +58,10 @@ public actor ServerSupervisor {
     private var spawnError: SpawnError?
     private var spawnWaiters: [CheckedContinuation<Void, Never>] = []
     private var spec: ServerSpec
+    /** Lifetime window a self-exit must land in to count toward the stall
+        streak (see recordOutcome). Overridable so tests can use fast bounds. */
+    private let stallBounds: (minSeconds: Int, maxSeconds: Int)
+    private var stallStreak = 0
     private var startedAt: Date?
     /** Taken once the run has been alive for the settle window rather than at
         spawn, so a server that writes its own watched file while booting folds
@@ -87,7 +91,8 @@ public actor ServerSupervisor {
         prober: any HealthProber = NetworkHealthProber(),
         projectPath: String,
         registry: Registry,
-        spec: ServerSpec
+        spec: ServerSpec,
+        stallBounds: (minSeconds: Int, maxSeconds: Int) = (10, 300)
     ) {
         self.events = events
         self.launcher = launcher
@@ -99,6 +104,7 @@ public actor ServerSupervisor {
         self.projectPath = project
         self.registry = registry
         self.spec = spec
+        self.stallBounds = stallBounds
         /** Computed once at creation, not per status read (it shells out to git)
             and not per spawn: a worktree project whose servers are stopped or
             restored still reports its label. */
@@ -112,6 +118,7 @@ public actor ServerSupervisor {
             self.errorSummary = persisted.errorSummary
             self.lastExit = persisted.lastExit
             self.spawnError = persisted.spawnError
+            self.stallStreak = persisted.stallStreak ?? 0
             self.terminalEvidence = persisted.terminalEvidence
             if persisted.phase == .crashed || persisted.phase == .failed {
                 self.phase = persisted.phase
@@ -382,7 +389,7 @@ public actor ServerSupervisor {
         let rootIdentity = ProcessTree.identity(of: target)
         let sessionID = rootSessionID
         let snapshot = lastDescendantSnapshot
-        signalRun(
+        let signaled = signalRun(
             target: target, rootIdentity: rootIdentity, sessionID: sessionID,
             snapshot: snapshot, signal: SIGTERM)
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
@@ -392,11 +399,16 @@ public actor ServerSupervisor {
             try? await Task.sleep(for: .milliseconds(100))
         }
         /** Escalate over a freshly re-derived union (new children may have
-            appeared during the grace window); signalRun SIGKILLs the group only
-            while the root still lives, and otherwise the survivors individually. */
+            appeared during the grace window) plus everything the SIGTERM pass
+            already reached: a descendant that ignored that pass and then became
+            invisible to every live source (setsid, the now-dead root's parent
+            chain, younger than the snapshot) is still re-signaled, revalidated
+            against its recorded identity. signalRun SIGKILLs the group only
+            while the root still lives, and otherwise the survivors
+            individually. */
         signalRun(
             target: target, rootIdentity: rootIdentity, sessionID: sessionID,
-            snapshot: snapshot, signal: SIGKILL)
+            snapshot: snapshot, signal: SIGKILL, priorSignaled: signaled)
         await waitForRunTaskCompletion()
         return status()
     }
@@ -410,15 +422,22 @@ public actor ServerSupervisor {
         match their recorded identity are signaled individually. Pass
         `rootIdentity: nil` from the crash path, where the root is already reaped,
         so `kill(-pid)` can never follow a recycled id. This is the one home for
-        turning a run's descendants into kernel signals. */
+        turning a run's descendants into kernel signals. Returns the identities
+        it signaled, so an escalation pass can remember what to re-signal even
+        after every live source has lost it. */
+    @discardableResult
     private func signalRun(
         target: pid_t, rootIdentity: ProcessIdentity?, sessionID: pid_t?,
-        snapshot: [ProcessIdentity], signal: Int32
-    ) {
+        snapshot: [ProcessIdentity], signal: Int32,
+        priorSignaled: [ProcessIdentity] = []
+    ) -> [ProcessIdentity] {
+        let descendants = ProcessTree.liveDescendants(
+            rootPid: target, sessionID: sessionID, snapshot: snapshot,
+            priorSignaled: priorSignaled)
         ProcessTree.signalTree(
-            descendants: ProcessTree.liveDescendants(
-                rootPid: target, sessionID: sessionID, snapshot: snapshot),
-            revalidate: true, rootIdentity: rootIdentity, rootPid: target, signal: signal)
+            descendants: descendants, revalidate: true, rootIdentity: rootIdentity,
+            rootPid: target, signal: signal)
+        return descendants
     }
 
     public func status() -> ServerStatus {
@@ -431,6 +450,7 @@ public actor ServerSupervisor {
         let tail = terminal ? (recentLogTail ?? spoolTail()) : nil
         let evidence = terminal ? (terminalEvidence ?? tail) : nil
         return ServerStatus(
+            blockedOn: stallStreak >= 2 && phase == .crashed ? "interactive-auth" : nil,
             declaredPort: declaredPort ?? spec.port,
             effectivePort: effectivePort ?? spec.port,
             errorSummary: errorSummary,
@@ -516,6 +536,14 @@ public actor ServerSupervisor {
             if !everHealthy {
                 if consecutiveSuccesses >= healthyAfter {
                     everHealthy = true
+                    /** A run that was verified healthy was not stalled; the
+                        pattern the streak tracks belongs to the runs before it.
+                        Gated on a real healthcheck: with none, "healthy" only
+                        means the process was alive past the stabilization
+                        window, which an auth-stalled server also is before it
+                        dies, so resetting here would erase the streak every
+                        cycle and the loop would never surface. */
+                    if spec.healthcheck != nil { stallStreak = 0 }
                     phase = .running
                     DevCtlLog.supervisor.info("healthy \(spec.name)@\(projectPath)")
                     scanObservedPort()
@@ -916,18 +944,6 @@ public actor ServerSupervisor {
         errorSummary = captureErrorSummary(since: windowStart)
         descendantTask?.cancel()
         descendantTask = nil
-        if !stopRequested, let rootPid = capturedPid {
-            /** The root is already reaped here, so signalRun gets rootIdentity:
-                nil and never signals its process group: kill(-pid) on a reaped id
-                could land on a recycled group. Only the escaped descendants that
-                still match their recorded identity are swept, drawn from the
-                snapshot, a parent-chain sweep, and the session at once, since no
-                one source sees a child that setpgid'd, setsid'd, or forked after
-                the last sample. */
-            signalRun(
-                target: rootPid, rootIdentity: nil, sessionID: capturedSessionID,
-                snapshot: capturedSnapshot, signal: SIGTERM)
-        }
         lastDescendantSnapshot = []
         rootSessionID = nil
         pid = nil
@@ -947,18 +963,73 @@ public actor ServerSupervisor {
         let errors = errorSummary
         let evidence = finalPhase == .stopped ? nil : terminalEvidence
         if finalPhase == .stopped { terminalEvidence = nil }
+        /** A run that exits on its own, nonzero, after tens of seconds and never
+            passed a healthcheck is the shape of a start command waiting on an
+            interactive credential prompt the daemon context cannot answer (a
+            biometric unlock, a secrets CLI): the process sits silent, times
+            out, and dies, and whoever called ensure retries into the same wall.
+            Two in a row is the loop the operator is inside; one is noise. The
+            window keeps a long-lived worker's eventual death and an instant
+            failure (a compile error) out of the classification. */
+        if finalPhase == .crashed, let exitCode = exit?.code, exitCode != 0,
+            let windowStart,
+            Double(stallBounds.minSeconds)...Double(stallBounds.maxSeconds)
+                ~= Date().timeIntervalSince(windowStart),
+            spec.healthcheck == nil || !everHealthy
+        {
+            stallStreak += 1
+        } else {
+            stallStreak = 0
+        }
+        let streak = stallStreak
         await registryUpdate(id: id) { entry in
             entry.errorSummary = errors
             entry.lastExit = exit
             entry.phase = finalPhase
             entry.pid = nil
+            entry.stallStreak = streak == 0 ? nil : streak
             if retireIntent { entry.resumeOnBoot = nil }
             entry.startedAt = nil
             entry.terminalEvidence = evidence
         }
         phase = finalPhase
         settleSpawnWaiters()
+        await escalateCrashDescendants(
+            id: id, rootPid: capturedPid, sessionID: capturedSessionID,
+            snapshot: capturedSnapshot)
     }
+
+    /** The crash path's counterpart to stop()'s SIGKILL escalation, and the one
+        signalling path for a self-exit's descendants. A self-exit used to get
+        exactly one SIGTERM pass, so a descendant that ignored it (a disposition
+        inherited across fork/exec when the root passed SIG_IGN down) or that
+        outlived the next restart survived holding its listeners, and the resume
+        or ensure that came after raced it for the port and crashed: the
+        lingering-inspector-port failure. The root is already reaped, so
+        `rootIdentity` is nil and the process group is never touched: only the
+        descendants that still match their recorded identity are swept, drawn
+        from the snapshot, a parent-chain sweep, and the session at once. Runs
+        after the waiters settle so the short grace never delays a status
+        answer, and the SIGKILL pass rides the prior pass's union so a
+        descendant every live source has since lost is still re-signaled. */
+    private func escalateCrashDescendants(
+        id: String, rootPid: pid_t?, sessionID: pid_t?, snapshot: [ProcessIdentity]
+    ) async {
+        guard let rootPid, !stopRequested else { return }
+        let signaled = signalRun(
+            target: rootPid, rootIdentity: nil, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGTERM)
+        try? await Task.sleep(for: .milliseconds(Self.crashEscalationGraceMilliseconds))
+        signalRun(
+            target: rootPid, rootIdentity: nil, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGKILL, priorSignaled: signaled)
+    }
+
+    /** How long a crashed run's descendants get to answer SIGTERM before the
+        SIGKILL pass. Deliberately shorter than stop()'s seven-second grace: the
+        phase is already published, so this only bounds how long an
+        old-generation listener can compete with the next spawn. */
+    nonisolated private static let crashEscalationGraceMilliseconds = 1_000
 
     /** State persistence failures (full disk, permissions) must not kill the
         supervisor, but they must not vanish either: crash forensics silently

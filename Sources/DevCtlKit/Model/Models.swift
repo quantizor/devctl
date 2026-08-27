@@ -319,6 +319,11 @@ public struct ErrorSummary: Codable, Equatable, Sendable {
 
 /** The core status schema agents consume; documented in docs/cli-contract.md. */
 public struct ServerStatus: Codable, Equatable, Sendable {
+    /** Present when the last runs died the way an interactive credential prompt
+        blocks: self-exit, nonzero, after tens of seconds, repeatedly, without
+        ever passing a healthcheck. A heuristic classification in devctl's own
+        words, not a quote of anything the child printed. */
+    public var blockedOn: String?
     public var declaredPort: Int?
     public var effectivePort: Int?
     public var errorSummary: ErrorSummary?
@@ -360,6 +365,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var worktree: String?
 
     public init(
+        blockedOn: String? = nil,
         declaredPort: Int? = nil,
         effectivePort: Int? = nil,
         errorSummary: ErrorSummary? = nil,
@@ -386,6 +392,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         url: String? = nil,
         worktree: String? = nil
     ) {
+        self.blockedOn = blockedOn
         self.declaredPort = declaredPort
         self.effectivePort = effectivePort
         self.errorSummary = errorSummary

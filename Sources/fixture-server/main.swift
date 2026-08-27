@@ -16,6 +16,11 @@ import Foundation
                            but keeps its session. A parent-chain sweep can no
                            longer find it; only a session sweep can. Prints
                            `grandchild pid N` so a teardown test can verify it
+    --orphan-grandchild-ignterm
+                           same, but the shell traps SIGTERM to ignore, and the
+                           backgrounded sleep inherits that ignore: it answers
+                           the first SIGTERM pass by ignoring it, so only an
+                           escalation pass can reach it
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
@@ -32,6 +37,7 @@ var exitCode: Int32 = 0
 var spawnGrandchild = false
 var grandchildAfter: Double?
 var orphanGrandchild = false
+var orphanGrandchildIgnoresTerm = false
 var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
@@ -54,6 +60,8 @@ while let arg = argIterator.next() {
         grandchildAfter = argIterator.next().flatMap { Double($0) }
     case "--orphan-grandchild":
         orphanGrandchild = true
+    case "--orphan-grandchild-ignterm":
+        orphanGrandchildIgnoresTerm = true
     case "--ignore-sigterm":
         ignoreSigterm = true
     case "--emit-binary":
@@ -90,11 +98,17 @@ func launchGrandchild() {
     reparents to launchd while keeping this process's session (no setsid). Only a
     session sweep can find it afterward, which is what a deliberate-stop teardown
     test needs to distinguish from a parent-chain sweep. `$!` is the backgrounded
-    pid, echoed to the inherited stdout so the test can read it from the spool. */
-func launchOrphanGrandchild() {
+    pid, echoed to the inherited stdout so the test can read it from the spool.
+    `ignoreTerm` makes the shell `trap "" TERM`, an ignored disposition the
+    backgrounded sleep inherits: the escalation-verification shape. A plain
+    Foundation Process cannot stand in for that, because posix_spawn resets
+    inherited dispositions for the direct child. */
+func launchOrphanGrandchild(ignoreTerm: Bool) {
     let shell = Process()
     shell.executableURL = URL(fileURLWithPath: "/bin/sh")
-    shell.arguments = ["-c", "sleep 1000 & echo grandchild pid $!"]
+    shell.arguments = [
+        "-c", ignoreTerm ? "trap \"\" TERM; sleep 1000 & echo grandchild pid $!" : "sleep 1000 & echo grandchild pid $!",
+    ]
     try? shell.run()
     shell.waitUntilExit()
 }
@@ -110,7 +124,11 @@ if spawnGrandchild {
 }
 
 if orphanGrandchild {
-    launchOrphanGrandchild()
+    launchOrphanGrandchild(ignoreTerm: false)
+}
+
+if orphanGrandchildIgnoresTerm {
+    launchOrphanGrandchild(ignoreTerm: true)
 }
 
 if emitBinary {
