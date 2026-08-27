@@ -3,6 +3,14 @@ import Foundation
 import Observation
 import UserNotifications
 
+/** The app's one daemon connection. connect() short-circuits on a live fd and
+    reconnects on error, so every polling loop (the 2s status refresh, the log
+    and timeline panes) holds this instead of paying a full socket
+    create/connect/hello handshake per tick. */
+enum AppDaemon {
+    nonisolated static let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+}
+
 /** How the popover orders its project groups. Persisted in UserDefaults so the
     choice survives relaunches. */
 enum ProjectSortOrder: String, CaseIterable, Identifiable {
@@ -247,7 +255,7 @@ final class DaemonModel {
     }
 
     func refresh() async {
-        let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+        let client = AppDaemon.client
         do {
             let all = try await client.request(
                 .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self)
@@ -374,7 +382,7 @@ final class DaemonModel {
     func startServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+            let client = AppDaemon.client
             _ = try? await client.request(
                 .serverEnsure,
                 params: EnsureParams(name: server.server, project: server.project, timeoutSeconds: 60),
@@ -386,7 +394,7 @@ final class DaemonModel {
     func stopServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+            let client = AppDaemon.client
             _ = try? await client.request(
                 .serverStop,
                 params: ServerTargetParams(name: server.server, project: server.project),
@@ -398,7 +406,7 @@ final class DaemonModel {
     func restartServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+            let client = AppDaemon.client
             /** One request rather than a stop followed by an ensure: the pair
                 leaves the server down if the ensure is refused, and lets another
                 session's ensure land in between. */

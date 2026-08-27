@@ -268,6 +268,37 @@ import Testing
 
     /** Discarding a worktree path stops its children and forgets registry/state
         without touching the main checkout. */
+    /** The timer sweep needs the path missing on two consecutive passes before
+        it tears a project down (one flaky stat must never be irreversible), and
+        on the second pass the children are stopped and the registration is
+        forgotten exactly like the machine-wide prune. */
+    @Test func missingProjectSweepPrunesAfterTwoConsecutiveMisses() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let started = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        #expect(started.server.phase == .running)
+        let pid = try #require(started.server.pid)
+        let projectKey = started.server.project
+
+        try FileManager.default.removeItem(atPath: env.worktree)
+
+        /** First miss: held. Nothing is torn down on one flaky stat. */
+        #expect(await router.sweepMissingProjects() == 0)
+        #expect(await registry.project(projectKey) != nil)
+        #expect(kill(pid_t(pid), 0) == 0)
+
+        /** Second miss: torn down, children stopped, state forgotten. */
+        #expect(await router.sweepMissingProjects() == 1)
+        #expect(await registry.project(projectKey) == nil)
+        #expect(kill(pid_t(pid), 0) != 0)
+        #expect(!PortGuard.isListening(port: try #require(started.server.effectivePort)))
+    }
+
     @Test func discardedWorktreeIsPrunedOnMachineWideStatus() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)

@@ -8,7 +8,7 @@ Success: the command's result object on stdout. Failure with `--json`: `{"ok": f
 
 Stable `error.code` values: `already-exists`, `config-invalid`, `daemon-starting`, `daemon-unreachable`, `internal-error`, `not-found`, `not-trusted`, `port-drift`, `port-held`, `resource-locked`, `resource-mutated`, `spawn-failed`, `usage`, `version-mismatch`. (Grows append-only.)
 
-Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 3 daemon unreachable · 4 named server not found. Unnamed `status` in an unconfigured project exits 0 with `{"servers": []}`.
+Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 3 daemon unreachable · 4 named server not found. Unnamed `status` in an unconfigured project exits 0 with `{"servers": []}`. `--project` must name an existing directory; a project name is refused `usage` (exit 2) rather than answered as an empty project.
 
 ## ServerStatus (the core schema)
 

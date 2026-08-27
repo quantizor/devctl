@@ -87,7 +87,7 @@ enum AppDeepLinkDispatch {
     }
 
     private static func execute(_ link: DeepLink) async {
-        let client = DaemonClient(socketPath: DevCtlPaths().socketPath)
+        let client = AppDaemon.client
         do {
             try await client.connect()
             let result = try await DeepLinkRunner(client: client, effects: AppDeepLinkEffects()).run(link)
