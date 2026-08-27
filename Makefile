@@ -5,12 +5,22 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test app dmg release-dmg install clean
+.PHONY: build test sweep-test-temp app dmg release-dmg install clean
 
 build:
 	swift build -c release
 
-test:
+# The unit suites create their fixture project trees under the user temp dir
+# (devctl-sup-*, devctl-wt-*, devctl-cfg-*, …) and never delete them: a run
+# killed part way has no one to clean up after it. This sweeps anything older
+# than a day, so a second `make test` running concurrently is untouched and a
+# just-finished run's own dirs are not yanked from under a still-attached
+# debugger. Best-effort by design (macOS system dirs are unreadable and make
+# find exit 1), so a failed sweep never fails a test run.
+sweep-test-temp:
+	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -depth 1 -name 'devctl-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+
+test: sweep-test-temp
 	swift test
 
 app: build
