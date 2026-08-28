@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.5.0
+### Minor Changes
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`be1705a`](https://github.com/quantizor/devctl/commit/be1705a9ce9d6d7f26bcc277d238373a4622ed92) - Servers in a linked git worktree keep the project's declared host instead of getting an ephemeral `worktree-<label>.<preferred>.localhost` origin. Every `*.localhost` name resolves to loopback, so the label never disambiguated a bind, while the third-level subdomain broke any auth config an app pins to one origin (an OAuth callback, a cookie domain, a CORS allow list, a trusted-origins check). Sibling worktrees of one repo are still told apart: the shared committed port auto-rebinds as before, and the worktree name surfaces as a display value (`worktree` and `mainProject` on status JSON, a `worktree: <label>` line in `devctl status` human output and in `config check`, and a banner line in session context). The menu bar app and Spotlight show a worktree server under its project family (`myproj · review`), so searching for the project name still finds it.
+
+
+### Patch Changes
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`557bc3c`](https://github.com/quantizor/devctl/commit/557bc3c1ec0590a3bcd017a9904dd06218d134a5) - Antigravity sessions now rediscover running servers the way Claude Code and Cursor already do. `devctl hook install --harness antigravity` (also offered at first run and in Settings when `~/.gemini` is present) wires a PreInvocation hook so a new session sees live `devctl` status instead of spawning duplicates. `devctl hook uninstall --harness antigravity` removes it.
+
+
+
+- [`ef2adc7`](https://github.com/quantizor/devctl/commit/ef2adc76f3e7a8d270bbad3b3899c0978950440b) - `devctl doctor` now catches a second devctl copy shadowing your Homebrew install, the failure where `brew upgrade` changes one copy while a bare `devctl` (or the background daemon) keeps running an older one. It reports when a manual `~/.local/bin` install coexists with the Homebrew cask (whichever `~/.local/bin` or brew's bin comes first on your PATH is what actually runs), and when an `/Applications/devctl.app` that Homebrew did not place is still present. Each finding names the exact cleanup command. Like doctor's other environment findings, it only reports, and only fires when a Homebrew install is present, so a plain `make install` is never flagged.
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`69232b8`](https://github.com/quantizor/devctl/commit/69232b8e845a3a65eb9f4e6c70f1527e68c88bef) - Grok Build is a supported agent harness. `devctl hook install --harness grok` (also offered at first run and in Settings when `~/.grok` is present) wires a session hook and a short home rule that tells Grok to run `devctl context` before touching a server, so a new session does not spawn duplicates. `devctl hook uninstall --harness grok` removes both.
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`b170109`](https://github.com/quantizor/devctl/commit/b170109999d2b52039469ed4f7552d6dc8cde77b) - A server whose start command waits on an interactive credential prompt (a secrets CLI unlock, a biometric approval) can no longer crash-loop invisibly. When runs repeatedly exit on their own, nonzero, after tens of seconds, without ever passing a healthcheck, status surfaces `blockedOn: "interactive-auth"` with the remedy in human status, `devctl why`, and the session-context block: start the server once in a terminal to surface the prompt, then `devctl ensure`. The classification is a heuristic in devctl's own words and clears the first time a run dies differently or a healthcheck passes.
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`3f8a7c2`](https://github.com/quantizor/devctl/commit/3f8a7c28a6d07fcc8b3606de69e998477c335af8) - Servers under a discarded checkout now stop on their own within about a minute of the checkout disappearing, instead of waiting for a reboot or a machine-wide `devctl status --all`. The daemon stats every registered project every 30 seconds and prunes a path only after it is missing on two consecutive sweeps, so one flaky stat (a network mount blip, a slow Finder move) never tears down a live project.
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`8409259`](https://github.com/quantizor/devctl/commit/84092598c2f0e5fe91d0215e75436dec12f532ed) - OpenCode is a supported agent harness. `devctl hook install --harness opencode` (also offered at first run and in Settings when `~/.config/opencode` is present) writes a managed `~/.config/opencode/devctl.md` that tells OpenCode to run `devctl context` before touching a server, wired through the `instructions` array of the winning global config file, so a new session discovers the servers without spawning duplicates. OpenCode has no session-start hook to inject live context into, so the standing instruction is the integration; instruction files already referenced by a losing `opencode.json` stay active after the entry lands in `opencode.jsonc`. `devctl hook uninstall --harness opencode` removes both halves.
+
+
+
+- [#25](https://github.com/quantizor/devctl/pull/25) [`3f8a7c2`](https://github.com/quantizor/devctl/commit/3f8a7c28a6d07fcc8b3606de69e998477c335af8) - `--project` now refuses anything that is not an existing directory (exit 2, `usage`). Passing a project's NAME instead of its path used to resolve to a nonexistent relative directory and answer an empty scoped view: `devctl down --project myproj` reported success against a phantom project while the real server kept running.
+
 ## 1.4.1
 ### Patch Changes
 
