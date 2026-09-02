@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.2
+### Patch Changes
+
+
+
+- [#28](https://github.com/quantizor/devctl/pull/28) [`3e19c23`](https://github.com/quantizor/devctl/commit/3e19c2382a45b43ded510a228eb079d8b8c3dfe4) - A memory-hungry dev server no longer takes the background daemon down with it. Under the menu bar agent, each server now runs as its own launchd job, so macOS can reclaim that server's memory without killing every other server the daemon is supervising.
+
 ## 1.5.1
 ### Patch Changes
 
