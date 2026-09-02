@@ -82,6 +82,23 @@ public struct DevCtlPaths: Sendable {
 
     public var eventsFile: URL { dataDir.appending(path: "events.log") }
 
+    /** Caches, preferences, and saved state outside the data/logs trees.
+        `--purge` removes these along with `dataDir` and `logsDir`. */
+    public static func userLibraryResidue(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let library = home.appending(path: "Library")
+        return [
+            library.appending(path: "Caches/dev.quantizor.devctl.app"),
+            library.appending(path: "Caches/dev.quantizor.devctld"),
+            library.appending(path: "Caches/devctld"),
+            library.appending(path: "HTTPStorages/dev.quantizor.devctld"),
+            library.appending(path: "HTTPStorages/devctld"),
+            library.appending(path: "Preferences/dev.quantizor.devctl.app.plist"),
+            library.appending(path: "Saved Application State/dev.quantizor.devctl.app.savedState"),
+        ]
+    }
+
     /** Raw child-output spools, one per stream so out/err tagging survives; the
         child holds these fds, so they outlive the daemon. */
     public func spoolErrFile(project: String, server: String) -> URL {

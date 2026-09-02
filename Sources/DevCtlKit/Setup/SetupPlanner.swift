@@ -79,6 +79,17 @@ public enum SetupPlanner {
         defaultCLIDirectory(home: home).appending(path: cliBinaryName)
     }
 
+    /** Owner of `/Applications/devctl.app`, or nil when that copy is absent.
+        Full uninstall trashes a copy devctl itself installed and leaves a
+        Homebrew cask's bundle for brew to remove. */
+    public static func applicationsAppOwner(fileManager: FileManager = .default) -> CLIOwner? {
+        let url = URL(fileURLWithPath: applicationsAppPath)
+        guard fileManager.fileExists(atPath: url.path), let bundle = Bundle(url: url) else {
+            return nil
+        }
+        return cliOwner(bundle: bundle, fileManager: fileManager)
+    }
+
     public static func installedDaemonSiblingURL(
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {

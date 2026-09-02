@@ -20,7 +20,7 @@ Install with Homebrew:
 brew install --cask quantizor/tap/devctl
 ```
 
-The fully qualified `quantizor/tap/devctl` trusts only this cask. `brew upgrade` keeps it current, and the in-app footer offers a one-click upgrade when a new version ships. To remove it later: `devctl uninstall` (or `brew uninstall --cask --zap quantizor/tap/devctl`).
+The fully qualified `quantizor/tap/devctl` trusts only this cask. `brew upgrade` keeps it current, and the in-app footer offers a one-click upgrade when a new version ships. To remove it later: `devctl uninstall`, then `brew uninstall --cask --zap quantizor/tap/devctl` if Homebrew installed the app.
 
 Prefer a direct download? Grab the latest DMG from [GitHub Releases](https://github.com/quantizor/devctl/releases) and double-click `devctl` inside it. Either way nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Antigravity, Claude Code, Cursor, Grok Build, and OpenCode (checked by default when needed).
 

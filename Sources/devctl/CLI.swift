@@ -1624,14 +1624,15 @@ struct Doctor: AsyncParsableCommand {
 }
 
 /** The one uninstall verb. Stops nothing that is running: the daemon shuts down
-    and its children survive it. Removes the background agent, then agent hooks,
-    then the CLI/daemon binaries devctl itself installed, keeping data unless
-    `--purge`. `--agent-only` stops after the agent, which is what the Homebrew
-    cask calls on every upgrade, so it must never touch hooks or user data. */
+    and its children survive it. Removes the background agent and Start at Login,
+    then agent hooks, then the CLI/daemon binaries devctl itself installed, and
+    a non-Homebrew `/Applications/devctl.app`. Data is kept unless `--purge`.
+    `--agent-only` stops after the agent, which is what the Homebrew cask calls
+    on every upgrade, so it must never touch hooks, login, or user data. */
 struct Uninstall: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract:
-            "Remove devctl: unregister the agent, remove hooks and the CLI (running servers keep going; data kept unless --purge).")
+            "Remove devctl: unregister the agent and Start at Login, remove hooks and the CLI (running servers keep going; data kept unless --purge).")
 
     @Flag(help: "Only unregister the background agent; leave hooks, CLI, and data in place.")
     var agentOnly = false
@@ -1651,11 +1652,12 @@ struct Uninstall: AsyncParsableCommand {
         let paths = DevCtlPaths()
         var actions: [String] = []
 
-        /** Agent + launchd job (and any legacy home plist) first. Data purge is
-            handled below, not here, so ordering stays explicit and data is the
-            last thing to go. */
-        await LaunchdAdmin.uninstall(paths: paths, purge: false)
+        /** Agent + launchd job (and any legacy home plist) first. Full uninstall
+            also drops Start at Login. Data purge is last so a failed earlier
+            step cannot leave launch items behind while erasing state. */
+        await LaunchdAdmin.uninstall(loginItem: !agentOnly, paths: paths, purge: false)
         actions.append("unregistered the background agent")
+        if !agentOnly { actions.append("unregistered Start at Login") }
 
         if !agentOnly {
             for adapter in harnessAdapters {
@@ -1670,12 +1672,25 @@ struct Uninstall: AsyncParsableCommand {
                 try? FileManager.default.removeItem(at: url)
                 actions.append("removed \(url.path)")
             }
+            /** Homebrew owns `/Applications/devctl.app`; a DMG/source install
+                does not, and leaving the bundle keeps Launch Services and BTM
+                pointing at a still-installed app. */
+            if let owner = SetupPlanner.applicationsAppOwner(), !owner.isHomebrew {
+                let app = LaunchdAdmin.applicationsAppURL
+                try? FileManager.default.trashItem(at: app, resultingItemURL: nil)
+                if !FileManager.default.fileExists(atPath: app.path) {
+                    actions.append("moved \(SetupPlanner.applicationsAppPath) to the Trash")
+                }
+            }
         }
 
         if purge && !agentOnly {
             try? FileManager.default.removeItem(at: paths.dataDir)
             try? FileManager.default.removeItem(at: paths.logsDir)
-            actions.append("removed data and logs")
+            for url in DevCtlPaths.userLibraryResidue() {
+                try? FileManager.default.removeItem(at: url)
+            }
+            actions.append("removed data, logs, preferences, and caches")
         }
 
         let result = UninstallResult(actions: actions, agentOnly: agentOnly, purged: purge && !agentOnly)

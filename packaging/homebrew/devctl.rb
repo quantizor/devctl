@@ -55,6 +55,10 @@ cask "devctl" do
   zap trash: [
     "~/Library/Application Support/devctl",
     "~/Library/Caches/dev.quantizor.devctl.app",
+    "~/Library/Caches/dev.quantizor.devctld",
+    "~/Library/Caches/devctld",
+    "~/Library/HTTPStorages/dev.quantizor.devctld",
+    "~/Library/HTTPStorages/devctld",
     "~/Library/LaunchAgents/dev.quantizor.devctl.plist",
     "~/Library/Logs/devctl",
     "~/Library/Preferences/dev.quantizor.devctl.app.plist",

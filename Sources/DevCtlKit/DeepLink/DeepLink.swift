@@ -9,6 +9,27 @@ public enum DeepLinkVerb: String, Sendable, Equatable, CaseIterable, Codable {
     case why
 }
 
+/** CLI-to-app control of SMAppService. Host is `daemon`, which is not a
+    DeepLinkVerb (those address a server). The CLI cannot call SMAppService
+    (wrong `Bundle.main`), so it opens these URLs and the app executes them. */
+public enum DaemonControlAction: String, Sendable, Equatable, CaseIterable {
+    case ensure
+    case unregister
+    case unregisterAll = "unregister-all"
+
+    static let host = "daemon"
+
+    public static func parse(url: URL) -> DaemonControlAction? {
+        guard url.scheme?.lowercased() == DeepLink.scheme,
+            url.host?.lowercased() == host
+        else { return nil }
+        let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        return DaemonControlAction(rawValue: action)
+    }
+
+    public var urlString: String { "\(DeepLink.scheme)://\(Self.host)/\(rawValue)" }
+}
+
 /** A parsed `devctl://` deep link. `head` is meaningful only for `open` (which
     surface of a multi-headed server to open); the parser rejects it on any other
     verb, so a `DeepLink` value is always internally consistent. */
@@ -178,7 +199,7 @@ public struct DeepLink: Sendable, Equatable, Codable {
 
     // MARK: - Internals
 
-    static let scheme = "devctl"
+    public static let scheme = "devctl"
 
     private static func validateSlug(_ slug: String) -> WireError? {
         if slug.isEmpty {
