@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.1
+### Patch Changes
+
+
+
+- [#26](https://github.com/quantizor/devctl/pull/26) [`13e293b`](https://github.com/quantizor/devctl/commit/13e293b11fce8ab22d938049621d6adaed6d3528) - Grok Build sessions receive a live server snapshot. `devctl hook install --harness grok` wires PreToolUse (the event Grok delivers into context, after the first tool of a turn) and UserPromptSubmit (the per-turn gate) alongside the existing home rule, and removes a leftover SessionStart or Stop registration of the same command. Re-run install to upgrade a SessionStart-only hook; `devctl doctor` reports the old install as missing.
+
+
+
+- [#26](https://github.com/quantizor/devctl/pull/26) [`13e293b`](https://github.com/quantizor/devctl/commit/13e293b11fce8ab22d938049621d6adaed6d3528) - A noisy dev server no longer drives the daemon's memory into the tens of gigabytes.
+
+
+
+- [#26](https://github.com/quantizor/devctl/pull/26) [`13e293b`](https://github.com/quantizor/devctl/commit/13e293b11fce8ab22d938049621d6adaed6d3528) - `devctl uninstall` now also removes Start at Login and the leftover background item in System Settings, so the app cannot launch itself after you remove it. A DMG-installed app is moved to the Trash; Homebrew's copy is left for brew to remove. `--purge` also deletes preferences and caches.
+
 ## 1.5.0
 ### Minor Changes
 
