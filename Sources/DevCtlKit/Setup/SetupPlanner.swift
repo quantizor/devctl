@@ -79,6 +79,17 @@ public enum SetupPlanner {
         defaultCLIDirectory(home: home).appending(path: cliBinaryName)
     }
 
+    /** Owner of `/Applications/devctl.app`, or nil when that copy is absent.
+        Full uninstall trashes a copy devctl itself installed and leaves a
+        Homebrew cask's bundle for brew to remove. */
+    public static func applicationsAppOwner(fileManager: FileManager = .default) -> CLIOwner? {
+        let url = URL(fileURLWithPath: applicationsAppPath)
+        guard fileManager.fileExists(atPath: url.path), let bundle = Bundle(url: url) else {
+            return nil
+        }
+        return cliOwner(bundle: bundle, fileManager: fileManager)
+    }
+
     public static func installedDaemonSiblingURL(
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {
@@ -436,19 +447,21 @@ enum HookPresence {
             let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let hooks = settings["hooks"] as? [String: Any]
         else { return false }
-        let expected = "\(expectedCLIPath) hook grok-session-start"
-        for (_, value) in hooks {
-            guard let groups = value as? [[String: Any]] else { continue }
-            for group in groups {
+        let expected = "\(expectedCLIPath)\(GrokWiring.commandSuffix)"
+        func present(_ event: String) -> Bool {
+            for group in (hooks[event] as? [[String: Any]]) ?? [] {
                 for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
                     let command = hook["command"] as? String ?? ""
-                    if command == expected || command.contains("devctl hook grok-session-start") {
+                    if command == expected || command.contains("devctl\(GrokWiring.commandSuffix)") {
                         return true
                     }
                 }
             }
+            return false
         }
-        return false
+        /** PreToolUse is the injection Grok delivers; UserPromptSubmit is the
+            per-turn gate. SessionStart-only is the old install and does not count. */
+        return GrokWiring.registeredEvents.allSatisfy { present($0) }
     }
 
     /** OpenCode's wiring is not a command in a hooks file: it is the managed
@@ -464,6 +477,13 @@ enum HookPresence {
         else { return false }
         return effective.entries.contains(entry)
     }
+}
+
+/** Events and command suffix the Grok adapter writes and the setup presence
+    check reads. One home so doctor and the setup panel cannot disagree. */
+public enum GrokWiring {
+    public static let commandSuffix = " hook grok-session-start"
+    public static let registeredEvents = ["PreToolUse", "UserPromptSubmit"]
 }
 
 /** The on-disk contract OpenCode's own config loader defines, the one home for

@@ -52,31 +52,29 @@ enum AppDeepLinkDispatch {
         }
     }
 
-    /** `devctl://daemon/ensure` and `devctl://daemon/unregister`: CLI asks the
+    /** `devctl://daemon/ensure`, `unregister`, and `unregister-all`: CLI asks the
         app to own SMAppService registration (correct Bundle.main). */
     private static func isDaemonControl(_ url: URL) -> Bool {
-        guard url.scheme?.lowercased() == "devctl",
-            url.host?.lowercased() == "daemon"
-        else { return false }
-        let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
-        return action == "ensure" || action == "unregister"
+        DaemonControlAction.parse(url: url) != nil
     }
 
     private static func executeDaemonControl(_ url: URL) async {
-        let action = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        guard let action = DaemonControlAction.parse(url: url) else { return }
         do {
             switch action {
-            case "ensure":
+            case .ensure:
                 try await AgentService.ensureRunning()
                 DevCtlLog.app.info("deeplink daemon/ensure ok")
-            case "unregister":
+            case .unregister:
                 try await AgentService.unregister()
                 DevCtlLog.app.info("deeplink daemon/unregister ok")
-            default:
-                break
+            case .unregisterAll:
+                try await AgentService.unregisterAllLaunchItems()
+                SpotlightIndexer.deleteAll()
+                DevCtlLog.app.info("deeplink daemon/unregister-all ok")
             }
         } catch {
-            DevCtlLog.app.error("deeplink daemon/\(action): \(error.localizedDescription)")
+            DevCtlLog.app.error("deeplink daemon/\(action.rawValue): \(error.localizedDescription)")
             await AppDeepLinkEffects().notify(
                 title: "devctl daemon control failed", body: error.localizedDescription)
         }

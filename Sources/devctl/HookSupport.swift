@@ -529,11 +529,113 @@ struct CursorAdapter: HarnessAdapter {
     }
 }
 
-/** SessionStart is the only Grok event this adapter emits for. Stop
-    additionalContext is injected as a user message and continues the turn. */
+/** GROK_HOOK_EVENT, parsed once at the process boundary. Settings JSON uses
+    PascalCase event names; the env value is snake_case. */
+enum GrokHookEvent: Equatable {
+    case leftover
+    case preToolUse
+    case unspecified
+    case userPromptSubmit
+
+    static func parse(_ raw: String?) -> GrokHookEvent {
+        switch raw?.lowercased() {
+        case "pre_tool_use": return .preToolUse
+        case "user_prompt_submit": return .userPromptSubmit
+        case nil: return .unspecified
+        default: return .leftover
+        }
+    }
+}
+
+/** What `devctl hook grok-session-start` does for one Grok event. Grok
+    delivers `additionalContext` from PreToolUse after the tool result, and
+    discards it on SessionStart and UserPromptSubmit. Stop additionalContext
+    continues the turn, so this adapter never emits there. UserPromptSubmit
+    still runs: it increments a per-session turn counter so PreToolUse can skip
+    later tools of the same turn (PreToolUse stdin omits promptId). SessionStart
+    is leftover and silent: Grok discards that stdout, and install removes the
+    registration. */
 enum GrokSessionHook {
-    static func emits(forGrokHookEvent event: String?) -> Bool {
-        event != "stop"
+    enum Action: Equatable {
+        case emitAndMark
+        case emitUnmarked
+        case silent
+        case silentPersist
+    }
+
+    /** Per-session turn gate, persisted under TMPDIR so the OS tmp reaper is
+        the expiry. `emittedThisTurn` starts false so a PreToolUse that beats
+        UserPromptSubmit still emits once. */
+    struct TurnState: Codable, Equatable, Sendable {
+        var emittedThisTurn: Bool
+        var turn: Int
+    }
+
+    static func action(for event: GrokHookEvent, state: inout TurnState) -> Action {
+        switch event {
+        case .leftover:
+            return .silent
+        case .preToolUse:
+            if state.emittedThisTurn { return .silent }
+            return .emitAndMark
+        case .unspecified:
+            return .emitUnmarked
+        case .userPromptSubmit:
+            state.turn += 1
+            state.emittedThisTurn = false
+            return .silentPersist
+        }
+    }
+
+    /** Record that this turn's PreToolUse already delivered. Called only after
+        stdout has been written, so a killed or empty render can still retry. */
+    static func markEmitted(_ state: inout TurnState) {
+        state.emittedThisTurn = true
+    }
+}
+
+/** On-disk half of `GrokSessionHook.TurnState`. Files are keyed by Grok's
+    session id; `DEVCTL_GROK_HOOK_STATE_DIR` relocates the directory for tests. */
+enum GrokTurnGate {
+    static let stateDirName = "devctl-grok-hook"
+
+    static func directory(environment: [String: String]) -> URL {
+        if let override = environment["DEVCTL_GROK_HOOK_STATE_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        let tmp = environment["TMPDIR"].flatMap { $0.isEmpty ? nil : $0 } ?? NSTemporaryDirectory()
+        return URL(fileURLWithPath: tmp).appending(path: stateDirName)
+    }
+
+    static func sessionId(in stdin: Data) -> String? {
+        guard let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
+            return nil
+        }
+        return (payload["sessionId"] as? String) ?? (payload["session_id"] as? String)
+    }
+
+    static let fallbackKey = "nosession"
+    static let maxKeyLength = 128
+
+    static func sessionKey(_ raw: String?) -> String {
+        let trimmed = (raw ?? "").replacing(/[^A-Za-z0-9._-]/) { _ in "" }
+        let sliced = String(trimmed.prefix(maxKeyLength))
+        if sliced.isEmpty || sliced == "." || sliced == ".." { return fallbackKey }
+        return sliced
+    }
+
+    static func load(sessionKey: String, directory: URL) -> GrokSessionHook.TurnState {
+        let url = directory.appending(path: sessionKey)
+        return AtomicFile.loadDefensively(GrokSessionHook.TurnState.self, from: url)
+            ?? GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
+    }
+
+    static func save(
+        _ state: GrokSessionHook.TurnState, sessionKey: String, directory: URL
+    ) {
+        let url = directory.appending(path: sessionKey)
+        guard let data = try? JSONCoding.encoder().encode(state) else { return }
+        try? AtomicFile.write(data, to: url)
     }
 }
 
@@ -558,20 +660,21 @@ enum HarnessStandingInstruction {
     }
 }
 
-/** Grok Build: SessionStart in ~/.grok/hooks/devctl.json, plus a managed
-    ~/.grok/rules/devctl.md.
+/** Grok Build: PreToolUse and UserPromptSubmit in ~/.grok/hooks/devctl.json,
+    plus a managed ~/.grok/rules/devctl.md.
 
-    Grok discards hook stdout on passive events (SessionStart included), so
-    additionalContext never reaches the model. Home rules under ~/.grok/rules
-    do, and they apply to every project, so the rule is the shared standing
-    instruction (HarnessStandingInstruction) rather than a live snapshot of one
-    project. The hook still emits the Claude-shaped JSON in case Grok starts
-    honoring it. No matcher: Grok's SessionStart source on a new session is
-    `new`, which would miss Claude's `startup|resume|clear|compact`. Do not
-    register Stop: Stop additionalContext is injected as a user message and
-    continues the turn. */
+    Grok discards hook stdout on SessionStart and UserPromptSubmit, and delivers
+    PreToolUse additionalContext after the tool result (once per user turn, gated
+    by the UPS turn mark because PreToolUse stdin omits promptId). Home rules
+    under ~/.grok/rules apply to every project, so the rule is the shared
+    standing instruction (HarnessStandingInstruction) rather than a live
+    snapshot: it covers the first tool of a turn and compaction, where
+    PreToolUse has not yet run. Install does not register SessionStart or Stop,
+    and removes this command from any event it does not register, so an older
+    SessionStart-only hook is torn down rather than left beside the new one. */
 struct GrokAdapter: HarnessAdapter {
     let name = "grok"
+    static let registeredEvents = GrokWiring.registeredEvents
     /** Overridable so tests can point at a scratch file; nil means the real
         `~/.grok/hooks/devctl.json`. */
     var settingsURLOverride: URL?
@@ -596,24 +699,13 @@ struct GrokAdapter: HarnessAdapter {
     }
 
     func install(devctlPath: String) throws -> String {
-        let command = "\(devctlPath) hook grok-session-start"
+        let command = "\(devctlPath)\(GrokWiring.commandSuffix)"
         var settings = try loadSettings()
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
-        let strippedStop = stripLeftoverStopHooks(hooks: &hooks)
+        let strippedLeftover = stripUnregisteredHooks(hooks: &hooks)
         let repaired = repairGrokHooks(hooks: &hooks, command: command)
-        var added = false
-        var groups = hooks["SessionStart"] as? [[String: Any]] ?? []
-        let alreadyInstalled = groups.contains { group in
-            ((group["hooks"] as? [[String: Any]]) ?? []).contains { hook in
-                (hook["command"] as? String) == command
-            }
-        }
-        if !alreadyInstalled {
-            groups.append(["hooks": [handler(command: command)]])
-            hooks["SessionStart"] = groups
-            added = true
-        }
-        if repaired != nil || added || strippedStop {
+        let added = ensureGrokEvents(hooks: &hooks, command: command)
+        if repaired != nil || added || strippedLeftover {
             settings["hooks"] = hooks
             try writeSettings(settings)
         }
@@ -622,12 +714,12 @@ struct GrokAdapter: HarnessAdapter {
             return repaired
         }
         if added {
-            return "Grok Build SessionStart hook installed in \(settingsURL.path)"
+            return "Grok Build hook installed in \(settingsURL.path)"
         }
-        if strippedStop {
-            return "Grok Build Stop hook removed from \(settingsURL.path)"
+        if strippedLeftover {
+            return "Grok Build leftover hook removed from \(settingsURL.path)"
         }
-        return "Grok Build SessionStart hook already installed (\(settingsURL.path))"
+        return "Grok Build hook already installed (\(settingsURL.path))"
     }
 
     func uninstall() throws -> String {
@@ -635,27 +727,7 @@ struct GrokAdapter: HarnessAdapter {
         guard var hooks = settings["hooks"] as? [String: Any] else {
             return "Grok Build hook not present (\(settingsURL.path))"
         }
-        var removed = false
-        for event in Array(hooks.keys) {
-            guard var groups = hooks[event] as? [[String: Any]] else { continue }
-            groups = groups.compactMap { group in
-                guard var entryHooks = group["hooks"] as? [[String: Any]] else { return group }
-                let before = entryHooks.count
-                entryHooks.removeAll { hook in
-                    ((hook["command"] as? String) ?? "").contains("devctl hook grok-session-start")
-                }
-                if entryHooks.count != before { removed = true }
-                if entryHooks.isEmpty { return nil }
-                var updated = group
-                updated["hooks"] = entryHooks
-                return updated
-            }
-            if groups.isEmpty {
-                hooks.removeValue(forKey: event)
-            } else {
-                hooks[event] = groups
-            }
-        }
+        let removed = removeDevctlHandlers(from: &hooks, events: Array(hooks.keys))
         guard removed else {
             return "Grok Build hook not present (\(settingsURL.path))"
         }
@@ -675,27 +747,56 @@ struct GrokAdapter: HarnessAdapter {
 
     func hookState() -> HarnessHookState {
         guard harnessPresent else { return .harnessAbsent }
-        let suffix = " hook grok-session-start"
+        let suffix = GrokWiring.commandSuffix
         guard let settings = try? loadSettings(),
             let hooks = settings["hooks"] as? [String: Any]
         else { return .notInstalled }
-        for (_, value) in hooks {
-            for group in (value as? [[String: Any]]) ?? [] {
-                for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
-                    if let command = hook["command"] as? String,
-                        let path = recordedPath(from: command, suffix: suffix)
-                    {
-                        return .installed(
-                            path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
-                    }
+        var path: String?
+        for event in Self.registeredEvents {
+            guard let groups = hooks[event] as? [[String: Any]],
+                let found = recordedGrokPath(in: groups, suffix: suffix)
+            else { return .notInstalled }
+            if path == nil { path = found }
+        }
+        guard let path else { return .notInstalled }
+        return .installed(
+            path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+    }
+
+    private static let handlerTimeoutSeconds = 10
+
+    private func handler(command: String) -> [String: Any] {
+        ["command": command, "timeout": Self.handlerTimeoutSeconds, "type": "command"]
+    }
+
+    private func ensureGrokEvents(hooks: inout [String: Any], command: String) -> Bool {
+        var added = false
+        for event in Self.registeredEvents {
+            var groups = hooks[event] as? [[String: Any]] ?? []
+            let present = groups.contains { group in
+                ((group["hooks"] as? [[String: Any]]) ?? []).contains { hook in
+                    (hook["command"] as? String) == command
+                }
+            }
+            if present { continue }
+            groups.append(["hooks": [handler(command: command)]])
+            hooks[event] = groups
+            added = true
+        }
+        return added
+    }
+
+    private func recordedGrokPath(in groups: [[String: Any]], suffix: String) -> String? {
+        for group in groups {
+            for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
+                if let command = hook["command"] as? String,
+                    let path = recordedPath(from: command, suffix: suffix)
+                {
+                    return path
                 }
             }
         }
-        return .notInstalled
-    }
-
-    private func handler(command: String) -> [String: Any] {
-        ["command": command, "timeout": 10, "type": "command"]
+        return nil
     }
 
     private func repairGrokHooks(hooks: inout [String: Any], command: String) -> String? {
@@ -706,7 +807,7 @@ struct GrokAdapter: HarnessAdapter {
                 guard var entryHooks = groups[i]["hooks"] as? [[String: Any]] else { continue }
                 for j in entryHooks.indices {
                     guard let existing = entryHooks[j]["command"] as? String,
-                        existing.contains("devctl hook grok-session-start"),
+                        existing.contains("devctl\(GrokWiring.commandSuffix)"),
                         existing != command
                     else { continue }
                     entryHooks[j]["command"] = command
@@ -719,31 +820,40 @@ struct GrokAdapter: HarnessAdapter {
         return changed ? "Grok Build hook path repaired in \(settingsURL.path)" : nil
     }
 
-    /** Drop a leftover Stop registration of this command. Stop additionalContext
-        continues the turn, so install never writes Stop and heals one that is
-        already there. Foreign Stop hooks stay. */
-    private func stripLeftoverStopHooks(hooks: inout [String: Any]) -> Bool {
-        guard var groups = hooks["Stop"] as? [[String: Any]] else { return false }
+    /** Drop this command from every event it does not register. SessionStart
+        stdout is discarded and Stop additionalContext continues the turn, so
+        neither is written, and an older install that still has one is healed.
+        Foreign handlers in those events stay. Runs before repair so a leftover
+        SessionStart with a stale path is deleted rather than rewritten. */
+    private func stripUnregisteredHooks(hooks: inout [String: Any]) -> Bool {
+        let leftover = Array(hooks.keys).filter { !Set(Self.registeredEvents).contains($0) }
+        return removeDevctlHandlers(from: &hooks, events: leftover)
+    }
+
+    private func removeDevctlHandlers(from hooks: inout [String: Any], events: [String]) -> Bool {
         var removed = false
-        groups = groups.compactMap { group in
-            guard var entryHooks = group["hooks"] as? [[String: Any]] else { return group }
-            let before = entryHooks.count
-            entryHooks.removeAll { hook in
-                ((hook["command"] as? String) ?? "").contains("devctl hook grok-session-start")
+        let needle = "devctl\(GrokWiring.commandSuffix)"
+        for event in events {
+            guard var groups = hooks[event] as? [[String: Any]] else { continue }
+            groups = groups.compactMap { group in
+                guard var entryHooks = group["hooks"] as? [[String: Any]] else { return group }
+                let before = entryHooks.count
+                entryHooks.removeAll { hook in
+                    ((hook["command"] as? String) ?? "").contains(needle)
+                }
+                if entryHooks.count != before { removed = true }
+                if entryHooks.isEmpty { return nil }
+                var updated = group
+                updated["hooks"] = entryHooks
+                return updated
             }
-            if entryHooks.count != before { removed = true }
-            if entryHooks.isEmpty { return nil }
-            var updated = group
-            updated["hooks"] = entryHooks
-            return updated
+            if groups.isEmpty {
+                hooks.removeValue(forKey: event)
+            } else {
+                hooks[event] = groups
+            }
         }
-        guard removed else { return false }
-        if groups.isEmpty {
-            hooks.removeValue(forKey: "Stop")
-        } else {
-            hooks["Stop"] = groups
-        }
-        return true
+        return removed
     }
 }
 

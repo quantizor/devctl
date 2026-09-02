@@ -114,6 +114,21 @@ enum AgentService {
         DevCtlLog.app.info("agent unregistered on request")
     }
 
+    /** Drop Start at Login. Idempotent when it was never on. */
+    nonisolated static func unregisterLoginItem() {
+        let item = SMAppService.mainApp
+        guard item.status != .notRegistered else { return }
+        try? item.unregister()
+        DevCtlLog.app.info("Start at Login unregistered on request")
+    }
+
+    /** Agent plus Start at Login. Full uninstall uses this; `--agent-only` does
+        not, so a Homebrew upgrade keeps the user's login preference. */
+    nonisolated static func unregisterAllLaunchItems(paths: DevCtlPaths = DevCtlPaths()) async throws {
+        try await unregister(paths: paths)
+        unregisterLoginItem()
+    }
+
     /** Deep-link / recovery entry: register, then wait until the socket answers.
         `Failure.needsApproval` short-circuits the wait, since no amount of
         polling starts a job the user has not switched on.

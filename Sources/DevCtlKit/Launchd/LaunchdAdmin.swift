@@ -29,21 +29,29 @@ public enum LaunchdAdmin {
         same bundle id does not steal the URL. */
     @discardableResult
     public static func requestAppAgentEnsure() -> (status: Int32, output: String) {
-        if applicationsAppPresent() {
-            return shell(
-                "/usr/bin/open", ["-a", applicationsAppURL.path, "devctl://daemon/ensure"])
-        }
-        return shell("/usr/bin/open", ["devctl://daemon/ensure"])
+        openDaemonControl(.ensure)
     }
 
     /** Ask the menu bar app to unregister the SMAppService agent. */
     @discardableResult
     public static func requestAppAgentUnregister() -> (status: Int32, output: String) {
+        openDaemonControl(.unregister)
+    }
+
+    /** Ask the menu bar app to drop the agent and Start at Login. */
+    @discardableResult
+    public static func requestAppLaunchItemsUnregister() -> (status: Int32, output: String) {
+        openDaemonControl(.unregisterAll)
+    }
+
+    @discardableResult
+    private static func openDaemonControl(_ action: DaemonControlAction) -> (
+        status: Int32, output: String
+    ) {
         if applicationsAppPresent() {
-            return shell(
-                "/usr/bin/open", ["-a", applicationsAppURL.path, "devctl://daemon/unregister"])
+            return shell("/usr/bin/open", ["-a", applicationsAppURL.path, action.urlString])
         }
-        return shell("/usr/bin/open", ["devctl://daemon/unregister"])
+        return shell("/usr/bin/open", [action.urlString])
     }
 
     /** True when launchd currently has our agent in the gui domain. */
@@ -277,13 +285,20 @@ public enum LaunchdAdmin {
         return runningServers
     }
 
-    public static func uninstall(paths: DevCtlPaths, purge: Bool) async {
+    /** Tear down launchd + SMAppService. `loginItem` also drops Start at Login;
+        `--agent-only` (cask upgrade) leaves that preference alone. Waits for
+        launchd to drop the agent instead of a fixed sleep, then boots out and
+        removes any leftover home plist. */
+    public static func uninstall(loginItem: Bool = false, paths: DevCtlPaths, purge: Bool) async {
         let client = DaemonClient(socketPath: paths.socketPath)
         _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
         if applicationsAppPresent() {
-            _ = requestAppAgentUnregister()
-            /** Brief wait so the app can finish SMAppService.unregister. */
-            try? await Task.sleep(for: .milliseconds(800))
+            if loginItem {
+                _ = requestAppLaunchItemsUnregister()
+            } else {
+                _ = requestAppAgentUnregister()
+            }
+            _ = await waitUntilAgentUnloaded()
         }
         _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
         try? FileManager.default.removeItem(at: plistURL)

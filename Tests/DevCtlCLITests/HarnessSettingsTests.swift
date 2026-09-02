@@ -304,11 +304,15 @@ import Testing
             let afterInstall = try adapter.loadSettings()
             #expect(afterInstall["keep"] as? Bool == true)
             let hooks = afterInstall["hooks"] as? [String: Any]
-            let sessionStart = hooks?["SessionStart"] as? [[String: Any]]
-            #expect(sessionStart?.count == 1)
-            #expect(sessionStart?.first?["matcher"] == nil)
-            let handlers = sessionStart?.first?["hooks"] as? [[String: Any]]
-            #expect(handlers?.first?["timeout"] as? Int == 10)
+            for event in GrokAdapter.registeredEvents {
+                let groups = hooks?[event] as? [[String: Any]]
+                #expect(groups?.count == 1)
+                #expect(groups?.first?["matcher"] == nil)
+                let handlers = groups?.first?["hooks"] as? [[String: Any]]
+                #expect(handlers?.first?["timeout"] as? Int == 10)
+                #expect((handlers?.first?["command"] as? String)?.hasSuffix(" hook grok-session-start") == true)
+            }
+            #expect(hooks?["SessionStart"] == nil)
             #expect(hooks?["SessionEnd"] == nil)
             #expect(hooks?["PostCompact"] == nil)
             #expect(hooks?["Stop"] == nil)
@@ -381,18 +385,13 @@ import Testing
             try FileManager.default.createDirectory(
                 at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
             let adapter = GrokAdapter(settingsURLOverride: settings)
+            let oldHandler: [String: Any] = [
+                "command": "/old/path/devctl hook grok-session-start", "type": "command",
+            ]
             try adapter.writeSettings([
                 "hooks": [
-                    "SessionStart": [
-                        [
-                            "hooks": [
-                                [
-                                    "command": "/old/path/devctl hook grok-session-start",
-                                    "type": "command",
-                                ]
-                            ]
-                        ]
-                    ]
+                    "PreToolUse": [["hooks": [oldHandler]]],
+                    "UserPromptSubmit": [["hooks": [oldHandler]]],
                 ]
             ])
             let newPath = dir.appending(path: "bin/devctl").path
@@ -403,6 +402,8 @@ import Testing
             } else {
                 Issue.record("expected the repaired hook to read as installed")
             }
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            #expect(hooks?["SessionStart"] == nil)
         }
     }
 
@@ -432,7 +433,33 @@ import Testing
         }
     }
 
-    @Test func grokInstallIsIdempotentWhenSessionStartAlreadyMatches() throws {
+    @Test func grokInstallIsIdempotentWhenRegisteredEventsAlreadyMatch() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            let handler: [String: Any] = [
+                "command": "\(devctlPath) hook grok-session-start", "type": "command",
+            ]
+            var events: [String: Any] = [:]
+            for event in GrokAdapter.registeredEvents {
+                events[event] = [["hooks": [handler]]]
+            }
+            try adapter.writeSettings(["hooks": events])
+            let summary = try adapter.install(devctlPath: devctlPath)
+            #expect(summary.contains("already installed"))
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            for event in GrokAdapter.registeredEvents {
+                #expect((hooks?[event] as? [[String: Any]])?.count == 1)
+            }
+            #expect(hooks?["Stop"] == nil)
+            #expect(FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+        }
+    }
+
+    @Test func grokInstallUpgradesASessionStartOnlyHook() throws {
         try inScratchDir { dir in
             let settings = dir.appending(path: "hooks/devctl.json")
             try FileManager.default.createDirectory(
@@ -450,19 +477,141 @@ import Testing
                     ]
                 ]
             ])
+            #expect(adapter.hookState() == .notInstalled)
             let summary = try adapter.install(devctlPath: devctlPath)
-            #expect(summary.contains("already installed"))
+            #expect(summary.contains("installed"))
+            #expect(!summary.contains("already"))
+            if case .installed(let path, _) = adapter.hookState() {
+                #expect(path == devctlPath)
+            } else {
+                Issue.record("expected the upgraded hook to read as installed")
+            }
             let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
-            #expect((hooks?["SessionStart"] as? [[String: Any]])?.count == 1)
-            #expect(hooks?["Stop"] == nil)
-            #expect(FileManager.default.fileExists(atPath: adapter.rulesURL.path))
+            for event in GrokAdapter.registeredEvents {
+                let commands =
+                    ((hooks?[event] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?
+                    .compactMap { $0["command"] as? String } ?? []
+                #expect(commands.contains("\(devctlPath) hook grok-session-start"))
+            }
+            #expect(hooks?["SessionStart"] == nil)
         }
     }
 
-    @Test func grokSessionHookDoesNotEmitOnStop() {
-        #expect(GrokSessionHook.emits(forGrokHookEvent: "stop") == false)
-        #expect(GrokSessionHook.emits(forGrokHookEvent: "session_start") == true)
-        #expect(GrokSessionHook.emits(forGrokHookEvent: nil) == true)
+    @Test func grokHookStateRequiresBothPreToolUseAndUserPromptSubmit() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let command = "\(dir.appending(path: "bin/devctl").path) hook grok-session-start"
+            let group: [[String: Any]] = [["hooks": [["command": command, "type": "command"]]]]
+            try adapter.writeSettings(["hooks": ["PreToolUse": group]])
+            #expect(adapter.hookState() == .notInstalled)
+            try adapter.writeSettings(["hooks": ["UserPromptSubmit": group]])
+            #expect(adapter.hookState() == .notInstalled)
+            try adapter.writeSettings(["hooks": ["PreToolUse": group, "UserPromptSubmit": group]])
+            if case .installed = adapter.hookState() {
+            } else {
+                Issue.record("expected both events to read as installed")
+            }
+        }
+    }
+
+    @Test func grokHookEventParse() {
+        #expect(GrokHookEvent.parse("pre_tool_use") == .preToolUse)
+        #expect(GrokHookEvent.parse("PRE_TOOL_USE") == .preToolUse)
+        #expect(GrokHookEvent.parse("user_prompt_submit") == .userPromptSubmit)
+        #expect(GrokHookEvent.parse(nil) == .unspecified)
+        #expect(GrokHookEvent.parse("session_start") == .leftover)
+        #expect(GrokHookEvent.parse("stop") == .leftover)
+        #expect(GrokHookEvent.parse("post_tool_use") == .leftover)
+    }
+
+    @Test func grokSessionHookActionMatrix() {
+        var state = GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
+        #expect(GrokSessionHook.action(for: .leftover, state: &state) == .silent)
+        #expect(state.turn == 0)
+        #expect(GrokSessionHook.action(for: .unspecified, state: &state) == .emitUnmarked)
+        #expect(state.emittedThisTurn == false)
+
+        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
+        #expect(state.emittedThisTurn == false)
+        GrokSessionHook.markEmitted(&state)
+        #expect(state.emittedThisTurn == true)
+        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
+
+        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
+        #expect(state.turn == 1)
+        #expect(state.emittedThisTurn == false)
+        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
+        GrokSessionHook.markEmitted(&state)
+        #expect(state.emittedThisTurn == true)
+        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
+
+        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
+        #expect(state.turn == 2)
+        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
+        GrokSessionHook.markEmitted(&state)
+        #expect(state.emittedThisTurn == true)
+    }
+
+    @Test func grokTurnGateSessionKeySanitizes() {
+        #expect(GrokTurnGate.sessionKey(nil) == GrokTurnGate.fallbackKey)
+        #expect(GrokTurnGate.sessionKey("") == GrokTurnGate.fallbackKey)
+        #expect(GrokTurnGate.sessionKey("ok-id_1.2") == "ok-id_1.2")
+        #expect(GrokTurnGate.sessionKey(".") == GrokTurnGate.fallbackKey)
+        #expect(GrokTurnGate.sessionKey("..") == GrokTurnGate.fallbackKey)
+        #expect(!GrokTurnGate.sessionKey("../../etc/passwd").contains("/"))
+        let long = String(repeating: "a", count: 200)
+        #expect(GrokTurnGate.sessionKey(long).count == GrokTurnGate.maxKeyLength)
+    }
+
+    @Test func grokTurnGateReadsSessionIdFromStdin() {
+        #expect(GrokTurnGate.sessionId(in: Data(#"{"sessionId":"abc"}"#.utf8)) == "abc")
+        #expect(GrokTurnGate.sessionId(in: Data(#"{"session_id":"def"}"#.utf8)) == "def")
+        #expect(GrokTurnGate.sessionId(in: Data("{}".utf8)) == nil)
+    }
+
+    @Test func grokTurnGateRoundTripsState() throws {
+        try inScratchDir { dir in
+            let stateDir = dir.appending(path: "state")
+            let original = GrokSessionHook.TurnState(emittedThisTurn: true, turn: 3)
+            GrokTurnGate.save(original, sessionKey: "sess1", directory: stateDir)
+            #expect(GrokTurnGate.load(sessionKey: "sess1", directory: stateDir) == original)
+            let missing = GrokTurnGate.load(sessionKey: "other", directory: stateDir)
+            #expect(missing == GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0))
+        }
+    }
+
+    /** The CLI persist protocol: UPS save is immediate; PreToolUse marks only
+        after a successful emit. Dropping either save would make the next
+        PreToolUse of the same turn emit again. */
+    @Test func grokTurnGateDiskProtocolSkipsASecondPreToolUseOfTheSameTurn() throws {
+        try inScratchDir { dir in
+            let stateDir = dir.appending(path: "state")
+            let key = "sess-disk"
+            var state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
+            #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
+            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
+
+            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
+            #expect(state.turn == 1)
+            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
+            GrokSessionHook.markEmitted(&state)
+            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
+
+            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
+            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
+        }
+    }
+
+    @Test func grokTurnGateDirectoryHonorsOverride() {
+        let override = "/tmp/devctl-grok-test-dir"
+        #expect(
+            GrokTurnGate.directory(environment: ["DEVCTL_GROK_HOOK_STATE_DIR": override]).path
+                == override)
+        let fromTmp = GrokTurnGate.directory(environment: ["TMPDIR": "/tmp/custom-tmp"])
+        #expect(fromTmp.lastPathComponent == GrokTurnGate.stateDirName)
     }
 
     @Test func grokInstallStripsALeftoverStopHook() throws {
@@ -492,13 +641,74 @@ import Testing
                 ]
             ])
             let summary = try adapter.install(devctlPath: devctlPath)
-            #expect(summary.contains("Stop hook removed"))
+            #expect(summary.contains("installed"))
             let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
-            #expect((hooks?["SessionStart"] as? [[String: Any]])?.count == 1)
+            for event in GrokAdapter.registeredEvents {
+                #expect((hooks?[event] as? [[String: Any]])?.count == 1)
+            }
+            #expect(hooks?["SessionStart"] == nil)
             let stopCommands =
                 ((hooks?["Stop"] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?
                 .compactMap { $0["command"] as? String } ?? []
             #expect(stopCommands == ["/other/tool run"])
+        }
+    }
+
+    @Test func grokInstallStripsALeftoverStopHookWhenAlreadyInstalled() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            let handler: [String: Any] = [
+                "command": "\(devctlPath) hook grok-session-start", "type": "command",
+            ]
+            var events: [String: Any] = [
+                "Stop": [
+                    [
+                        "hooks": [
+                            ["command": "\(devctlPath) hook grok-session-start", "type": "command"]
+                        ]
+                    ]
+                ]
+            ]
+            for event in GrokAdapter.registeredEvents {
+                events[event] = [["hooks": [handler]]]
+            }
+            try adapter.writeSettings(["hooks": events])
+            let summary = try adapter.install(devctlPath: devctlPath)
+            #expect(summary.contains("leftover hook removed"))
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            #expect(hooks?["Stop"] == nil)
+            #expect(hooks?["SessionStart"] == nil)
+        }
+    }
+
+    @Test func grokInstallStripsLeftoverSessionStartWhenAlreadyInstalled() throws {
+        try inScratchDir { dir in
+            let settings = dir.appending(path: "hooks/devctl.json")
+            try FileManager.default.createDirectory(
+                at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let adapter = GrokAdapter(settingsURLOverride: settings)
+            let devctlPath = dir.appending(path: "bin/devctl").path
+            let handler: [String: Any] = [
+                "command": "\(devctlPath) hook grok-session-start", "type": "command",
+            ]
+            var events: [String: Any] = [
+                "SessionStart": [["hooks": [handler]]]
+            ]
+            for event in GrokAdapter.registeredEvents {
+                events[event] = [["hooks": [handler]]]
+            }
+            try adapter.writeSettings(["hooks": events])
+            let summary = try adapter.install(devctlPath: devctlPath)
+            #expect(summary.contains("leftover hook removed"))
+            let hooks = try adapter.loadSettings()["hooks"] as? [String: Any]
+            #expect(hooks?["SessionStart"] == nil)
+            for event in GrokAdapter.registeredEvents {
+                #expect((hooks?[event] as? [[String: Any]])?.count == 1)
+            }
         }
     }
 

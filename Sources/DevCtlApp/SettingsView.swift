@@ -141,7 +141,7 @@ struct SettingsView: View {
                 .controlSize(.small)
             } else {
                 Text(
-                    "Removes the background agent, agent hooks, and the CLI, then moves this app to the Trash. Running servers keep going; your data is kept."
+                    "Removes the background agent, Start at Login, agent hooks, and the CLI, then moves this app to the Trash. Running servers keep going; your data is kept."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -157,7 +157,7 @@ struct SettingsView: View {
                     Button("Cancel", role: .cancel) {}
                 } message: {
                     Text(
-                        "This removes the agent, hooks, and CLI and moves devctl.app to the Trash. Your data is kept unless you remove it by hand."
+                        "This removes the agent, Start at Login, hooks, and CLI and moves devctl.app to the Trash. Your data is kept unless you remove it by hand."
                     )
                 }
             }
@@ -208,9 +208,10 @@ struct SettingsView: View {
         }
     }
 
-    /** Non-Homebrew uninstall: shell the CLI to remove the agent, hooks, and the
-        `~/.local/bin` binaries, then move this bundle to the Trash and quit. A
-        running bundle can be trashed because the process holds the inode. */
+    /** Non-Homebrew uninstall: drop launch items in-process (this is already
+        the hosting app), then shell the CLI for hooks and binaries, then move
+        this bundle to the Trash and quit. A running bundle can be trashed
+        because the process holds the inode. */
     private func performLocalUninstall() {
         guard let cli = SetupPerformer.resourceURLs()?.cli else {
             hookError = "This copy of devctl.app is missing its bundled CLI."
@@ -218,6 +219,7 @@ struct SettingsView: View {
         }
         Task { @MainActor in
             _ = await Task.detached(priority: .userInitiated) {
+                try? await AgentService.unregisterAllLaunchItems()
                 LaunchdAdmin.shell(cli.path, ["uninstall"])
             }.value
             try? FileManager.default.trashItem(

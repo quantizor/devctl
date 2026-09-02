@@ -138,6 +138,15 @@ enum SpotlightIndexer {
         }
     }
 
+    /** Drop every donated item and the local engagement cache. Full uninstall
+        calls this so Spotlight does not keep serving removed servers. */
+    static func deleteAll() {
+        index.deleteAllSearchableItems { _ in }
+        UserDefaults.standard.removeObject(forKey: entriesKey)
+        UserDefaults.standard.removeObject(forKey: signatureKey)
+        UserDefaults.standard.removeObject(forKey: statusKey)
+    }
+
     static func noteOpened(identifier: String) {
         var map = loadEntries()
         guard var entry = map[identifier] else { return }

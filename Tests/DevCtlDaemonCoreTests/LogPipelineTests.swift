@@ -51,6 +51,55 @@ private func tempDir() throws -> URL {
     }
 }
 
+@Suite struct SpoolLineSplitTests {
+    @Test func splitsLinesAndKeepsIncompleteTail() {
+        let pulled = SpoolLineSplit.pull(
+            from: Data("one\ntwo\nthree".utf8), maxPartialBytes: 16 * 1024)
+        #expect(pulled.lines.map { String(decoding: $0, as: UTF8.self) } == ["one", "two"])
+        #expect(String(decoding: pulled.remainder, as: UTF8.self) == "three")
+    }
+
+    @Test func skipsEmptyLines() {
+        let pulled = SpoolLineSplit.pull(from: Data("a\n\nb\n".utf8), maxPartialBytes: 16)
+        #expect(pulled.lines.map { String(decoding: $0, as: UTF8.self) } == ["a", "b"])
+        #expect(pulled.remainder.isEmpty)
+    }
+
+    @Test func segmentsANewlineLessTailPastTheCap() {
+        let pulled = SpoolLineSplit.pull(
+            from: Data(repeating: 0x61, count: 10), maxPartialBytes: 4)
+        #expect(pulled.lines.map(\.count) == [4, 4])
+        #expect(pulled.remainder.count == 2)
+        #expect(pulled.remainder == Data(repeating: 0x61, count: 2))
+    }
+
+    @Test func aTailAtTheCapStaysUnflushed() {
+        let pulled = SpoolLineSplit.pull(
+            from: Data(repeating: 0x61, count: 4), maxPartialBytes: 4)
+        #expect(pulled.lines.isEmpty)
+        #expect(pulled.remainder.count == 4)
+    }
+
+    @Test func pullDoesNotCopyTheUnreadTailOncePerLine() {
+        /** 50k short lines is enough that a per-line `removeSubrange` from the
+            front of `Data` spends seconds memmoving the remainder; an index
+            walk finishes immediately. */
+        var buffer = Data()
+        buffer.reserveCapacity(50_000 * 8)
+        for index in 0..<50_000 {
+            buffer.append(contentsOf: "l\(index)\n".utf8)
+        }
+        let started = ContinuousClock.now
+        let pulled = SpoolLineSplit.pull(from: buffer, maxPartialBytes: 16 * 1024)
+        let elapsed = ContinuousClock.now - started
+        #expect(pulled.lines.count == 50_000)
+        #expect(String(decoding: pulled.lines[0], as: UTF8.self) == "l0")
+        #expect(String(decoding: pulled.lines[49_999], as: UTF8.self) == "l49999")
+        #expect(pulled.remainder.isEmpty)
+        #expect(elapsed < Duration.seconds(1))
+    }
+}
+
 @Suite struct SpoolTailerTests {
     @Test func tailsIncrementallyAndSanitizes() async throws {
         let dir = try tempDir()
@@ -72,6 +121,113 @@ private func tempDir() throws -> URL {
         #expect(texts.contains("done"))
         #expect(texts.contains("green"))
         #expect(texts.contains { $0.hasSuffix("tail") })
+    }
+
+    @Test func assemblesALineTornAcrossReadChunks() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("hello world\nnext\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, readChunkBytes: 8, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts == ["hello world", "next"])
+    }
+
+    @Test func truncationResetsTheCursorWithoutReplaying() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("first line\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        /** Shorter than the prior offset, which is the truncation signal. */
+        try Data("new\n".utf8).write(to: spool)
+        await tailer.start()
+        await tailer.stop()
+        let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts == ["first line", "new"])
+    }
+
+    @Test func stopFlushesAPartialLine() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("no newline".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts == ["no newline"])
+    }
+
+    @Test func aBurstOfShortLinesIsIngestedInFull() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        var payload = Data()
+        payload.reserveCapacity(4_000 * 12)
+        for index in 0..<4_000 {
+            payload.append(contentsOf: "line \(index)\n".utf8)
+        }
+        try payload.write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 0, readChunkBytes: 64, store: store, stream: .out,
+            url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let records = await store.query(LogQueryOptions(streams: [.out]))
+        #expect(records.count == 4_000)
+        #expect(records.first?.text == "line 0")
+        #expect(records.last?.text == "line 3999")
+    }
+
+    @Test func aNewlineLessBlobIsFlushedInSegments() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data(repeating: 0x61, count: 40 * 1024).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 0, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts.map(\.count) == [16 * 1024, 16 * 1024, 8 * 1024])
+        #expect(texts.allSatisfy { $0.allSatisfy { $0 == "a" } })
+    }
+
+    @Test func catchUpSkipKeepsTheRecentTail() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        var payload = Data()
+        for index in 0..<20 {
+            payload.append(contentsOf: "line-\(index)\n".utf8)
+        }
+        try payload.write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        /** 30 bytes of tail: enough for the last few lines, not the head. */
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 30, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let out = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        let sys = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
+        #expect(out.contains("line-19"))
+        #expect(!out.contains("line-0"))
+        #expect(sys.contains { $0.hasPrefix("spool catch-up skipped ") })
+    }
+
+    @Test func fileHandleReadUpToCountHonorsTheLimit() throws {
+        let dir = try tempDir()
+        let url = dir.appending(path: "blob")
+        try Data(repeating: 0x61, count: 1000).write(to: url)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let chunk = try handle.read(upToCount: 64)
+        #expect(chunk?.count == 64)
     }
 }
 

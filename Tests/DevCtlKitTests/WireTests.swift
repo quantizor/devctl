@@ -230,6 +230,19 @@ import Testing
         #expect(DevCtlPaths.hash8("/a").count == 8)
     }
 
+    @Test func userLibraryResidueCoversCachesPrefsAndSavedState() {
+        let paths = DevCtlPaths.userLibraryResidue(home: URL(fileURLWithPath: "/Users/x")).map(\.path)
+        #expect(paths.contains("/Users/x/Library/Caches/dev.quantizor.devctl.app"))
+        #expect(paths.contains("/Users/x/Library/Caches/dev.quantizor.devctld"))
+        #expect(paths.contains("/Users/x/Library/Caches/devctld"))
+        #expect(paths.contains("/Users/x/Library/HTTPStorages/dev.quantizor.devctld"))
+        #expect(paths.contains("/Users/x/Library/HTTPStorages/devctld"))
+        #expect(paths.contains("/Users/x/Library/Preferences/dev.quantizor.devctl.app.plist"))
+        #expect(
+            paths.contains(
+                "/Users/x/Library/Saved Application State/dev.quantizor.devctl.app.savedState"))
+    }
+
     @Test func atomicWriteAndDefensiveLoad() throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: "devctl-test-\(UUID().uuidString)")
         let file = dir.appending(path: "state.json")

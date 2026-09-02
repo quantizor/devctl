@@ -48,6 +48,28 @@ import Testing
     }
 }
 
+@Suite struct DaemonControlActionTests {
+    @Test func parsesEnsureUnregisterAndUnregisterAll() {
+        #expect(DaemonControlAction.parse(url: URL(string: "devctl://daemon/ensure")!) == .ensure)
+        #expect(
+            DaemonControlAction.parse(url: URL(string: "devctl://daemon/unregister")!) == .unregister)
+        #expect(
+            DaemonControlAction.parse(url: URL(string: "devctl://daemon/unregister-all")!)
+                == .unregisterAll)
+    }
+
+    @Test func rejectsAServerDeepLink() {
+        #expect(DaemonControlAction.parse(url: URL(string: "devctl://open/proj/web")!) == nil)
+    }
+
+    @Test func urlStringRoundTrips() {
+        for action in DaemonControlAction.allCases {
+            let parsed = DaemonControlAction.parse(url: URL(string: action.urlString)!)
+            #expect(parsed == action)
+        }
+    }
+}
+
 @Suite struct DeepLinkRejectTests {
     private func expectUsage(_ string: String) {
         switch DeepLink.parse(string) {

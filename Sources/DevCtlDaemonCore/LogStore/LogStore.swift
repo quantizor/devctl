@@ -35,6 +35,13 @@ public actor LogStore {
         return record
     }
 
+    /** One actor hop for a burst so a flood does not pay a hop per line. */
+    public func append(stream: LogStream, texts: [String], at date: Date = Date()) {
+        for text in texts {
+            _ = append(stream: stream, text: text, at: date)
+        }
+    }
+
     /** A correlation marker; payload = `<id>\t<label>\t<text>` so queries can
         resolve `--since-mark` and attribute the mark to its requester. */
     public func appendMark(label: String, text: String) -> PlacedMark {
