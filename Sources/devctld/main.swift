@@ -148,7 +148,9 @@ do {
 }
 
 let registry = Registry(paths: paths)
-let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
+let launcher: any ProcessLauncher =
+    LaunchdJobLauncher.runningAsAgent ? LaunchdJobLauncher() : SubprocessLauncher()
+let router = Router(launcher: launcher, paths: paths, registry: registry)
 
 /** Sleep/wake awareness: health probes pause during sleep and get a grace
     window on wake so lid-open does not flap every server unhealthy. IOKit

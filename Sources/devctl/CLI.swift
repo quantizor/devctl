@@ -1496,6 +1496,21 @@ struct Doctor: AsyncParsableCommand {
                 findings.append(
                     Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
             }
+            if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),
+                let daemonJetsam = CoalitionIDs.read(of: daemonPid)?.jetsam
+            {
+                for server in all.servers {
+                    guard let rawPid = server.pid, let childPid = pid_t(exactly: rawPid),
+                        let childJetsam = CoalitionIDs.read(of: childPid)?.jetsam,
+                        childJetsam == daemonJetsam
+                    else { continue }
+                    findings.append(
+                        Finding(
+                            detail:
+                                "\(server.server) in \(server.project) shares the daemon's jetsam coalition (pid \(childPid)); under memory pressure macOS may kill the daemon instead of this server",
+                            kind: "jetsam-coalition", severity: "warning"))
+                }
+            }
             for server in all.servers {
                 if !FileManager.default.fileExists(atPath: server.project) {
                     staleProjects.insert(server.project)

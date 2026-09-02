@@ -10,21 +10,36 @@ public enum ProcessOutcome: Sendable {
     case spawnFailed(SpawnError)
 }
 
+/** Spool destinations for a spawn. SubprocessLauncher dups stdoutFD/stderrFD;
+    LaunchdJobLauncher reopens stdoutPath/stderrPath (it cannot inherit the
+    daemon's fds). */
+public struct SpawnCapture: Sendable {
+    public let stderrFD: Int32
+    public let stderrPath: String
+    public let stdoutFD: Int32
+    public let stdoutPath: String
+
+    public init(stderrFD: Int32, stderrPath: String, stdoutFD: Int32, stdoutPath: String) {
+        self.stderrFD = stderrFD
+        self.stderrPath = stderrPath
+        self.stdoutFD = stdoutFD
+        self.stdoutPath = stdoutPath
+    }
+}
+
 /** Seam isolating swift-subprocess (pre-1.0) from the supervisor. The fallback
     implementation, if the API churns, is ~200 lines of posix_spawn +
     POSIX_SPAWN_SETSID + kqueue EVFILT_PROC; the protocol is shaped so that swap
     stays invisible to callers. */
 public protocol ProcessLauncher: Sendable {
-    /** Spawns `argv` in a fresh session with stdout and stderr duped onto their
-        spool fds (separate files keep the stream tags honest). Reports the pid
-        via `onSpawn` as soon as it exists, then returns only when the process
-        has terminated. The fds are the child's; the caller keeps its copies. */
+    /** Spawns `argv` in a fresh session with stdout and stderr on the spool
+        capture. Reports the pid via `onSpawn` as soon as it exists, then returns
+        only when the process has terminated. */
     func run(
         argv: [String],
+        capture: SpawnCapture,
         cwd: String?,
         environment: [String: String],
-        stdoutFD: Int32,
-        stderrFD: Int32,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome
 }
@@ -34,10 +49,9 @@ public struct SubprocessLauncher: ProcessLauncher {
 
     public func run(
         argv: [String],
+        capture: SpawnCapture,
         cwd: String?,
         environment: [String: String],
-        stdoutFD: Int32,
-        stderrFD: Int32,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
         guard let first = argv.first, !first.isEmpty else {
@@ -50,8 +64,8 @@ public struct SubprocessLauncher: ProcessLauncher {
         /** New session ⇒ new process group whose pgid == child pid, which is what
             group-directed SIGTERM/SIGKILL teardown relies on. */
         options.createSession = true
-        let outFD = FileDescriptor(rawValue: stdoutFD)
-        let errFD = FileDescriptor(rawValue: stderrFD)
+        let outFD = FileDescriptor(rawValue: capture.stdoutFD)
+        let errFD = FileDescriptor(rawValue: capture.stderrFD)
         do {
             let result = try await Subprocess.run(
                 executable,

@@ -288,10 +288,11 @@ public actor ServerSupervisor {
         runTask = Task { [launcher] in
             let outcome = await launcher.run(
                 argv: argv,
+                capture: SpawnCapture(
+                    stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD,
+                    stdoutPath: outURL.path),
                 cwd: cwd,
                 environment: environment,
-                stdoutFD: outFD,
-                stderrFD: errFD,
                 onSpawn: { [weak self] childPid in
                     await self?.recordSpawn(pid: childPid, id: id)
                 }

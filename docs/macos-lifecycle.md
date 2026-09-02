@@ -6,6 +6,20 @@ Hard-won platform behavior behind devctl's process teardown, launchd supervision
 
 - swift-subprocess `createSession = true` gives the child a fresh session, so `pgid == pid`. Group-directed teardown relies on this.
 
+## Jetsam coalitions
+
+posix_spawn inherits the parent's resource and jetsam coalitions. xnu's default is explicit: "Default is to inherit parent's coalition(s)." `POSIX_SPAWN_SETSID` / `createSession` is a session, not a coalition. Session-leader children of `devctld` still sit in the SMAppService agent's jetsam coalition.
+
+SMAppService agents (and user LaunchAgents on macOS 26) get `jetsamproperties category = daemon`, jetsam priority 40, thread limit 32. KeepAlive respawns the job into the same coalition id. memorystatus attributes the coalition's compressed footprint to the focal process and can kill it as `largest compressed process` while higher-priority members (prio 180 posix_spawn children) survive. Observed 2026-09-02: `devctld` pid 6616 then 23242, kernel log `memorystatus: killing largest compressed process devctld [23242] 174020 MB`, children bounced as orphans.
+
+Third-party spawn cannot pick a different coalition. `posix_spawnattr_setcoalition_np` is `EPERM` without `com.apple.private.coalition-spawn`. `coalition(COALITION_OP_CREATE)` is `EPERM`. `responsibility_spawnattrs_setdisclaim` (dlsym, pointer ABI, macOS 10.14+) starts a new TCC responsibility chain and does not change jetsam or resource coalition ids (ProcessTreeTests.disclaimDoesNotSplitJetsamCoalition).
+
+The one userland spawn that does create a new jetsam coalition is launchd itself: `launchctl bootstrap` of a `KeepAlive=false` job in `gui/<uid>` yields a new coalition, `ppid=1`, `pgid=pid`. `launchctl submit` also splits, but implies KeepAlive, so a crashed server would be restarted by launchd beside the daemon's phase machine. A bootstrap'd job still gets daemon-category jetsam (prio 40, thread limit 32); `ProcessType=Interactive` on the child does not raise the band, so the child plist omits it. The split is the point (the agent is no longer billed).
+
+`LaunchdJobLauncher` is that path: used only when `XPC_SERVICE_NAME` is the agent label. `devctld --foreground` and the unit suites keep posix_spawn. Spool paths come from the supervisor's spool URLs on `SpawnCapture` (`StandardOutPath` / `StandardErrorPath`); launchd opens those paths itself. The supervisor still waits on process death (kqueue `NOTE_EXIT`, because waitpid cannot reap a non-child) and still tears down with the three-source union; bootout unregisters the job after exit. `devctl doctor` warns when a live server still shares the daemon's jetsam coalition.
+
+Readout: `CoalitionIDs.read(of:)` via `proc_pidinfo` flavor 20 (`PROC_PIDCOALITIONINFO`, omitted from the public SDK).
+
 ## launchd
 
 For the launchd phase:
