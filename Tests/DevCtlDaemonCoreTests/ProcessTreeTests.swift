@@ -1,4 +1,5 @@
 import Darwin
+import DevCtlKit
 import Foundation
 import Testing
 
@@ -143,5 +144,68 @@ import Testing
         #expect(none.identities.isEmpty)
         #expect(fail.identities.isEmpty)
         #expect(none != fail)
+    }
+
+    @Test func coalitionIDsOfSelfAreReadable() throws {
+        let ids = try #require(CoalitionIDs.read(of: getpid()))
+        #expect(ids.jetsam != 0)
+        #expect(ids.resource != 0)
+    }
+
+    /** posix_spawn inherits the parent's jetsam and resource coalitions.
+        `POSIX_SPAWN_SETSID` makes a session leader and does not break that
+        inheritance: the 2026-09-02 jetsam of `devctld` was this fact, not a
+        missing setsid. */
+    @Test func posixSpawnInheritsJetsamCoalition() throws {
+        let parent = try #require(CoalitionIDs.read(of: getpid()))
+        let child = try spawnSleep(disclaim: false)
+        defer { reap(child) }
+        let ids = try #require(CoalitionIDs.read(of: child))
+        #expect(ids.jetsam == parent.jetsam)
+        #expect(ids.resource == parent.resource)
+        #expect(getpgid(child) == child)
+    }
+
+    /** `responsibility_spawnattrs_setdisclaim` is the cheap Darwin SPI Chromium
+        and LLDB use for a new TCC responsibility chain. On macOS 26.6 it does
+        not create a new jetsam coalition (probe 2026-09-02). If this assertion
+        flips, the cheap `preSpawnProcessConfigurator` path is back. */
+    @Test func disclaimDoesNotSplitJetsamCoalition() throws {
+        let parent = try #require(CoalitionIDs.read(of: getpid()))
+        let child = try spawnSleep(disclaim: true)
+        defer { reap(child) }
+        let ids = try #require(CoalitionIDs.read(of: child))
+        #expect(ids.jetsam == parent.jetsam)
+        #expect(ids.resource == parent.resource)
+    }
+
+    private func spawnSleep(disclaim: Bool) throws -> pid_t {
+        var attributes = posix_spawnattr_t(bitPattern: 0)
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        #expect(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID)) == 0)
+        if disclaim {
+            typealias DisclaimFn =
+                @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
+            let symbol = dlsym(
+                UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim")
+            let ptr = try #require(symbol)
+            let fn = unsafeBitCast(ptr, to: DisclaimFn.self)
+            let rc = fn(&attributes, 1)
+            try #require(rc == 0, "disclaim returned \(rc)")
+        }
+        var child: pid_t = 0
+        let argv: [String] = ["/bin/sleep", "8"]
+        var cArgs = argv.map { strdup($0) } + [nil]
+        defer { for arg in cArgs where arg != nil { free(arg) } }
+        let spawned = posix_spawn(&child, "/bin/sleep", nil, &attributes, &cArgs, environ)
+        try #require(spawned == 0, "posix_spawn failed: \(spawned)")
+        return child
+    }
+
+    private func reap(_ pid: pid_t) {
+        kill(pid, SIGKILL)
+        var status: Int32 = 0
+        waitpid(pid, &status, 0)
     }
 }
