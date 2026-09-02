@@ -278,6 +278,184 @@ import Testing
         _ = await supervisor.stop(graceSeconds: 2)
     }
 
+    @Test func extrasAreKeptAndAreNotDrift() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let primary = 45020
+        let extra = 45021
+        let registry = Registry(paths: env.paths)
+        let spec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(primary), "--listen-tcp", String(extra)],
+            name: "web", port: primary)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let settled = await settle(supervisor) {
+            ($0.phase == .running && ($0.observedPorts?.contains(extra) ?? false))
+                || $0.phase == .failed
+        }
+        #expect(settled.phase == .running)
+        #expect(settled.portConflict == nil)
+        #expect(settled.observedPort == primary)
+        #expect(settled.observedPorts == [primary, extra])
+        #expect(settled.extraPorts == [extra])
+        #expect(settled.holds(extra))
+        _ = await supervisor.stop(graceSeconds: 2)
+        let stopped = await supervisor.status()
+        #expect(stopped.observedPort == nil)
+        #expect(stopped.observedPorts == [primary, extra])
+        let id = serverID(project: env.projectA, name: "web")
+        #expect(await registry.persistedState(serverID: id)?.observedPorts == [primary, extra])
+    }
+
+    @Test func anExtraPortIsAManagedHold() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let primary = 45022
+        let extra = 45023
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.projectA,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(primary), "--listen-tcp", String(extra)],
+                name: "web", port: primary))
+        try await registry.register(
+            project: env.projectB, spec: sleeperSpec(name: "web", port: extra))
+        try await registry.setTrusted(project: env.projectB)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.projectA),
+            ServerResult.self)
+        var status = ServerStatus(logPath: "", phase: .stopped, project: env.projectA, server: "web")
+        for _ in 0..<60 {
+            if case .success(let list) = await handle(
+                router, .serverStatus, ProjectParams(project: env.projectA), ServerListResult.self),
+                let server = list.servers.first,
+                server.observedPorts?.contains(extra) == true
+            {
+                status = server
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(status.observedPorts?.contains(extra) == true)
+        let refused = await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.projectB, timeoutSeconds: 3),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected the extra port to be held")
+            await teardown(router, env.projectA, "web")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(error.message.contains(String(extra)))
+        #expect(error.message.contains("managed server"))
+        #expect(error.message.contains(env.projectA))
+        await teardown(router, env.projectA, "web")
+    }
+
+    @Test func lockResumeRefusesWhileAnExtraPortStaysBusy() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let primary = 45024
+        let extra = 45025
+        try Data(
+            """
+            {
+              "servers": {
+                "web": {
+                  "command": ["\(fixture)", "--listen-tcp", "\(primary)", "--listen-tcp", "\(extra)"],
+                  "locks": ["data"],
+                  "port": \(primary)
+                }
+              },
+              "version": 1
+            }
+            """.utf8
+        ).write(to: URL(fileURLWithPath: env.projectA).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectA)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.projectA),
+            ServerResult.self)
+        for _ in 0..<60 {
+            if case .success(let list) = await handle(
+                router, .serverStatus, ProjectParams(project: env.projectA), ServerListResult.self),
+                list.servers.first?.observedPorts?.contains(extra) == true
+            {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        let acquired = await handle(
+            router, .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), project: env.projectA, resource: "data",
+                resumeTimeoutSeconds: 8),
+            LockResult.self)
+        guard case .success = acquired else {
+            Issue.record("expected lock acquire to pause the server")
+            await teardown(router, env.projectA, "web")
+            return
+        }
+        for _ in 0..<40 where LoopbackProbe.isListening(port: extra) {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        /** After pause, occupy the extra port so resume must wait on last listen. */
+        let leftover = Process()
+        leftover.executableURL = URL(fileURLWithPath: fixture)
+        leftover.arguments = ["--listen-tcp", String(extra)]
+        leftover.standardOutput = FileHandle.nullDevice
+        leftover.standardError = FileHandle.nullDevice
+        try leftover.run()
+        defer { leftover.terminate() }
+        var bound = false
+        for _ in 0..<40 {
+            if LoopbackProbe.isListening(port: extra) {
+                bound = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(bound)
+        _ = await handle(
+            router, .lockRelease,
+            LockParams(
+                holderPid: Int(getpid()), project: env.projectA, resource: "data",
+                resumeTimeoutSeconds: 8),
+            LockResult.self)
+        if case .success(let list) = await handle(
+            router, .serverStatus, ProjectParams(project: env.projectA), ServerListResult.self),
+            let server = list.servers.first
+        {
+            #expect(server.phase == .stopped)
+        } else {
+            Issue.record("expected status after a refused resume")
+        }
+        _ = await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.projectA),
+            ServerResult.self)
+    }
+
+    @Test func anOlderStateFileWithoutObservedPortsStillLoads() throws {
+        let data = Data(#"{"phase":"stopped"}"#.utf8)
+        let state = try JSONCoding.decoder().decode(PersistedServerState.self, from: data)
+        #expect(state.observedPorts == nil)
+        #expect(state.phase == .stopped)
+    }
+
     /** ATTACK: the server's own listener lives outside its process tree. A
         container-backed server (docker compose) is the common shape: the
         listening socket belongs to the runtime, never to our children. Modelled

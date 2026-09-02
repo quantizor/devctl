@@ -344,6 +344,9 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         Spotlight and the menu bar. */
     public var mainProject: String?
     public var observedPort: Int?
+    /** Full listen set from the last scan, including the primary. Extras are
+        listen minus the claim; they are not drift. */
+    public var observedPorts: [Int]?
     public var phase: ServerPhase
     public var pid: Int?
     public var portConflict: PortConflict?
@@ -378,6 +381,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         logPath: String,
         mainProject: String? = nil,
         observedPort: Int? = nil,
+        observedPorts: [Int]? = nil,
         phase: ServerPhase,
         pid: Int? = nil,
         portConflict: PortConflict? = nil,
@@ -405,6 +409,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.logPath = logPath
         self.mainProject = mainProject
         self.observedPort = observedPort
+        self.observedPorts = observedPorts
         self.phase = phase
         self.pid = pid
         self.portConflict = portConflict
@@ -422,22 +427,40 @@ public struct ServerStatus: Codable, Equatable, Sendable {
 }
 
 extension ServerStatus {
-    /** The one port to show a human, from the three the status carries.
+    /** The one port to show a human: observedPort (derived from the listen set),
+        then effectivePort, then declaredPort.
 
-        Observed first because it is the only one measured rather than intended:
-        it is scraped from what the child actually bound. The supervisor sets it
-        to the expected port whenever the child binds where it was told, so this
-        differs from the effective port only under drift, which `portConflict`
-        reports separately.
-
-        Effective before declared is the part that was getting lost. A server
-        that auto-rebound off a sibling collision has an effective port that its
-        declared port disagrees with, and showing the declared one sends the
-        reader to a port where nothing is listening. Three call sites spelled
-        this precedence three different ways and two of them dropped the
-        effective port, so the menu bar and the statusline disagreed with the
-        agent context about where the same server was. */
+        Observed first because it is the only one measured rather than intended.
+        A later hop can move it off the effective port without a new drift
+        conflict. Effective before declared is the part that was getting lost: a
+        server that auto-rebound off a sibling collision has an effective port
+        that its declared port disagrees with, and showing the declared one
+        sends the reader to a port where nothing is listening. */
     public var displayPort: Int? { observedPort ?? effectivePort ?? declaredPort }
+
+    /** Listen ports outside declaredPort, effectivePort, and named ports.
+        Empty when the server is not live, there is no scan, or every listen is
+        one of those. portSpan is not stored on status, so a listening span
+        member appears here; holds still counts it through observedPorts. */
+    public var extraPorts: [Int] {
+        switch phase {
+        case .running, .starting, .unhealthy:
+            return (observedPorts ?? []).filter { !claimPorts.contains($0) }
+        case .crashed, .failed, .stopped, .stopping:
+            return []
+        }
+    }
+
+    /** Claim (declared, effective, named secondaries) or listen set. */
+    public func holds(_ port: Int) -> Bool {
+        claimPorts.contains(port) || (observedPorts?.contains(port) ?? false)
+    }
+
+    private var claimPorts: Set<Int> {
+        var claimed = Set([declaredPort, effectivePort].compactMap { $0 })
+        if let ports { claimed.formUnion(ports.values) }
+        return claimed
+    }
 }
 
 /** The unified event feed: lifecycle transitions, health changes, and marks as

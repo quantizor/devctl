@@ -39,6 +39,8 @@ public struct PersistedServerState: Codable, Sendable {
         Optional so state files written before this field existed keep parsing. */
     public var errorSummary: ErrorSummary?
     public var lastExit: LastExit?
+    /** Last listen scan, including extras. Optional so older state files parse. */
+    public var observedPorts: [Int]?
     public var phase: ServerPhase
     public var pid: Int?
     /** Intent to have this server up across a machine reboot. Set on every
@@ -61,6 +63,7 @@ public struct PersistedServerState: Codable, Sendable {
         boundPort: Int? = nil,
         errorSummary: ErrorSummary? = nil,
         lastExit: LastExit? = nil,
+        observedPorts: [Int]? = nil,
         phase: ServerPhase = .stopped,
         pid: Int? = nil,
         resumeOnBoot: Bool? = nil,
@@ -72,6 +75,7 @@ public struct PersistedServerState: Codable, Sendable {
         self.boundPort = boundPort
         self.errorSummary = errorSummary
         self.lastExit = lastExit
+        self.observedPorts = observedPorts
         self.phase = phase
         self.pid = pid
         self.resumeOnBoot = resumeOnBoot

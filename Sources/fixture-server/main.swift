@@ -1,7 +1,7 @@
 import Foundation
 
 /** fixture-server: the test double for a real dev server. Modes compose:
-    --listen-tcp PORT      accept TCP connections (healthcheck target)
+    --listen-tcp PORT      accept TCP connections (healthcheck target); repeatable
     --exit-after SECONDS   terminate itself after a delay
     --code N               exit code to use with --exit-after
     --spawn-grandchild     spawn a `sleep 1000` child (group-kill verification).
@@ -31,7 +31,7 @@ import Foundation
     --touch-file PATH      rewrite PATH every 300ms (self-write loop fixture)
     Default behavior: print a heartbeat line every 200ms. */
 
-var listenPort: UInt16?
+var listenPorts: [UInt16] = []
 var exitAfter: Double?
 var exitCode: Int32 = 0
 var spawnGrandchild = false
@@ -49,7 +49,11 @@ var argIterator = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = argIterator.next() {
     switch arg {
     case "--listen-tcp":
-        listenPort = argIterator.next().flatMap { UInt16($0) }
+        if let port = argIterator.next().flatMap({ UInt16($0) }),
+            !listenPorts.contains(port)
+        {
+            listenPorts.append(port)
+        }
     case "--exit-after":
         exitAfter = argIterator.next().flatMap { Double($0) }
     case "--code":
@@ -157,7 +161,7 @@ for index in 0..<errLines {
     FileHandle.standardError.write(Data("FIXTURE-ERR-TOKEN line \(index)\n".utf8))
 }
 
-if let listenPort {
+for listenPort in listenPorts {
     let sock = socket(AF_INET, SOCK_STREAM, 0)
     var yes: Int32 = 1
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))

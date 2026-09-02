@@ -122,6 +122,33 @@ import Testing
         )
     }
 
+    @Test func statusSchemaGoldenWithObservedPorts() throws {
+        let status = ServerStatus(
+            declaredPort: 3000,
+            effectivePort: 3000,
+            healthcheck: .tcp,
+            logPath: "/logs/web/current.log",
+            observedPort: 3000,
+            observedPorts: [3000, 9229],
+            phase: .running,
+            project: "/tmp/proj",
+            server: "web"
+        )
+        let json = String(data: try JSONCoding.encoder().encode(status), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"declaredPort":3000,"effectivePort":3000,"healthcheck":"tcp","logPath":"/logs/web/current.log","observedPort":3000,"observedPorts":[3000,9229],"phase":"running","project":"/tmp/proj","server":"web"}"#
+        )
+        #expect(status.extraPorts == [9229])
+        #expect(status.holds(3000))
+        #expect(status.holds(9229))
+        #expect(!status.holds(80))
+        var named = status
+        named.ports = ["inspect": 9229]
+        #expect(named.extraPorts == [])
+        #expect(named.holds(9229))
+    }
+
     /** `daemon.info` is what every other command's hint points at, so its shape
         is a contract like any other and had no golden until it grew a field. A
         serving daemon encodes exactly what it always did: `restoring` is omitted

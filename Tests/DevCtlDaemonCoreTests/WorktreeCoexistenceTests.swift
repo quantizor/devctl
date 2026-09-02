@@ -105,6 +105,77 @@ import Testing
             ServerResult.self)
     }
 
+    /** An extra bind on the main checkout is a managed hold: the worktree
+        must rebind off it rather than treating it as free or as an unmanaged
+        squatter. */
+    @Test func siblingRebindSkipsAnExtraListenPort() async throws {
+        let env = try makeEnv()
+        let primary = 45111
+        let extra = 45112
+        try Data(
+            """
+            {
+              "host": "app.localhost",
+              "servers": {
+                "web": {
+                  "command": ["\(env.fixture)", "--listen-tcp", "\(primary)", "--listen-tcp", "\(extra)"],
+                  "port": \(primary)
+                }
+              },
+              "version": 1
+            }
+            """.utf8
+        ).write(to: URL(fileURLWithPath: env.main).appending(path: "devservers.json"))
+        try Data(
+            """
+            {
+              "host": "app.localhost",
+              "servers": {
+                "web": {
+                  "command": ["\(env.fixture)", "--listen-tcp", "{port}"],
+                  "port": \(extra)
+                }
+              },
+              "version": 1
+            }
+            """.utf8
+        ).write(to: URL(fileURLWithPath: env.worktree).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        _ = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        var sawExtra = false
+        for _ in 0..<60 {
+            let listed = try await handle(
+                router, .serverStatus, ProjectParams(project: env.main), ServerListResult.self)
+            if listed.servers.first?.observedPorts?.contains(extra) == true {
+                sawExtra = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(sawExtra)
+
+        let wtResult = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        #expect(wtResult.server.phase == .running)
+        #expect(wtResult.server.effectivePort != extra)
+        #expect(wtResult.server.effectivePort != primary)
+        #expect(wtResult.server.portConflict?.state == .rebound)
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
+            ServerResult.self)
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.main),
+            ServerResult.self)
+    }
+
     /** The label is computed at supervisor creation, not at spawn: a worktree
         project whose servers have never started in this daemon's lifetime (a
         stopped checkout after a daemon restart, a status-only query) still

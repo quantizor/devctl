@@ -1490,10 +1490,10 @@ struct Doctor: AsyncParsableCommand {
                         port, calling it unmanaged is simply wrong, and the
                         port-collision finding above already names both sides. */
                     let managedOwner = all.servers.first { other in
-                        (other.effectivePort ?? other.declaredPort) == port
-                            && !(other.project == server.project && other.server == server.server)
+                        !(other.project == server.project && other.server == server.server)
                             && (other.phase == .running || other.phase == .starting
                                 || other.phase == .unhealthy)
+                            && other.holds(port)
                     }
                     if server.phase == .stopped || server.phase == .crashed,
                         managedOwner == nil,
@@ -1503,6 +1503,13 @@ struct Doctor: AsyncParsableCommand {
                                 detail: "port \(port) has an unmanaged listener while \(server.server) is down",
                                 kind: "port-squatter", severity: "warning"))
                     }
+                }
+                for extra in server.extraPorts {
+                    findings.append(
+                        Finding(
+                            detail:
+                                "\(server.server) in \(server.project) also listens on \(extra), which is not a declared port",
+                            kind: "extra-port", severity: "warning"))
                 }
             }
             for project in staleProjects.sorted() {

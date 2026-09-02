@@ -41,7 +41,11 @@ public actor ServerSupervisor {
     private let launcher: any ProcessLauncher
     /** Resolved named secondaries for this run (status.ports). */
     private var namedPorts: [String: Int]?
-    private var observedPort: Int?
+    /** Last listen scan on the tree. Kept across stop so resume can wait on extras.
+        Nil means this run has not yet produced a non-empty scan (drift still pending). */
+    private var observedPorts: [Int]?
+    private var listenScanGeneration = 0
+    private var listenScanTask: Task<Void, Never>?
     private let paths: DevCtlPaths
     private var phase: ServerPhase = .stopped
     private var pid: pid_t?
@@ -119,6 +123,7 @@ public actor ServerSupervisor {
             self.lastExit = persisted.lastExit
             self.spawnError = persisted.spawnError
             self.stallStreak = persisted.stallStreak ?? 0
+            self.observedPorts = persisted.observedPorts
             self.terminalEvidence = persisted.terminalEvidence
             if persisted.phase == .crashed || persisted.phase == .failed {
                 self.phase = persisted.phase
@@ -256,7 +261,10 @@ public actor ServerSupervisor {
         errorSummary = nil
         terminalEvidence = nil
         everHealthy = false
-        observedPort = nil
+        listenScanGeneration += 1
+        listenScanTask?.cancel()
+        listenScanTask = nil
+        observedPorts = nil
         recentLogTail = nil
         lastDescendantSnapshot = []
         consecutiveFailures = 0
@@ -449,6 +457,15 @@ public actor ServerSupervisor {
             which matches the pre-capture behavior for that narrow case. */
         let tail = terminal ? (recentLogTail ?? spoolTail()) : nil
         let evidence = terminal ? (terminalEvidence ?? tail) : nil
+        let listen = observedPorts
+        let derivedObserved: Int?
+        switch phase {
+        case .running, .starting, .unhealthy:
+            derivedObserved = Self.derivedObservedPort(
+                expected: effectivePort ?? spec.port, listen: listen ?? [])
+        case .crashed, .failed, .stopped, .stopping:
+            derivedObserved = nil
+        }
         return ServerStatus(
             blockedOn: stallStreak >= 2 && phase == .crashed ? "interactive-auth" : nil,
             declaredPort: declaredPort ?? spec.port,
@@ -462,7 +479,8 @@ public actor ServerSupervisor {
             locks: spec.locks.map { $0.map(\.name) },
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
             mainProject: mainProjectSlug,
-            observedPort: observedPort,
+            observedPort: derivedObserved,
+            observedPorts: listen,
             phase: phase,
             pid: pid.map(Int.init),
             portConflict: portConflict,
@@ -546,13 +564,13 @@ public actor ServerSupervisor {
                     if spec.healthcheck != nil { stallStreak = 0 }
                     phase = .running
                     DevCtlLog.supervisor.info("healthy \(spec.name)@\(projectPath)")
-                    scanObservedPort()
                     postHealthEvent(.healthy)
                 }
             } else if phase == .unhealthy {
                 phase = .running
                 postHealthEvent(.healthy)
             }
+            if phase == .running { scanListenSet() }
         } else {
             consecutiveFailures += 1
             consecutiveSuccesses = 0
@@ -569,20 +587,31 @@ public actor ServerSupervisor {
         }
     }
 
-    /** Post-healthy listen scan: dev servers auto-increment ports on conflict
-        (Vite, Next), so the port actually listening is surfaced separately from
-        the declared one. */
-    private func scanObservedPort() {
+    /** Listen scan on the tree. The first non-empty scan of a run checks drift;
+        later running probes refresh the set so a hop after first-healthy is still
+        named. Overlapping probes share one in-flight scan. */
+    private func scanListenSet() {
         guard let rootPid = pid else { return }
+        guard listenScanTask == nil else { return }
         let expected = effectivePort ?? spec.port
-        Task { [weak self] in
+        listenScanGeneration += 1
+        let generation = listenScanGeneration
+        listenScanTask = Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = PortGuard.listeningPorts(pids: pids)
-            await self?.recordObservedPort(ports: ports)
-            guard let expected else { return }
-            let owners = PortGuard.listenerPids(port: expected)
-            await self?.recordPortOwnership(
-                expected: expected, owners: owners, ours: pids.map(Int.init))
+            await self?.recordListenSet(forPid: rootPid, ports: ports)
+            if let expected {
+                let owners = PortGuard.listenerPids(port: expected)
+                await self?.recordPortOwnership(
+                    expected: expected, owners: owners, ours: pids.map(Int.init))
+            }
+            await self?.listenScanFinished(generation)
+        }
+    }
+
+    private func listenScanFinished(_ generation: Int) {
+        if listenScanGeneration == generation {
+            listenScanTask = nil
         }
     }
 
@@ -708,28 +737,30 @@ public actor ServerSupervisor {
         }
     }
 
-    private func recordObservedPort(ports: [Int]) async {
-        guard !ports.isEmpty else { return }
+    /** Claim primary if it is in the listen set, else the first listen. */
+    private static func derivedObservedPort(expected: Int?, listen: [Int]) -> Int? {
+        if let expected, listen.contains(expected) { return expected }
+        return listen.first
+    }
+
+    private func recordListenSet(forPid rootPid: pid_t, ports: [Int]) async {
+        guard pid == rootPid, !ports.isEmpty else { return }
+        let firstScan = observedPorts == nil
+        let listen = Array(Set(ports)).sorted()
+        let changed = observedPorts != listen
+        observedPorts = listen
+        let id = serverID(project: projectPath, name: spec.name)
+        if changed {
+            await registryUpdate(id: id) { $0.observedPorts = listen }
+        }
+        /** Drift is only the claim primary missing from listen, and only on
+            the first non-empty scan. Extra listen fds are not drift. Later
+            scans refresh the set so a hop after first-healthy is recorded. */
+        guard firstScan else { return }
         let expected = effectivePort ?? spec.port
-        let claimPorts = Set(portClaim?.allPorts ?? expected.map { [$0] } ?? [])
-        if let expected, ports.contains(expected) {
-            observedPort = expected
-        } else if let claimed = ports.first(where: { claimPorts.contains($0) }) {
-            observedPort = claimed
-        } else {
-            observedPort = ports.first
-        }
-        /** Strict bind: primary must match. Listeners on claimed secondaries are
-            expected for composites; anything outside the claim is drift. */
-        guard let expected, let observed = observedPort,
-            phase == .running || phase == .starting
-        else { return }
-        if observed == expected || claimPorts.contains(observed) {
-            if observed == expected { return }
-            /** Secondary claimed port observed without primary: still require primary. */
-            if ports.contains(expected) { return }
-        }
-        guard observed != expected else { return }
+        guard let expected, phase == .running || phase == .starting else { return }
+        if listen.contains(expected) { return }
+        let observed = Self.derivedObservedPort(expected: expected, listen: listen) ?? expected
         portConflict = PortConflict(
             declaredPort: declaredPort ?? expected,
             effectivePort: expected,
@@ -747,7 +778,6 @@ public actor ServerSupervisor {
         await events?.post(
             kind: .failed, project: projectPath, server: spec.name,
             detail: "port drift \(expected)->\(observed)")
-        let id = serverID(project: projectPath, name: spec.name)
         let summary = errorSummary
         let err = spawnError
         let evidence = terminalEvidence
@@ -824,6 +854,7 @@ public actor ServerSupervisor {
         startDescendantWatch()
         await registryUpdate(id: id) { entry in
             entry.lastExit = nil
+            entry.observedPorts = nil
             entry.phase = .starting
             entry.pid = Int(childPid)
             entry.resumeOnBoot = true
@@ -948,7 +979,6 @@ public actor ServerSupervisor {
         rootSessionID = nil
         pid = nil
         startedAt = nil
-        observedPort = nil
         let finalPhase: ServerPhase = stopRequested ? .stopped : .crashed
         stopRequested = false
         let exit = lastExit

@@ -1047,8 +1047,7 @@ public actor Router {
         case .crashed, .failed, .stopped, .stopping:
             return false
         }
-        return status.declaredPort == port || status.effectivePort == port
-            || status.observedPort == port || (status.ports?.values.contains(port) ?? false)
+        return status.holds(port)
     }
 
     /** How many candidates a sibling rebind tries before giving up and handing
@@ -1082,12 +1081,16 @@ public actor Router {
         return candidate
     }
 
-    /** Wait until every claimed port is free, or return the first still-busy port. */
-    private func waitForClaimFree(claim: PortClaim, budgetSeconds: Double = 2) async -> Int? {
+    /** Wait until every claimed port and last listen set is free, or return
+        the first still-busy port. */
+    private func waitForClaimFree(
+        claim: PortClaim, lastListenSet: [Int], budgetSeconds: Double = 2
+    ) async -> Int? {
+        let watched = Array(Set(claim.allPorts + lastListenSet)).sorted()
         let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
         while true {
             var busy: Int?
-            for port in claim.allPorts where PortGuard.isListening(port: port) {
+            for port in watched where PortGuard.isListening(port: port) {
                 busy = port
                 break
             }
@@ -1109,11 +1112,7 @@ public actor Router {
             let status = await other.status()
             let active =
                 status.phase == .running || status.phase == .starting || status.phase == .unhealthy
-            if active,
-                status.effectivePort == port || status.declaredPort == port
-                    || status.observedPort == port
-                    || (status.ports?.values.contains(port) ?? false)
-            {
+            if active, status.holds(port) {
                 return (project: status.project, server: status.server)
             }
         }
@@ -1123,9 +1122,12 @@ public actor Router {
                 persisted.phase == .running || persisted.phase == .starting
                 || persisted.phase == .unhealthy
             guard active, let pid = persisted.pid, ProcessTree.isAlive(pid) else { continue }
-            guard let separator = id.range(of: "::") else { continue }
-            let project = String(id[id.startIndex..<separator.lowerBound])
-            let name = String(id[separator.upperBound...])
+            guard let parts = Self.splitServerID(id) else { continue }
+            let name = parts.name
+            let project = parts.project
+            if persisted.observedPorts?.contains(port) == true {
+                return (project: project, server: name)
+            }
             guard let merged = try? await mergedSpecs(project: project),
                 let spec = merged.specs.first(where: { $0.name == name })
             else { continue }
@@ -1321,9 +1323,13 @@ public actor Router {
                 guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
                 let supervisor = await supervisor(project: project, spec: spec)
                 let id = serverID(project: project, name: name)
-                let bound = await registry.persistedState(serverID: id)?.boundPort ?? spec.port
+                let persisted = await registry.persistedState(serverID: id)
+                let bound = persisted?.boundPort ?? spec.port
                 let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
-                if let claim = resolved.claim, let busy = await waitForClaimFree(claim: claim) {
+                let listen = (await supervisor.status()).observedPorts ?? []
+                if let claim = resolved.claim,
+                    let busy = await waitForClaimFree(claim: claim, lastListenSet: listen)
+                {
                     DevCtlLog.daemon.error(
                         "lock \(resource) resume refused \(name)@\(project): port \(busy) still busy")
                     continue
