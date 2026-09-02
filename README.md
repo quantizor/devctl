@@ -35,7 +35,7 @@ devctl why myproj     # root cause when something breaks
 devctl hook install --harness antigravity # Antigravity sessions rediscover servers automatically
 devctl hook install --harness claude      # same for Claude Code (default harness)
 devctl hook install --harness cursor      # same for Cursor
-devctl hook install --harness grok        # Grok Build: home rule plus session hook
+devctl hook install --harness grok        # Grok Build: live snapshot after the first tool, plus a home rule
 devctl hook install --harness opencode    # OpenCode: standing instruction wired into its global config
 ```
 

@@ -985,32 +985,64 @@ struct HookCursorSessionStart: AsyncParsableCommand {
     }
 }
 
-/** Invoked by Grok Build's SessionStart hook. Emits
-    hookSpecificOutput.additionalContext (Grok currently ignores stdout on
-    passive events; the standing instruction lives in ~/.grok/rules/devctl.md).
-    Same silence / exit-0 guarantees as the Claude hook. Silent on Stop:
-    Stop additionalContext continues the turn. */
+/** Invoked by Grok Build's PreToolUse and UserPromptSubmit hooks. Emits
+    hookSpecificOutput.additionalContext on PreToolUse (the path Grok delivers).
+    UserPromptSubmit only marks the turn. SessionStart and Stop are silent, so a
+    leftover registration cannot stall the session or continue the turn. Same
+    silence / exit-0 guarantees as the Claude hook. */
 struct HookGrokSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "grok-session-start", shouldDisplay: false)
 
     func run() async throws {
-        guard GrokSessionHook.emits(forGrokHookEvent: ProcessInfo.processInfo.environment["GROK_HOOK_EVENT"])
-        else { return }
+        let env = ProcessInfo.processInfo.environment
+        let event = GrokHookEvent.parse(env["GROK_HOOK_EVENT"])
+        guard event != .leftover else { return }
+
+        if event == .unspecified {
+            let stdin = FileHandle.standardInput.readDataToEndOfFile()
+            _ = await emit(stdin: stdin)
+            return
+        }
+
+        let directory = GrokTurnGate.directory(environment: env)
+        let key = GrokTurnGate.sessionKey(env["GROK_SESSION_ID"])
+        var state = GrokTurnGate.load(sessionKey: key, directory: directory)
+        let action = GrokSessionHook.action(for: event, state: &state)
+        switch action {
+        case .silent:
+            return
+        case .silentPersist:
+            GrokTurnGate.save(state, sessionKey: key, directory: directory)
+            return
+        case .emitUnmarked, .emitAndMark:
+            break
+        }
+
         let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        guard await emit(stdin: stdin) else { return }
+        if action == .emitAndMark {
+            GrokSessionHook.markEmitted(&state)
+            GrokTurnGate.save(state, sessionKey: key, directory: directory)
+        }
+    }
+
+    /** Returns false when there is nothing to say, so the caller can skip the mark. */
+    private func emit(stdin: Data) async -> Bool {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return }
+        guard let text = await HookContext.render(project: project) else { return false }
         let output: [String: Any] = [
             "hookSpecificOutput": [
                 "additionalContext": text,
-                "hookEventName": "SessionStart",
+                "hookEventName": "PreToolUse",
             ]
         ]
         if let data = try? JSONSerialization.data(withJSONObject: output) {
             FileHandle.standardOutput.write(data)
         }
+        return true
     }
 }
 

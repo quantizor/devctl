@@ -216,7 +216,7 @@ struct SetupPlannerTests {
             """
         try Data(cursorSettings.utf8).write(to: home.appending(path: ".cursor/hooks.json"))
         let grokSettings = """
-            {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
+            {"hooks":{"PreToolUse":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}],"UserPromptSubmit":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
             """
         try FileManager.default.createDirectory(
             at: home.appending(path: ".grok/hooks"), withIntermediateDirectories: true)
@@ -234,6 +234,22 @@ struct SetupPlannerTests {
         let offersInstalled = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
         #expect(offersInstalled.count == 5)
         #expect(offersInstalled.allSatisfy { $0.alreadyInstalled && !$0.defaultChecked })
+    }
+
+    @Test func grokSessionStartOnlyDoesNotCountAsInstalled() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "devctl-setup-grok-old-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let settings = root.appending(path: ".grok/hooks/devctl.json")
+        try FileManager.default.createDirectory(
+            at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let cliPath = root.appending(path: ".local/bin/devctl").path
+        try Data(
+            """
+            {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
+            """.utf8
+        ).write(to: settings)
+        #expect(HookPresence.grokHookInstalled(settingsURL: settings, expectedCLIPath: cliPath) == false)
     }
 
     @Test func stampRoundTrip() throws {
