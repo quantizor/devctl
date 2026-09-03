@@ -190,6 +190,13 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
             InstallerWindowController.shared.present()
             return
         }
+        /** MenuBarExtra is not a window TAL counts as "in use", so AppKit's
+            automatic termination will quit an LSUIElement extra that looks idle,
+            especially after a memory-pressure pass. Start at Login does not
+            relaunch mid-session. The matching Info.plist keys refuse TAL at
+            Launch Services; these calls refuse it in-process. */
+        ProcessInfo.processInfo.disableAutomaticTermination("menu bar extra")
+        ProcessInfo.processInfo.disableSuddenTermination()
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         /** MenuBarExtra / LSUIElement apps do not always receive
