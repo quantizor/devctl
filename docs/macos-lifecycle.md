@@ -10,7 +10,12 @@ Hard-won platform behavior behind devctl's process teardown, launchd supervision
 
 posix_spawn inherits the parent's resource and jetsam coalitions. xnu's default is explicit: "Default is to inherit parent's coalition(s)." `POSIX_SPAWN_SETSID` / `createSession` is a session, not a coalition. Session-leader children of `devctld` still sit in the SMAppService agent's jetsam coalition.
 
-SMAppService agents (and user LaunchAgents on macOS 26) get `jetsamproperties category = daemon`, jetsam priority 40, thread limit 32. KeepAlive respawns the job into the same coalition id. memorystatus attributes the coalition's compressed footprint to the focal process and can kill it as `largest compressed process` while higher-priority members (prio 180 posix_spawn children) survive. Observed 2026-09-02: `devctld` pid 6616 then 23242, kernel log `memorystatus: killing largest compressed process devctld [23242] 174020 MB`, children bounced as orphans.
+SMAppService agents (and user LaunchAgents on macOS 26) get `jetsamproperties category = daemon`, jetsam priority 40, thread limit 32. KeepAlive respawns the job into the same coalition id.
+
+Two different memorystatus paths showed up on 2026-09-02:
+
+- Jetsam snapshot (10:00): posix_spawn children still sat in the agent's coalition. `node` pid 6751 had 221772 resident pages (~3.5 GB) in coalition 91632 with `devctld` pid 6616 (945 pages, ~15 MB). `largestProcess` was `node`. That is the inheritance `LaunchdJobLauncher` closes.
+- `no_paging_space_action` (16:05, xnu-12377 `kern_proc.c`): compressor/swap exhaustion. The kernel walks every task's `internal_compressed` ledger (`get_task_compressed`), and if the largest process that has no pcontrol action holds more than half the compressor pool it SIGKILLs it and logs `memorystatus: killing largest compressed process %s [%d] %llu MB` (`npcs_max_size / (1024*1024)`, bytes of uncompressed-equivalent compressed anonymous memory, not RSS). Observed: `devctld` pid 94572, 176853 MB, and a new 1 GB swapfile at the same second. That figure cannot be resident RAM on a 32 GB Mac with 7 GB swap. The live successor (same binary, same coalition-split children, hours later) is ~19 MB `phys_footprint` / 139 MB lifetime peak, and its jetsam coalition contains only itself. `ps` VSZ of ~415 GB is the ARM64 address-space layout (zsh reports the same) and is not consumption.
 
 Third-party spawn cannot pick a different coalition. `posix_spawnattr_setcoalition_np` is `EPERM` without `com.apple.private.coalition-spawn`. `coalition(COALITION_OP_CREATE)` is `EPERM`. `responsibility_spawnattrs_setdisclaim` (dlsym, pointer ABI, macOS 10.14+) starts a new TCC responsibility chain and does not change jetsam or resource coalition ids (ProcessTreeTests.disclaimDoesNotSplitJetsamCoalition).
 
@@ -28,6 +33,12 @@ For the launchd phase:
 - `ThrottleInterval` defaults to 10s between respawns.
 - `ExitTimeOut` (SIGTERM to SIGKILL) defaults to 20s per `launchd.plist(5)`. A sequential drain of many servers at 7s grace each can exceed it, so set it deliberately. 60 is the ceiling: launchd clamps anything larger and logs `ExitTimeOut is larger than the maximum allowed`.
 - User agents live in domain `gui/<uid>`, never `system`. `launchctl list`/`print` answer differently depending on the calling context.
+
+## Menu bar extra
+
+The GUI app is a login item (`SMAppService.mainApp`), not a KeepAlive LaunchAgent. Jetsam priority in a 2026-09-02 JetsamEvent was 100 (background-app band) on its own coalition, while `devctld` was 40. A login item does not relaunch mid-session, so a kill leaves the tally gone until the next login or an explicit `open`.
+
+MenuBarExtra is not a window AppKit's Transparent App Life-cycle counts as "in use". After the 16:05 daemon jetsam, `devctl-app` pid 94113 survived, resurrected the agent (the designed inverse of KeepAlive), then logged `_updateToReflectAutomaticTerminationState` and vanished; kernel `memorystatus` never named it. `NSSupportsAutomaticTermination` / `NSSupportsSuddenTermination` are false and `applicationDidFinishLaunching` calls `disableAutomaticTermination` / `disableSuddenTermination` so AppKit is not invited to quit the extra as idle. A true jetsam of the GUI process is a different hole: this opt-out does not KeepAlive it. Putting the GUI binary itself under `SMAppService.agent` would move it to daemon-category jetsam (priority 40, thread limit 32), which is the wrong band for SwiftUI.
 
 ## SMAppService
 
