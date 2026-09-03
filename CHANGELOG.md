@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.3
+### Patch Changes
+
+
+
+- [#30](https://github.com/quantizor/devctl/pull/30) [`34c9331`](https://github.com/quantizor/devctl/commit/34c933123bbfb7ca82894b11640c34333ca8d19e) - The menu bar icon no longer quits itself as idle after macOS reclaims memory. The extra has no windows AppKit counts as "in use", so a memory-pressure pass was allowed to terminate it, and Start at Login only brings it back at the next login.
+
 ## 1.5.2
 ### Patch Changes
 
