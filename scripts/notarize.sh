@@ -6,14 +6,14 @@
 #   NOTARY_KEYCHAIN_PROFILE  (default: devctl-notary) — local notarytool store-credentials
 #   APPLE_API_KEY_ID + APPLE_API_ISSUER + (APPLE_API_KEY_PATH | APPLE_API_KEY_BASE64) — CI
 # Optional:
-#   NOTARIZE_TARGET    (path to .dmg or .app; default: newest dist/devctl-*.dmg)
+#   NOTARIZE_TARGET    (path to .dmg or .app; default: newest dist/directa-*.dmg)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 TARGET="${NOTARIZE_TARGET:-}"
 if [[ -z "$TARGET" ]]; then
-  TARGET="$(ls -t "$ROOT"/dist/devctl-*.dmg 2>/dev/null | head -1 || true)"
+  TARGET="$(ls -t "$ROOT"/dist/directa-*.dmg 2>/dev/null | head -1 || true)"
 fi
 [[ -n "$TARGET" && -e "$TARGET" ]] || {
   echo "notarize: no target (set NOTARIZE_TARGET or build make dmg first)" >&2

@@ -61,7 +61,7 @@ func render(scale: CGFloat) -> Data? {
         those glyphs sit 16 to 29 points below the icon box with a background a
         few points further, so the label owns roughly 242 to 258. That label is
         invisible in this PNG, and text placed to clear the icon alone once
-        shipped overlapping the word "devctl". Move the icon and every offset
+        shipped overlapping the word "directa". Move the icon and every offset
         below has to move with it. */
     let tagline = NSAttributedString(
         string: "An agent-friendly coordinator for many devservers\nand their unique configurations.",

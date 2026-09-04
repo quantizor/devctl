@@ -43,15 +43,18 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
 
+      # `.build` PCM files bake in the checkout path (`.../work/<repo>/<repo>`),
+      # so a repository rename would restore a cache compiled at the old path
+      # and fail the build. The repo name is part of the key so that cannot happen.
       - name: Cache SwiftPM
         uses: actions/cache@v4
         with:
           path: |
             .build
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+          key: spm-release-${{ runner.os }}-${{ runner.arch }}-${{ github.event.repository.name }}-${{ hashFiles('Package.resolved') }}
           restore-keys: |
-            spm-release-${{ runner.os }}-${{ runner.arch }}-
+            spm-release-${{ runner.os }}-${{ runner.arch }}-${{ github.event.repository.name }}-
 
       - name: Import Developer ID certificate
         env:
@@ -65,8 +68,8 @@ jobs:
           fi
           # RUNNER_TEMP is job-private; mktemp only randomizes trailing Xs, so
           # a ".XXXXXX.p12" template would be a fixed path.
-          CERT_PATH="$(mktemp "$RUNNER_TEMP/devctl-cert.XXXXXX")"
-          KEYCHAIN_PATH="$RUNNER_TEMP/devctl-signing.keychain-db"
+          CERT_PATH="$(mktemp "$RUNNER_TEMP/directa-cert.XXXXXX")"
+          KEYCHAIN_PATH="$RUNNER_TEMP/directa-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
           echo "$P12_BASE64" | base64 -D > "$CERT_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -86,17 +89,17 @@ jobs:
           # A released image must carry the double-click instructions, so a
           # runner that cannot drive Finder fails here instead of shipping a
           # bare icon view.
-          DEVCTL_DMG_REQUIRE_LAYOUT: "1"
+          DIRECTA_DMG_REQUIRE_LAYOUT: "1"
           SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
           # make dmg notarizes and staples inline; these are what it authenticates
           # with. The quarantine stamp is a local-testing aid only, so skip it here.
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          DEVCTL_DMG_QUARANTINE: "0"
+          DIRECTA_DMG_QUARANTINE: "0"
           # Fail the build if signing falls back to ad-hoc: an unsigned release
           # would install through the cask and then be disabled by Gatekeeper.
-          DEVCTL_REQUIRE_SIGNING: "1"
+          DIRECTA_REQUIRE_SIGNING: "1"
         run: |
           set -euo pipefail
           : "${SIGN_IDENTITY:?set APPLE_SIGN_IDENTITY secret}"
@@ -116,7 +119,7 @@ jobs:
       - name: Verify the DMG is notarized and stapled
         run: |
           set -euo pipefail
-          DMG="$(ls -t dist/devctl-*.dmg | head -1)"
+          DMG="$(ls -t dist/directa-*.dmg | head -1)"
           xcrun stapler validate "$DMG"
           spctl -a -vvv -t open --context context:primary-signature "$DMG" 2>&1 | tee /tmp/spctl.txt
           grep -q "source=Notarized Developer ID" /tmp/spctl.txt || {
@@ -156,7 +159,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
-          DMG="$(ls -t dist/devctl-*.dmg | head -1)"
+          DMG="$(ls -t dist/directa-*.dmg | head -1)"
           if [[ -z "${TAG:-}" ]]; then
             TAG="$(git describe --tags --abbrev=0)"
           fi
@@ -179,8 +182,8 @@ jobs:
         if: steps.gate.outputs.publish != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: devctl-dmg-dryrun
-          path: dist/devctl-*.dmg
+          name: directa-dmg-dryrun
+          path: dist/directa-*.dmg
           retention-days: 7
           if-no-files-found: error
 

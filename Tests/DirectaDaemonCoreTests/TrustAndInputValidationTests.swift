@@ -1,0 +1,156 @@
+import DirectaKit
+import Foundation
+import Testing
+
+@testable import DirectaDaemonCore
+
+/** The daemon's input-validation and trust boundary at the wire: a spec entering
+    through `register` is validated the same as one from the file, `writeConfig`
+    cannot drop a devservers.json at a path directa does not track, and an explicit
+    start records the trust that boot restore later requires. */
+@Suite(.serialized) struct TrustAndInputValidationTests {
+    private struct Env {
+        let paths: DirectaPaths
+        let project: String
+    }
+
+    private func makeEnv() throws -> Env {
+        let base = FileManager.default.temporaryDirectory
+            .appending(path: "directa-trust-\(UUID().uuidString)")
+        let project = base.appending(path: "proj")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        return Env(
+            paths: DirectaPaths(
+                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
+            project: project.path)
+    }
+
+    /** Returns the decoded result, or the WireError when the daemon refused. */
+    private func send<P: Codable & Sendable, R: Codable & Sendable>(
+        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
+    ) async throws -> Result<R, WireError> {
+        let line = try NDJSON.encodeLine(
+            WireRequest(id: "t", method: method.rawValue, params: params))
+        let data = await router.handle(line: line)
+        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
+        if response.ok, let result = response.result { return .success(result) }
+        return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
+    }
+
+    /** A non-finite or astronomically large timeout arriving over the wire is
+        clamped before it reaches `Duration.seconds`, which traps on such a value.
+        The clamp keeps a crafted `ensure`/`wait`/lock request from taking the
+        daemon down (and respawning it under KeepAlive). */
+    @Test func wireTimeoutIsClampedBeforeDurationConversion() {
+        #expect(ServerSupervisor.boundedTimeoutSeconds(.infinity) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(-.infinity) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(.nan) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(1e30) == 86_400)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(-5) == 0)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(0) == 0)
+        #expect(ServerSupervisor.boundedTimeoutSeconds(60) == 60)
+    }
+
+    @Test func registerRefusesAnInvalidSpec() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let outcome = try await send(
+            router, .serverRegister,
+            RegisterParams(
+                project: env.project,
+                spec: ServerSpec(command: [], name: "web", port: 70000)),
+            ServerResult.self)
+        guard case .failure(let error) = outcome else {
+            Issue.record("register accepted an invalid spec")
+            return
+        }
+        #expect(error.code == .configInvalid)
+        #expect(await registry.spec(project: env.project, name: "web") == nil)
+    }
+
+    @Test func registerAcceptsAValidSpec() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let outcome = try await send(
+            router, .serverRegister,
+            RegisterParams(
+                project: env.project,
+                spec: ServerSpec(command: ["bun", "dev"], name: "web", port: 3000)),
+            ServerResult.self)
+        #expect((try? outcome.get()) != nil)
+        #expect(await registry.spec(project: env.project, name: "web") != nil)
+    }
+
+    @Test func writeConfigRefusesAnUntrackedProjectPath() async throws {
+        let env = try makeEnv()
+        let stranger = FileManager.default.temporaryDirectory
+            .appending(path: "directa-stranger-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: stranger, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stranger) }
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let body = """
+            {"servers":{"web":{"command":["bun","dev"]}},"version":1}
+            """
+        let outcome = try await send(
+            router, .projectWriteConfig,
+            WriteConfigParams(baselineHash: "", content: body, project: stranger.path),
+            CheckResult.self)
+        guard case .failure(let error) = outcome else {
+            Issue.record("writeConfig created a config for an untracked path")
+            return
+        }
+        #expect(error.code == .notFound)
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: stranger.appending(path: "devservers.json").path))
+    }
+
+    @Test func writeConfigCreatesForAKnownProject() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        /** A registered server makes the project known, so the editor's
+            create-on-first-save flow is allowed. */
+        try await registry.register(
+            project: env.project, spec: ServerSpec(command: ["bun", "dev"], name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let body = """
+            {"servers":{"web":{"command":["bun","dev"]}},"version":1}
+            """
+        let outcome = try await send(
+            router, .projectWriteConfig,
+            WriteConfigParams(baselineHash: "", content: body, project: env.project),
+            CheckResult.self)
+        #expect((try? outcome.get()) != nil)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: env.project).appending(path: "devservers.json").path))
+    }
+
+    @Test func anExplicitStartRecordsTrust() async throws {
+        let env = try makeEnv()
+        let body = """
+            {"servers":{"web":{"command":["/bin/sh","-c","sleep 30"]}},"version":1}
+            """
+        try Data(body.utf8).write(
+            to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        #expect(await registry.isTrusted(project: env.project) == false)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let outcome = try await send(
+            router, .serverStart,
+            ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        #expect((try? outcome.get()) != nil)
+        /** The explicit start IS the approval: trust is now recorded, which is
+            what lets boot restore bring this server back next time. */
+        #expect(await registry.isTrusted(project: env.project) == true)
+        let stop = try NDJSON.encodeLine(
+            WireRequest(
+                id: "s", method: WireMethod.serverStop.rawValue,
+                params: ServerTargetParams(name: "web", project: env.project)))
+        _ = await router.handle(line: stop)
+    }
+}

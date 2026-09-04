@@ -8,6 +8,6 @@ Version and changelog for GitHub releases. This repo is a Swift product: the roo
 2. Merge the PR. On `main`, the Release workflow opens or updates a **Version Packages** PR.
 3. Merge that PR when ready. The workflow tags `vX.Y.Z` (matching historical releases) and creates the GitHub release from the changelog.
 
-`npm run version` also syncs `Sources/DevCtlKit/Model/Models.swift` (`DevCtlVersion.version`) from `package.json` so `devctl --version` and the app bundle stay aligned.
+`npm run version` also syncs `Sources/DirectaKit/Model/Models.swift` (`DirectaVersion.version`) from `package.json` so `directa --version` and the app bundle stay aligned.
 
 Changelog lines still link the PR/commit via `@changesets/changelog-github`. The local `changelog.cjs` wrapper drops "Thanks @quantizor" (maintainer self-thanks) and keeps thanks for other contributors.

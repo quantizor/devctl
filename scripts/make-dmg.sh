@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds the devctl DMG from the assembled (and signed) devctl.app.
+# Builds the directa DMG from the assembled (and signed) directa.app.
 # Usage: scripts/make-dmg.sh [SIGN_IDENTITY]
 #
 # The image holds the app alone: no /Applications symlink. Setup happens inside
@@ -9,7 +9,7 @@
 #
 # Finder styling needs a GUI session. Without one the AppleScript pass is skipped
 # and the image still ships, just unstyled: plain icon view, background file
-# present but unused. Set DEVCTL_DMG_REQUIRE_LAYOUT=1 to make that a hard error,
+# present but unused. Set DIRECTA_DMG_REQUIRE_LAYOUT=1 to make that a hard error,
 # so a release build never quietly loses the instructions.
 #
 # Two kinds of image. A TEST image is what an external contributor gets: signed
@@ -18,22 +18,22 @@
 # testing. A REAL image is notarized and stapled, and is reserved for where the
 # notarytool credentials live: the maintainer's machine (the `devctl-notary`
 # keychain profile) or CI (App Store Connect API key env). make dmg notarizes
-# automatically when those credentials are reachable; DEVCTL_NOTARIZE=1 demands
+# automatically when those credentials are reachable; DIRECTA_NOTARIZE=1 demands
 # the real path (failing if they are missing) and the release build sets
-# DEVCTL_REQUIRE_SIGNING=1, which implies it. SKIP_NOTARIZE=1 forces the fast
-# local loop; DEVCTL_DMG_QUARANTINE=0 drops the download stamp.
+# DIRECTA_REQUIRE_SIGNING=1, which implies it. SKIP_NOTARIZE=1 forces the fast
+# local loop; DIRECTA_DMG_QUARANTINE=0 drops the download stamp.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IDENTITY="${1:--}"
-APP="$ROOT/devctl.app"
+APP="$ROOT/directa.app"
 DIST="$ROOT/dist"
 STAGE="$DIST/dmg-stage"
-VOLUME_NAME="devctl"
+VOLUME_NAME="directa"
 
 [[ -d "$APP" ]] || { echo "make-dmg: run make app first (missing $APP)" >&2; exit 1 }
 
-# A leftover volume of this name makes the new one mount as "devctl 1". The
+# A leftover volume of this name makes the new one mount as "directa 1". The
 # layout pass below reads the real name back so it still styles the right disk,
 # but a stale mount also means a later double-click can open the OLD image, so
 # say so rather than leaving it to be discovered during a test install.
@@ -43,12 +43,12 @@ if [[ -d "/Volumes/$VOLUME_NAME" ]]; then
 fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo 0.0.0)"
-DMG="$DIST/devctl-${VERSION}.dmg"
-RW_DMG="$DIST/.devctl-${VERSION}.rw.dmg"
+DMG="$DIST/directa-${VERSION}.dmg"
+RW_DMG="$DIST/.directa-${VERSION}.rw.dmg"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/.background" "$DIST"
-ditto "$APP" "$STAGE/devctl.app"
+ditto "$APP" "$STAGE/directa.app"
 
 echo "rendering background..."
 swift "$ROOT/scripts/make-dmg-background.swift" "$STAGE/.background"
@@ -67,7 +67,7 @@ hdiutil create \
   "$RW_DMG" > /dev/null
 
 # Mount under /Volumes and read the name back: Finder resolves the window by
-# volume name, and a stale devctl mount makes this one "devctl 1". Custom
+# volume name, and a stale directa mount makes this one "directa 1". Custom
 # -mountpoint or -nobrowse both break the AppleScript lookup.
 MOUNT_POINT="$(hdiutil attach "$RW_DMG" -noverify -noautoopen | awk -F'\t' '/\/Volumes\// { print $NF }' | tail -1)"
 [[ -n "$MOUNT_POINT" ]] || { echo "make-dmg: could not mount $RW_DMG" >&2; exit 1 }
@@ -79,7 +79,7 @@ abort_cleanup() {
 }
 trap abort_cleanup EXIT
 
-LAYOUT_LOG="$(mktemp "${TMPDIR:-/tmp}/devctl-dmg-layout.XXXXXX")"
+LAYOUT_LOG="$(mktemp "${TMPDIR:-/tmp}/directa-dmg-layout.XXXXXX")"
 if osascript - "$MOUNTED_NAME" > "$LAYOUT_LOG" 2>&1 <<'APPLESCRIPT'
 on run argv
   set volumeName to item 1 of argv
@@ -95,7 +95,7 @@ on run argv
       set icon size of viewOptions to 128
       set text size of viewOptions to 12
       set background picture of viewOptions to file ".background:background.tiff"
-      set position of item "devctl.app" of container window to {280, 162}
+      set position of item "directa.app" of container window to {280, 162}
       update without registering applications
       delay 1
       close
@@ -106,8 +106,8 @@ APPLESCRIPT
 then
   echo "applied Finder window layout"
   rm -f "$LAYOUT_LOG"
-elif [[ "${DEVCTL_DMG_REQUIRE_LAYOUT:-0}" == "1" ]]; then
-  echo "make-dmg: Finder window layout failed and DEVCTL_DMG_REQUIRE_LAYOUT=1" >&2
+elif [[ "${DIRECTA_DMG_REQUIRE_LAYOUT:-0}" == "1" ]]; then
+  echo "make-dmg: Finder window layout failed and DIRECTA_DMG_REQUIRE_LAYOUT=1" >&2
   cat "$LAYOUT_LOG" >&2
   echo "make-dmg: run from a logged-in GUI session, grant the terminal Automation access for Finder, and check that no other volume is named $VOLUME_NAME" >&2
   exit 1
@@ -130,7 +130,7 @@ rm -rf "$STAGE"
 # where these live: this machine's `devctl-notary` keychain profile, or CI's App
 # Store Connect API key env. A contributor without them still gets a signed TEST
 # image and a clear note, never a hard failure. A false negative here costs the
-# maintainer only a `DEVCTL_NOTARIZE=1`; it never blocks a contributor.
+# maintainer only a `DIRECTA_NOTARIZE=1`; it never blocks a contributor.
 notary_creds_available() {
   if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" \
         && ( -n "${APPLE_API_KEY_PATH:-}" || -n "${APPLE_API_KEY_BASE64:-}" ) ]]; then
@@ -154,12 +154,12 @@ else
   echo "signed DMG with $IDENTITY"
 
   # A real release is signed AND notarized; a contributor build is signed only.
-  # DEVCTL_NOTARIZE=1 (and the release build's DEVCTL_REQUIRE_SIGNING=1) demands
+  # DIRECTA_NOTARIZE=1 (and the release build's DIRECTA_REQUIRE_SIGNING=1) demands
   # the real path, so a missing credential fails loudly rather than shipping a
   # test image. SKIP_NOTARIZE=1 forces the fast local loop. Otherwise notarize
   # only when the credentials are actually reachable.
   require_notarize=0
-  [[ "${DEVCTL_NOTARIZE:-}" == "1" || "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]] && require_notarize=1
+  [[ "${DIRECTA_NOTARIZE:-}" == "1" || "${DIRECTA_REQUIRE_SIGNING:-0}" == "1" ]] && require_notarize=1
 
   if [[ "${SKIP_NOTARIZE:-0}" == "1" && "$require_notarize" != "1" ]]; then
     echo "note: SKIP_NOTARIZE=1. Quarantined, Gatekeeper will block this image." >&2
@@ -181,8 +181,8 @@ fi
 # without it Gatekeeper never runs its first-launch check at all. Stamping it
 # here is what makes a local double-click match what a user gets. The attribute
 # is per-file metadata and does not survive an upload, so a released artifact is
-# unaffected. Set DEVCTL_DMG_QUARANTINE=0 to build without it.
-if [[ "${DEVCTL_DMG_QUARANTINE:-1}" == "1" ]]; then
+# unaffected. Set DIRECTA_DMG_QUARANTINE=0 to build without it.
+if [[ "${DIRECTA_DMG_QUARANTINE:-1}" == "1" ]]; then
   xattr -w com.apple.quarantine \
     "0081;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$DMG"
   echo "stamped com.apple.quarantine (as a download would)"

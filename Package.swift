@@ -6,14 +6,14 @@ let strictCore: [SwiftSetting] = [
 ]
 
 let package = Package(
-    name: "devctl",
+    name: "directa",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "devctl", targets: ["devctl"]),
-        .executable(name: "devctld", targets: ["devctld"]),
-        .executable(name: "DevCtlApp", targets: ["DevCtlApp"]),
+        .executable(name: "directa", targets: ["directa"]),
+        .executable(name: "ddirecta", targets: ["ddirecta"]),
+        .executable(name: "DirectaApp", targets: ["DirectaApp"]),
         .executable(name: "fixture-server", targets: ["fixture-server"]),
-        .library(name: "DevCtlKit", targets: ["DevCtlKit"]),
+        .library(name: "DirectaKit", targets: ["DirectaKit"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.0"),
@@ -23,20 +23,20 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "DevCtlKit",
+            name: "DirectaKit",
             swiftSettings: strictCore
         ),
         .target(
-            name: "DevCtlDaemonCore",
+            name: "DirectaDaemonCore",
             dependencies: [
-                "DevCtlKit",
+                "DirectaKit",
                 .product(name: "Subprocess", package: "swift-subprocess"),
             ],
             swiftSettings: strictCore
         ),
         .executableTarget(
-            name: "devctld",
-            dependencies: ["DevCtlDaemonCore", "DevCtlKit"],
+            name: "ddirecta",
+            dependencies: ["DirectaDaemonCore", "DirectaKit"],
             exclude: ["Info.plist"],
             swiftSettings: strictCore,
             linkerSettings: [
@@ -47,21 +47,21 @@ let package = Package(
                     "-Xlinker", "-sectcreate",
                     "-Xlinker", "__TEXT",
                     "-Xlinker", "__info_plist",
-                    "-Xlinker", "\(Context.packageDirectory)/Sources/devctld/Info.plist",
+                    "-Xlinker", "\(Context.packageDirectory)/Sources/ddirecta/Info.plist",
                 ])
             ]
         ),
         .executableTarget(
-            name: "devctl",
+            name: "directa",
             dependencies: [
-                "DevCtlKit",
+                "DirectaKit",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             swiftSettings: strictCore
         ),
         .executableTarget(
-            name: "DevCtlApp",
-            dependencies: ["DevCtlKit"],
+            name: "DirectaApp",
+            dependencies: ["DirectaKit"],
             swiftSettings: [
                 .defaultIsolation(MainActor.self)
             ]
@@ -71,21 +71,21 @@ let package = Package(
             swiftSettings: strictCore
         ),
         .testTarget(
-            name: "DevCtlKitTests",
-            dependencies: ["DevCtlKit"]
+            name: "DirectaKitTests",
+            dependencies: ["DirectaKit"]
         ),
         .testTarget(
-            name: "DevCtlDaemonCoreTests",
-            dependencies: ["DevCtlDaemonCore", "DevCtlKit"]
+            name: "DirectaDaemonCoreTests",
+            dependencies: ["DirectaDaemonCore", "DirectaKit"]
         ),
         /** The CLI's argument parsing is behavior with a contract (docs/cli-contract.md)
             and no other way to exercise it: a parse defect there silently changes
             what a guarded command receives. */
         .testTarget(
-            name: "DevCtlCLITests",
+            name: "DirectaCLITests",
             dependencies: [
-                "DevCtlKit",
-                "devctl",
+                "DirectaKit",
+                "directa",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
