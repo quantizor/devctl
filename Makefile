@@ -5,7 +5,7 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test sweep-test-temp app dmg release-dmg install clean
+.PHONY: build test sweep-test-temp app dmg release-dmg install clean icon
 
 build:
 	swift build -c release
@@ -45,6 +45,12 @@ install: build app
 	install .build/release/ddirecta $(PREFIX)/bin/ddirecta
 	ditto directa.app /Applications/directa.app
 	$(PREFIX)/bin/directa daemon install
+
+# Regenerates Resources/AppIcon.png and AppIcon.icns from logo.svg. The icns is
+# checked in, so `make app` does not need librsvg; re-run this after changing
+# the mark (`brew install librsvg` for rsvg-convert).
+icon:
+	scripts/make-app-icon.sh
 
 clean:
 	swift package clean

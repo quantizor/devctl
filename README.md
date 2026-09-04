@@ -1,6 +1,9 @@
-# directa
-
-An agent-friendly coordinator for many devservers and their unique configurations.
+<div align="center">
+  <br>
+  <img src="logo.svg" width="96" height="96" alt="directa">
+  <h1>directa</h1>
+  <p>An agent-friendly coordinator for many devservers and their unique configurations.</p>
+</div>
 
 A macOS menu bar app and a CLI, built so coding agents never lose track of the servers they started.
 

@@ -8,7 +8,7 @@ How the app bundle, DMG, signing, notarization, the GitHub release workflow, and
 
 - CLI in `Contents/Resources`.
 - Signed `Helpers/ddirecta` plus a `Contents/Library/LaunchAgents` BundleProgram plist for SMAppService.
-- `AppIcon.icns`.
+- `AppIcon.icns`, rendered from the root `logo.svg` via `make icon` (`scripts/make-app-icon.sh`). The icns is checked in so `make app` does not need librsvg; re-run `make icon` after changing the mark.
 - Declares the `directa://` URL scheme.
 - Writes both `CFBundleShortVersionString` and `CFBundleVersion`.
 
