@@ -9,11 +9,11 @@ public enum DirectaDistribution: Sendable {
     public static let homebrewCaskToken = "quantizor/tap/directa"
 
     /** Human-facing releases page, offered to non-Homebrew installs. */
-    public static let releasesLatestURL = "https://github.com/quantizor/devctl/releases/latest"
+    public static let releasesLatestURL = "https://github.com/quantizor/directa/releases/latest"
 
     /** GitHub API for the newest non-prerelease, used by the update check. */
     public static let latestReleaseAPIURL =
-        "https://api.github.com/repos/quantizor/devctl/releases/latest"
+        "https://api.github.com/repos/quantizor/directa/releases/latest"
 
     /** The command an in-app control runs in Terminal to upgrade a cask install. */
     public static var brewUpgradeCommand: String {

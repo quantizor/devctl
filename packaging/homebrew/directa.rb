@@ -11,10 +11,10 @@ cask "directa" do
   version "1.3.0"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
-  url "https://github.com/quantizor/devctl/releases/download/v#{version}/directa-#{version}.dmg"
+  url "https://github.com/quantizor/directa/releases/download/v#{version}/directa-#{version}.dmg"
   name "directa"
   desc "Agent-friendly coordinator for many devservers and their configurations"
-  homepage "https://github.com/quantizor/devctl"
+  homepage "https://github.com/quantizor/directa"
 
   livecheck do
     url :url

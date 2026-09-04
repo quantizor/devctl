@@ -43,15 +43,18 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
 
+      # `.build` PCM files bake in the checkout path (`.../work/<repo>/<repo>`),
+      # so a repository rename would restore a cache compiled at the old path
+      # and fail the build. The repo name is part of the key so that cannot happen.
       - name: Cache SwiftPM
         uses: actions/cache@v4
         with:
           path: |
             .build
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+          key: spm-release-${{ runner.os }}-${{ runner.arch }}-${{ github.event.repository.name }}-${{ hashFiles('Package.resolved') }}
           restore-keys: |
-            spm-release-${{ runner.os }}-${{ runner.arch }}-
+            spm-release-${{ runner.os }}-${{ runner.arch }}-${{ github.event.repository.name }}-
 
       - name: Import Developer ID certificate
         env:
