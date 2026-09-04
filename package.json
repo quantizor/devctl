@@ -1,5 +1,5 @@
 {
-  "name": "devctl",
+  "name": "directa",
   "version": "1.5.3",
   "private": true,
   "description": "Version and changelog source of truth for GitHub releases (Swift product; not published to npm).",

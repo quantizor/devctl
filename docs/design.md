@@ -1,6 +1,8 @@
-> Ratified plan snapshot (2026-07-18), kept as the design rationale record. The
-> living documents are AGENTS.md (map + invariants) and docs/cli-contract.md
-> (the JSON surface). Known deviations from this plan, chosen during the build:
+> Ratified plan snapshot (2026-07-18), kept as the design rationale record.
+> The product was renamed from `devctl` to `directa` in 2026-09; identifiers in
+> this snapshot still use the old name. The living documents are AGENTS.md
+> (map + invariants) and docs/cli-contract.md (the JSON surface). Known
+> deviations from this plan, chosen during the build:
 > push subscriptions were replaced by incremental polling everywhere (CLI
 > --follow and the app; restart-safe, no reconnect machinery), logs.follow /
 > status.subscribe never shipped as wire methods, and the crash verb landed as

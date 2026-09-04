@@ -2,19 +2,19 @@
 # Verify ProcessType=Interactive on the live LaunchAgent and that managed
 # servers are session leaders (pgid == pid) that do not share the daemon's
 # jetsam coalition. Under the agent those servers are launchd jobs (ppid=1),
-# so pids come from `devctl status --all --json`, not pgrep -P. Full App Nap /
+# so pids come from `directa status --all --json`, not pgrep -P. Full App Nap /
 # QoS inheritance for setsid children needs root `taskinfo` or Instruments;
 # this script stays userland and never rewrites the installed plist.
 set -euo pipefail
 
-LABEL="dev.quantizor.devctl"
+LABEL="dev.quantizor.directa"
 UID_NUM="$(id -u)"
 SERVICE="gui/${UID_NUM}/${LABEL}"
-PRINT_FILE="$(mktemp -t devctl-launchctl-print)"
+PRINT_FILE="$(mktemp -t directa-launchctl-print)"
 
 echo "== launchctl spawn type =="
 if ! launchctl print "$SERVICE" >"$PRINT_FILE" 2>/dev/null; then
-  echo "service $SERVICE not loaded; run: devctl daemon install" >&2
+  echo "service $SERVICE not loaded; run: directa daemon install" >&2
   exit 1
 fi
 grep -nE $'^\t(path|state|pid|spawn type|job state) =' "$PRINT_FILE" || true
@@ -37,12 +37,12 @@ echo "daemon pid: $DAEMON_PID"
 echo
 echo "== managed servers (expect pgid==pid; pids from status, not pgrep -P) =="
 ps -o pid,ppid,pgid,pri,nice,state,command -p "$DAEMON_PID"
-if ! command -v devctl >/dev/null; then
-  echo "devctl not on PATH; install the CLI and re-run" >&2
+if ! command -v directa >/dev/null; then
+  echo "directa not on PATH; install the CLI and re-run" >&2
   exit 1
 fi
-STATUS_JSON="$(devctl status --all --json --no-bootstrap)" || {
-  echo "devctl status --all failed; is the daemon reachable?" >&2
+STATUS_JSON="$(directa status --all --json --no-bootstrap)" || {
+  echo "directa status --all failed; is the daemon reachable?" >&2
   exit 1
 }
 CHILDREN="$(python3 -c '

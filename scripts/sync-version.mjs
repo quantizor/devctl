@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** Keep DevCtlVersion.version and package-lock.json root version in lockstep
+/** Keep DirectaVersion.version and package-lock.json root version in lockstep
     with package.json after `changeset version`. GitHub releases use
     package.json; the CLI/app report the Swift constant. */
 import { readFileSync, writeFileSync } from "node:fs";
@@ -13,7 +13,7 @@ if (typeof version !== "string" || !/^\d+\.\d+\.\d+/.test(version)) {
   process.exit(1);
 }
 
-const swiftPath = join(root, "Sources/DevCtlKit/Model/Models.swift");
+const swiftPath = join(root, "Sources/DirectaKit/Model/Models.swift");
 const before = readFileSync(swiftPath, "utf8");
 const after = before.replace(
   /public static let version = "[^"]+"/,
@@ -21,7 +21,7 @@ const after = before.replace(
 );
 if (after === before) {
   if (!before.includes(`public static let version = "${version}"`)) {
-    console.error("sync-version: DevCtlVersion.version declaration not found in Models.swift");
+    console.error("sync-version: DirectaVersion.version declaration not found in Models.swift");
     process.exit(1);
   }
   console.log(`sync-version: Models.swift already at ${version}`);

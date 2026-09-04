@@ -1,7 +1,7 @@
 #!/bin/zsh
-# Assembles devctl.app from the SPM-built products. No Xcode: the bundle is
+# Assembles directa.app from the SPM-built products. No Xcode: the bundle is
 # directory layout + Info.plist + signature. Contents/Resources carries the CLI
-# (and a Resources copy of the daemon for setup); Contents/Helpers/devctld is the
+# (and a Resources copy of the daemon for setup); Contents/Helpers/ddirecta is the
 # SMAppService BundleProgram target; Contents/Library/LaunchAgents holds the
 # in-bundle agent plist. $1 is the signing identity; the Makefile resolves it
 # through scripts/signing-identity.sh, which prefers a Developer ID certificate
@@ -12,11 +12,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IDENTITY="${1:--}"
 CONFIG="${2:-release}"
 BUILD="$ROOT/.build/$CONFIG"
-APP_BINARY="$BUILD/DevCtlApp"
-CLI_BINARY="$BUILD/devctl"
-DAEMON_BINARY="$BUILD/devctld"
-APP="$ROOT/devctl.app"
-LABEL="dev.quantizor.devctl"
+APP_BINARY="$BUILD/DirectaApp"
+CLI_BINARY="$BUILD/directa"
+DAEMON_BINARY="$BUILD/ddirecta"
+APP="$ROOT/directa.app"
+LABEL="dev.quantizor.directa"
 
 [[ -x "$APP_BINARY" ]] || { echo "make-app-bundle: build first (missing $APP_BINARY)" >&2; exit 1 }
 [[ -x "$CLI_BINARY" ]] || { echo "make-app-bundle: build first (missing $CLI_BINARY)" >&2; exit 1 }
@@ -31,16 +31,16 @@ mkdir -p \
   "$APP/Contents/Resources" \
   "$APP/Contents/Helpers" \
   "$APP/Contents/Library/LaunchAgents"
-cp "$APP_BINARY" "$APP/Contents/MacOS/devctl-app"
-cp "$CLI_BINARY" "$APP/Contents/Resources/devctl"
-cp "$DAEMON_BINARY" "$APP/Contents/Resources/devctld"
-cp "$DAEMON_BINARY" "$APP/Contents/Helpers/devctld"
+cp "$APP_BINARY" "$APP/Contents/MacOS/directa-app"
+cp "$CLI_BINARY" "$APP/Contents/Resources/directa"
+cp "$DAEMON_BINARY" "$APP/Contents/Resources/ddirecta"
+cp "$DAEMON_BINARY" "$APP/Contents/Helpers/ddirecta"
 cp "$ICON_ICNS" "$APP/Contents/Resources/AppIcon.icns"
 chmod 755 \
-  "$APP/Contents/MacOS/devctl-app" \
-  "$APP/Contents/Resources/devctl" \
-  "$APP/Contents/Resources/devctld" \
-  "$APP/Contents/Helpers/devctld"
+  "$APP/Contents/MacOS/directa-app" \
+  "$APP/Contents/Resources/directa" \
+  "$APP/Contents/Resources/ddirecta" \
+  "$APP/Contents/Helpers/ddirecta"
 
 # Sealed in-bundle agent: BundleProgram (SMAppService-only), static PATH floor.
 # Dynamic login PATH lives in Application Support/agent.path (daemon applies it).
@@ -52,7 +52,7 @@ cat > "$APP/Contents/Library/LaunchAgents/${LABEL}.plist" <<PLIST
 <plist version="1.0">
 <dict>
 	<key>BundleProgram</key>
-	<string>Contents/Helpers/devctld</string>
+	<string>Contents/Helpers/ddirecta</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
@@ -81,8 +81,8 @@ VERSION="$("$CLI_BINARY" --version 2>/dev/null || echo 0.1.0)"
 # cask and is then disabled by Gatekeeper. Enforced here because the Makefile
 # resolves the identity through $(shell ...), which swallows the exit code of
 # scripts/signing-identity.sh.
-if [[ "$IDENTITY" == "-" && "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]]; then
-  echo "make-app-bundle: DEVCTL_REQUIRE_SIGNING=1 but no signing identity; refusing to build an ad-hoc release." >&2
+if [[ "$IDENTITY" == "-" && "${DIRECTA_REQUIRE_SIGNING:-0}" == "1" ]]; then
+  echo "make-app-bundle: DIRECTA_REQUIRE_SIGNING=1 but no signing identity; refusing to build an ad-hoc release." >&2
   exit 1
 fi
 
@@ -92,17 +92,17 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>quantizor/devctl</string>
+    <string>quantizor/directa</string>
     <key>CFBundleExecutable</key>
-    <string>devctl-app</string>
+    <string>directa-app</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.quantizor.devctl.app</string>
+    <string>dev.quantizor.directa.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>devctl</string>
+    <string>directa</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -113,6 +113,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Evan Jacobs</string>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
     <key>NSSupportsSuddenTermination</key>
@@ -121,12 +123,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <array>
         <dict>
             <key>CFBundleURLName</key>
-            <string>dev.quantizor.devctl.url</string>
+            <string>dev.quantizor.directa.url</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
             <key>CFBundleURLSchemes</key>
             <array>
-                <string>devctl</string>
+                <string>directa</string>
             </array>
         </dict>
     </array>
@@ -149,23 +151,23 @@ sign() {
 }
 
 # Nested Mach-Os first, then the outer bundle (Gatekeeper walks inward).
-sign "$APP/Contents/Resources/devctl"
-sign "$APP/Contents/Resources/devctld"
-sign "$APP/Contents/Helpers/devctld"
-sign "$APP/Contents/MacOS/devctl-app"
+sign "$APP/Contents/Resources/directa"
+sign "$APP/Contents/Resources/ddirecta"
+sign "$APP/Contents/Helpers/ddirecta"
+sign "$APP/Contents/MacOS/directa-app"
 sign "$APP"
-echo "assembled $APP (signed: $IDENTITY; Helpers/devctld + LaunchAgents + Resources)"
+echo "assembled $APP (signed: $IDENTITY; Helpers/ddirecta + LaunchAgents + Resources)"
 
 # Warn at the point of signing, because the build succeeds either way and the
 # cost only lands later, on whoever installs over a previous copy. Reasoning for
 # why the Team ID matters lives in scripts/signing-identity.sh.
 #
-# DEVCTL_ADHOC_EXPECTED=1 silences it for a bundle nobody installs (smoke.sh
+# DIRECTA_ADHOC_EXPECTED=1 silences it for a bundle nobody installs (smoke.sh
 # builds one to assert its layout), so the warning keeps meaning "this one will
 # bite you" rather than becoming noise the gate prints every run.
-if [[ "$IDENTITY" == "-" && "${DEVCTL_ADHOC_EXPECTED:-0}" != "1" ]]; then
+if [[ "$IDENTITY" == "-" && "${DIRECTA_ADHOC_EXPECTED:-0}" != "1" ]]; then
   echo "warning: ad-hoc signed (no Team ID). Installing this over an existing copy" >&2
-  echo "         stalls devctld for tens of seconds: the stale launch constraint" >&2
+  echo "         stalls ddirecta for tens of seconds: the stale launch constraint" >&2
   echo "         SIGKILLs it on exec until BTM invalidates its item." >&2
   echo "         To sign, install a Developer ID certificate or pass SIGN_IDENTITY=..." >&2
   echo "         (scripts/signing-identity.sh picks one up automatically when present.)" >&2

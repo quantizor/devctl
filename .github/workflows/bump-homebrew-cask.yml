@@ -6,7 +6,7 @@
 # fallback). Runs on ubuntu (no brew, no macOS minutes): it needs only the DMG's
 # checksum and a git push.
 #
-# The cask's structure lives in devctl's packaging/homebrew/devctl.rb; this job
+# The cask's structure lives in directa's packaging/homebrew/directa.rb; this job
 # only injects the release's version and sha256, so there is one home for the
 # cask and the tap is a generated artifact.
 #
@@ -49,11 +49,11 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout devctl at the tag
+      - name: Checkout directa at the tag
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.tag.outputs.tag }}
-          path: devctl
+          path: directa
 
       - name: Verify the DMG asset exists and download it
         id: dmg
@@ -63,7 +63,7 @@ jobs:
           VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
-          ASSET="devctl-${VERSION}.dmg"
+          ASSET="directa-${VERSION}.dmg"
           # Fail fast if the DMG is not attached yet: the release DMG build must
           # finish first, and shipping a cask whose URL 404s is worse than waiting.
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
@@ -94,10 +94,10 @@ jobs:
           ruby -e '
             version = ENV.fetch("VERSION")
             sha = ENV.fetch("SHA")
-            text = File.read("devctl/packaging/homebrew/devctl.rb")
+            text = File.read("directa/packaging/homebrew/directa.rb")
             text.sub!(/version "[^"]*"/, %(version "#{version}")) or abort("version stanza not found in template")
             text.sub!(/sha256 "[^"]*"/, %(sha256 "#{sha}")) or abort("sha256 stanza not found in template")
-            File.write("tap/Casks/devctl.rb", text)
+            File.write("tap/Casks/directa.rb", text)
           '
 
       - name: Commit and push
@@ -108,10 +108,10 @@ jobs:
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Casks/devctl.rb; then
+          if git diff --quiet -- Casks/directa.rb; then
             echo "cask already at ${VERSION}; nothing to push"
             exit 0
           fi
-          git add Casks/devctl.rb
-          git commit -m "devctl ${VERSION}"
+          git add Casks/directa.rb
+          git commit -m "directa ${VERSION}"
           git push

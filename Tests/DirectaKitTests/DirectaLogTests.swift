@@ -1,0 +1,52 @@
+import Testing
+
+@testable import DirectaKit
+
+/** Serialized: every case swaps the process-global `DirectaLog.backend`, so
+    parallel cases would clobber each other's recorder. */
+@Suite(.serialized) struct DirectaLogTests {
+    /** Installs a recorder for the duration of `body`, then restores the default
+        backend so one suite's swap never leaks into another. */
+    private func withRecorder(_ body: (RecordingBackend) -> Void) {
+        let previous = DirectaLog.backend
+        defer { DirectaLog.backend = previous }
+        let recorder = RecordingBackend()
+        DirectaLog.backend = recorder
+        body(recorder)
+    }
+
+    @Test func categoryLoggerCapturesLevelAndCategory() {
+        withRecorder { recorder in
+            DirectaLog.deeplink.info("dispatched ensure")
+            DirectaLog.deeplink.error("rejected slug")
+            DirectaLog.daemon.debug("tick")
+            #expect(
+                recorder.entries == [
+                    .init(category: .deeplink, level: .info, message: "dispatched ensure"),
+                    .init(category: .deeplink, level: .error, message: "rejected slug"),
+                    .init(category: .daemon, level: .debug, message: "tick"),
+                ])
+        }
+    }
+
+    @Test func staticFormsMatchCategoryLoggers() {
+        withRecorder { recorder in
+            DirectaLog.info(.app, "hello")
+            DirectaLog.error(.health, "probe failed")
+            #expect(recorder.messages == ["hello", "probe failed"])
+        }
+    }
+
+    @Test func resetClearsEntries() {
+        withRecorder { recorder in
+            DirectaLog.supervisor.info("first")
+            recorder.reset()
+            DirectaLog.supervisor.info("second")
+            #expect(recorder.messages == ["second"])
+        }
+    }
+
+    @Test func subsystemIsStable() {
+        #expect(DirectaLog.subsystem == "dev.quantizor.directa")
+    }
+}

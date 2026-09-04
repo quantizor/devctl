@@ -5,54 +5,54 @@
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Debug devctl",
-            "program": "${workspaceFolder:devctl}/.build/debug/devctl",
-            "preLaunchTask": "swift: Build Debug devctl"
+            "name": "Debug directa",
+            "program": "${workspaceFolder:devctl}/.build/debug/directa",
+            "preLaunchTask": "swift: Build Debug directa"
         },
         {
             "type": "lldb",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Release devctl",
-            "program": "${workspaceFolder:devctl}/.build/release/devctl",
-            "preLaunchTask": "swift: Build Release devctl"
+            "name": "Release directa",
+            "program": "${workspaceFolder:devctl}/.build/release/directa",
+            "preLaunchTask": "swift: Build Release directa"
         },
         {
             "type": "lldb",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Debug devctld",
-            "program": "${workspaceFolder:devctl}/.build/debug/devctld",
-            "preLaunchTask": "swift: Build Debug devctld"
+            "name": "Debug ddirecta",
+            "program": "${workspaceFolder:devctl}/.build/debug/ddirecta",
+            "preLaunchTask": "swift: Build Debug ddirecta"
         },
         {
             "type": "lldb",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Release devctld",
-            "program": "${workspaceFolder:devctl}/.build/release/devctld",
-            "preLaunchTask": "swift: Build Release devctld"
+            "name": "Release ddirecta",
+            "program": "${workspaceFolder:devctl}/.build/release/ddirecta",
+            "preLaunchTask": "swift: Build Release ddirecta"
         },
         {
             "type": "lldb",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Debug DevCtlApp",
-            "program": "${workspaceFolder:devctl}/.build/debug/DevCtlApp",
-            "preLaunchTask": "swift: Build Debug DevCtlApp"
+            "name": "Debug DirectaApp",
+            "program": "${workspaceFolder:devctl}/.build/debug/DirectaApp",
+            "preLaunchTask": "swift: Build Debug DirectaApp"
         },
         {
             "type": "lldb",
             "request": "launch",
             "args": [],
             "cwd": "${workspaceFolder:devctl}",
-            "name": "Release DevCtlApp",
-            "program": "${workspaceFolder:devctl}/.build/release/DevCtlApp",
-            "preLaunchTask": "swift: Build Release DevCtlApp"
+            "name": "Release DirectaApp",
+            "program": "${workspaceFolder:devctl}/.build/release/DirectaApp",
+            "preLaunchTask": "swift: Build Release DirectaApp"
         },
         {
             "type": "lldb",

@@ -8,7 +8,7 @@
 # Why this prefers a real identity over ad-hoc: an ad-hoc signature has no Team
 # ID, so BTM pins the SMAppService launch constraint to the helper's CDHash,
 # which changes on every rebuild. Installing over a previous copy then gets
-# devctld SIGKILLed on exec (CODESIGNING / Launch Constraint Violation) until
+# ddirecta SIGKILLed on exec (CODESIGNING / Launch Constraint Violation) until
 # BTM invalidates its item on its own schedule, costing a launchd
 # ThrottleInterval per attempt. A Developer ID signature pins the Team ID, which
 # survives rebuilds, so an upgrade spawns immediately.
@@ -25,12 +25,12 @@ identities="$(security find-identity -v -p codesigning 2>/dev/null \
   | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' || true)"
 
 if [[ -z "$identities" ]]; then
-  # Release builds set DEVCTL_REQUIRE_SIGNING=1 so a missing certificate fails
+  # Release builds set DIRECTA_REQUIRE_SIGNING=1 so a missing certificate fails
   # loudly rather than silently shipping an ad-hoc image Gatekeeper will disable.
   # make-app-bundle.sh enforces the same, since a $(shell ...) call in the
   # Makefile swallows this exit code.
-  if [[ "${DEVCTL_REQUIRE_SIGNING:-0}" == "1" ]]; then
-    echo "signing-identity: no Developer ID Application certificate found and DEVCTL_REQUIRE_SIGNING=1; refusing to fall back to ad-hoc." >&2
+  if [[ "${DIRECTA_REQUIRE_SIGNING:-0}" == "1" ]]; then
+    echo "signing-identity: no Developer ID Application certificate found and DIRECTA_REQUIRE_SIGNING=1; refusing to fall back to ad-hoc." >&2
     exit 1
   fi
   echo -
